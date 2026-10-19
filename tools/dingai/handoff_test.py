@@ -1,8 +1,13 @@
+import base64
 import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from http.client import HTTPConnection
 
 import handoff
 
@@ -104,6 +109,155 @@ class HandoffTests(unittest.TestCase):
                 names = handoff.handle_rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
                 self.assertEqual(names["result"]["tools"][0]["name"], "dingai_handoff")
                 self.assertIn("dingai_mark_fixed", [tool["name"] for tool in names["result"]["tools"]])
+                self.assertIn("dingai_screenshot", [tool["name"] for tool in names["result"]["tools"]])
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+
+class TransportTests(unittest.TestCase):
+    def test_stdio_accepts_ndjson_and_content_length(self):
+        stdin = io.BytesIO((json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"},
+        }) + "\n").encode("utf-8"))
+        stdout = io.BytesIO()
+        handoff.serve_mcp(stdin, stdout)
+        stdout.seek(0)
+        reply = json.loads(stdout.readline().decode("utf-8"))
+        self.assertEqual(reply["result"]["protocolVersion"], "2025-03-26")
+        self.assertIn("resources", reply["result"]["capabilities"])
+        self.assertEqual(reply["result"]["serverInfo"]["name"], "dingai")
+
+        framed = io.BytesIO()
+        handoff.write_message({"jsonrpc": "2.0", "id": 7, "method": "ping"}, framed)
+        framed.seek(0)
+        out = io.BytesIO()
+        handoff.serve_mcp(framed, out)
+        out.seek(0)
+        self.assertTrue(out.read(15).lower().startswith(b"content-length"))
+
+    def test_http_initialize_lists_and_rejects_sse(self):
+        server = handoff.make_http_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        }).encode("utf-8")
+        conn.request("POST", "/mcp", body=body, headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Mcp-Session-Id"), "dingai")
+        self.assertIn("application/json", resp.getheader("Content-Type"))
+        payload = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(payload["result"]["serverInfo"]["name"], "dingai")
+        self.assertEqual(payload["result"]["tools"] if "tools" in payload["result"] else payload["result"]["protocolVersion"], "2025-06-18")
+        conn.request("GET", "/mcp")
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 405)
+        resp.read()
+        note = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8")
+        conn.request("POST", "/mcp", body=note, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 202)
+        resp.read()
+        conn.request("POST", "/mcp", body=json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+        }).encode("utf-8"), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        listed = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(listed["result"]["tools"][0]["name"], "dingai_handoff")
+        self.assertIn("dingai_mark_fixed", [tool["name"] for tool in listed["result"]["tools"]])
+        conn.close()
+
+    def test_http_requires_the_token_when_set(self):
+        old = os.environ.get("DINGAI_MCP_TOKEN")
+        os.environ["DINGAI_MCP_TOKEN"] = "test-token"
+        server = handoff.make_http_server("127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            body = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+            conn.request("POST", "/mcp", body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 401)
+            resp.read()
+            conn.request("POST", "/mcp", body=body, headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer test-token",
+            })
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(resp.read().decode("utf-8"))["result"], {})
+            conn.close()
+        finally:
+            if old is None:
+                os.environ.pop("DINGAI_MCP_TOKEN", None)
+            else:
+                os.environ["DINGAI_MCP_TOKEN"] = old
+
+    def test_latest_pins_screenshot_and_bundle(self):
+        keys = ("HOME", "DINGAI_OUTPUT_DIR", "DINGAI_MODE", "DINGAI_SHARE_DIR", "DINGAI_TEAM_URLS", "ANNO_TEAM_URLS")
+        saved = {key: os.environ.get(key) for key in keys}
+        with tempfile.TemporaryDirectory() as home:
+            os.environ["HOME"] = home
+            os.environ["DINGAI_OUTPUT_DIR"] = "DingAI"
+            os.environ["DINGAI_MODE"] = "local"
+            os.environ["DINGAI_SHARE_DIR"] = ""
+            os.environ["DINGAI_TEAM_URLS"] = ""
+            os.environ["ANNO_TEAM_URLS"] = ""
+            try:
+                notes = os.path.join(home, "DingAI", "notes")
+                shots = os.path.join(home, "DingAI", "shots")
+                os.makedirs(notes)
+                os.makedirs(shots)
+                png = b"\x89PNG\r\n\x1a\nlocal"
+                with open(os.path.join(shots, "anno.png"), "wb") as fh:
+                    fh.write(png)
+                note = {"file": "note-1", "screenshot": "anno.png", "pins": [{"id": 1, "note": "gap"}]}
+                with open(os.path.join(notes, "a.json"), "w", encoding="utf-8") as fh:
+                    json.dump(note, fh)
+                payload = handoff.latest_pins_json()
+                self.assertEqual(payload["mode"], "local")
+                self.assertEqual(payload["pins"][0]["id"], 1)
+                self.assertTrue(payload["screenshot"].endswith("anno.png"))
+                folder = handoff.write_export_bundle(json.dumps(note), png, os.path.join(home, "DingAI", "export"))
+                self.assertTrue(os.path.isfile(os.path.join(folder, "prompt.txt")))
+                self.assertTrue(os.path.isfile(os.path.join(folder, "note.json")))
+                with open(os.path.join(folder, "screenshot.png"), "rb") as fh:
+                    self.assertEqual(fh.read(), png)
+                with open(os.path.join(folder, "prompt.txt"), encoding="utf-8") as fh:
+                    self.assertIn("pinned element", fh.read())
+                listed = handoff.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
+                uris = [row["uri"] for row in listed["result"]["resources"]]
+                self.assertIn("dingai://screenshot/note-1/1", uris)
+                read = handoff.handle_rpc({
+                    "jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                    "params": {"uri": "dingai://screenshot/note-1/1"},
+                })
+                self.assertEqual(base64.b64decode(read["result"]["contents"][0]["blob"]), png)
+                called = handoff.handle_rpc({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "dingai_screenshot", "arguments": {"note_id": "note-1", "pin_id": "1"}},
+                })
+                self.assertEqual(called["result"]["content"][0]["mimeType"], "image/png")
+                script = os.path.join(os.path.dirname(__file__), "dingai")
+                env = os.environ.copy()
+                proc = subprocess.run([sys.executable, script], capture_output=True, env=env, check=False)
+                self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+                printed = json.loads(proc.stdout.decode("utf-8"))
+                self.assertEqual(printed["pins"][0]["note"], "gap")
             finally:
                 for key, value in saved.items():
                     if value is None:

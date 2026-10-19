@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,9 +23,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import handoff
+from core.guide import write_bundle
+from core.i18n import t as ui_text
 from core.layout import layout_callouts
+from core.redact import hits, redact_note
 from core.schema import normalize_note
 from core.sync import load_settings, publish_note
+from core.voice import transcribe
 
 PIN_TYPES = ("bug", "change", "question")
 
@@ -66,7 +71,7 @@ class _XImage(ctypes.Structure):
     ]
 
 
-def capture_x11(width=None, height=None):
+def capture_x11(width=None, height=None, origin_x=0, origin_y=0):
     lib = _x11()
     display = lib.XOpenDisplay(None)
     if not display:
@@ -75,10 +80,12 @@ def capture_x11(width=None, height=None):
         screen = lib.XDefaultScreen(display)
         full_w = lib.XDisplayWidth(display, screen)
         full_h = lib.XDisplayHeight(display, screen)
-        width = min(width or full_w, full_w)
-        height = min(height or full_h, full_h)
+        origin_x = max(0, min(int(origin_x), max(full_w - 1, 0)))
+        origin_y = max(0, min(int(origin_y), max(full_h - 1, 0)))
+        width = min(width or full_w, full_w - origin_x)
+        height = min(height or full_h, full_h - origin_y)
         root = lib.XRootWindow(display, screen)
-        image = lib.XGetImage(display, root, 0, 0, width, height, ctypes.c_ulong(-1).value, 2)
+        image = lib.XGetImage(display, root, origin_x, origin_y, width, height, ctypes.c_ulong(-1).value, 2)
         if not image:
             return None
         info = ctypes.cast(image, ctypes.POINTER(_XImage)).contents
@@ -113,6 +120,58 @@ def capture_wayland(dest):
         return False
     proc = subprocess.run(["grim", str(dest)], capture_output=True)
     return proc.returncode == 0 and Path(dest).exists()
+
+
+def ocr_boxes(png_bytes):
+    """Tesseract TSV boxes. Empty when the binary is missing."""
+    if not shutil.which("tesseract") or not png_bytes:
+        return []
+    proc = subprocess.run(["tesseract", "stdin", "stdout", "-l", "eng", "tsv"], input=png_bytes, capture_output=True)
+    if proc.returncode != 0:
+        return []
+    lines = proc.stdout.decode("utf-8", "replace").splitlines()
+    if len(lines) < 2:
+        return []
+    header = lines[0].split("\t")
+
+    def col(name):
+        return header.index(name) if name in header else -1
+
+    boxes = []
+    for line in lines[1:]:
+        parts = line.split("\t")
+        try:
+            text = parts[col("text")]
+            if not str(text).strip():
+                continue
+            boxes.append({
+                "x": int(float(parts[col("left")])),
+                "y": int(float(parts[col("top")])),
+                "w": int(float(parts[col("width")])),
+                "h": int(float(parts[col("height")])),
+                "text": text,
+            })
+        except (ValueError, IndexError):
+            continue
+    return boxes
+
+
+def face_boxes(png_path):
+    """Optional local command. Prints 'x y w h' lines. No network."""
+    cmd = os.environ.get("DINGAI_FACE_CMD", "").strip()
+    if not cmd or not png_path:
+        return []
+    proc = subprocess.run(cmd.split() + [str(png_path)], capture_output=True, text=True)
+    boxes = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            boxes.append({"x": int(float(parts[0])), "y": int(float(parts[1])), "w": int(float(parts[2])), "h": int(float(parts[3]))})
+        except ValueError:
+            continue
+    return boxes
 
 
 def ocr_png(png_bytes):
@@ -217,12 +276,48 @@ class Session:
         self.pin_type = "bug"
         self.next_id = 1
         self.drag_from = None
+        self.voice = None
+        self.voice_wav = ""
+        self.steps_on = False
+        self.steps = []
+
+    def start_voice(self):
+        if self.voice is not None or not shutil.which("arecord"):
+            return
+        handle = tempfile.NamedTemporaryFile(prefix="dingai-voice-", suffix=".wav", delete=False)
+        self.voice_wav = handle.name
+        handle.close()
+        self.voice = subprocess.Popen(
+            ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", self.voice_wav],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def stop_voice(self):
+        proc = self.voice
+        self.voice = None
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        text = transcribe(self.voice_wav) if self.voice_wav else ""
+        if text and self.pins:
+            note = self.pins[-1].get("note") or ""
+            self.pins[-1]["note"] = (note + " " + text).strip()
+        return text
 
     def add_pin(self, x, y, note=""):
         anchor = atspi_at_point(x, y) or {"kind": "viewport", "dx": 0, "dy": 0}
         pin = {"id": self.next_id, "x": int(x), "y": int(y), "note": note, "ocr": "", "pin_type": self.pin_type, "anchor": anchor}
         self.next_id += 1
         self.pins.append(pin)
+        if self.steps_on:
+            shot = capture_x11(480, 320, max(0, int(x) - 240), max(0, int(y) - 160))
+            png = shot[2] if shot else b""
+            name = "step-%d.png" % (len(self.steps) + 1)
+            self.steps.append({"n": len(self.steps) + 1, "x_px": int(x), "y_px": int(y), "note": note or ("Pin at %d,%d" % (x, y)), "shot": name, "png": png})
+            pin["step"] = len(self.steps)
         return pin
 
     def add_mark(self, kind, x0, y0, x1, y1):
@@ -261,8 +356,25 @@ class Session:
         note["boxes"] = self.boxes
         note["arrow_count"] = len(self.arrows)
         note["box_count"] = len(self.boxes)
-        (out / "anno-linux.json").write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding="utf-8")
-        publish_note(note, png or None, load_settings())
+        settings = load_settings()
+        if settings.get("redact"):
+            boxes = [box for box in ocr_boxes(png) if hits(box.get("text") or "")] if png else []
+            if png:
+                (out / "anno-linux.png").write_bytes(png)
+                boxes.extend(face_boxes(out / "anno-linux.png"))
+            note, png = redact_note(note, png or None, boxes)
+            if png:
+                (out / "anno-linux.png").write_bytes(png)
+        if self.steps:
+            note["steps"] = [{key: value for key, value in step.items() if key != "png"} for step in self.steps]
+            write_bundle(out, self.steps)
+        text = json.dumps(note, ensure_ascii=False, indent=2)
+        (out / "anno-linux.json").write_text(text, encoding="utf-8")
+        (out / "prompt.txt").write_text(handoff.prompt_for(text), encoding="utf-8")
+        handoff.write_export_bundle(text, png or None, str(out / "export"))
+        shot = out / "anno-linux.png"
+        handoff.offer_clipboard(handoff.prompt_for(text), str(shot) if shot.is_file() else "")
+        publish_note(note, png or None, settings)
         return note
 
 
@@ -286,8 +398,8 @@ def run_toolbar():
     screen = lib.XDefaultScreen(display)
     root = lib.XRootWindow(display, screen)
     window = lib.XCreateSimpleWindow(display, root, 40, 40, 720, 36, 1, 0, 0xFFFFFF)
-    lib.XStoreName(display, window, b"DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done")
-    lib.XSelectInput(display, window, (1 << 0) | (1 << 2))
+    lib.XStoreName(display, window, ui_text("toolbar").encode())
+    lib.XSelectInput(display, window, (1 << 0) | (1 << 1) | (1 << 2))
     lib.XMapWindow(display, window)
     lib.XFlush(display)
     session = Session()
@@ -335,6 +447,14 @@ def run_toolbar():
                 session.pin_type = "change"
             elif keysym in (ord("q"),):
                 session.pin_type = "question"
+            elif keysym in (ord("v"), ord("V")):
+                session.start_voice()
+            elif keysym in (ord("g"),):
+                session.steps_on = not session.steps_on
+        if kind == 3:  # KeyRelease
+            keysym = _keysym(lib, display, event)
+            if keysym in (ord("v"), ord("V")):
+                session.stop_voice()
             elif keysym in (ord("a"),):
                 armed = "arrow"
                 session.drag_from = None
@@ -367,6 +487,27 @@ def _keysym(lib, display, event):
 
 
 def main(argv):
+    if os.environ.get("DINGAI_UPDATE") == "1":
+        try:
+            from core.update import check_update
+            print(json.dumps(check_update()))
+        except Exception as exc:
+            print("update check skipped: %s" % exc, file=sys.stderr)
+    if len(argv) > 1 and argv[1] == "recheck":
+        if len(argv) < 6:
+            print("usage: dingai_linux.py recheck before.png x y outdir", file=sys.stderr)
+            return 2
+        from core.diff import write_diff
+        out = Path(argv[5])
+        shot = capture_x11(480, 320, max(0, int(argv[3]) - 240), max(0, int(argv[4]) - 160))
+        if not shot:
+            print("capture failed", file=sys.stderr)
+            return 1
+        out.mkdir(parents=True, exist_ok=True)
+        after = out / "after.png"
+        after.write_bytes(shot[2])
+        print(json.dumps(write_diff(argv[2], after, out)))
+        return 0
     if "--check" in argv:
         print(json.dumps(capabilities()))
         return 0

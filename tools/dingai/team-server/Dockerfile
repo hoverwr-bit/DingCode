@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY dingai_team_server.py .
+COPY team-server/dingai_team_server.py .
+COPY core ./core
 ENV DINGAI_TEAM_HOST=0.0.0.0
 ENV DINGAI_TEAM_PORT=8050
 ENV DINGAI_TEAM_ROOT=/data

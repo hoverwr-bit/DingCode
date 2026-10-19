@@ -19,8 +19,12 @@ jobs:
           python3 -m unittest discover -s team-server -p 'test_*.py'
           node --check web/anno.js
           node web/anno-layout.test.js
+          node web/anno-source.test.js
+          node web/anno-i18n.test.js
+          node --check extension/background.js
+          node --check extension/content.js
       - name: Team server image
-        run: docker build -t dingai-team tools/dingai/team-server
+        run: docker build -f tools/dingai/team-server/Dockerfile -t dingai-team tools/dingai
 
   windows:
     runs-on: windows-latest

@@ -12,7 +12,43 @@
   window.ANNO_V7 = true; /* v7.9.1（261008）：修复防重入锁——原只检查不赋值，二次注入=双实例同 id 打架 */
   if (new URLSearchParams(location.search).get('qa') === '1') return;
   var LS_KEY = 'anno-v7:' + location.pathname;
-  var mode = false, annos = [], seq = 0, me = 'admin';
+  var mode = false, annos = [], seq = 0, me = 'admin', stepMode = false;
+  /* @i18n-start */
+  var STRINGS = {"unlock":{"zh":"开启 DingAI","en":"Enable DingAI","vi":"Bật DingAI"},"add":{"zh":"添加批注","en":"Add pin","vi":"Thêm ghim"},"edit":{"zh":"编辑批注","en":"Edit pin","vi":"Sửa ghim"},"save":{"zh":"保存","en":"Save","vi":"Lưu"},"cancel":{"zh":"取消","en":"Cancel","vi":"Hủy"},"clear":{"zh":"清空","en":"Clear","vi":"Xóa hết"},"copy":{"zh":"复制 JSON","en":"Copy JSON","vi":"Sao chép JSON"},"needComment":{"zh":"问题描述（含期望结果）必填","en":"A description is required","vi":"Cần mô tả vấn đề"},"confirmClear":{"zh":"确定清空本页全部批注？","en":"Clear every pin on this page?","vi":"Xóa mọi ghim trên trang này?"},"select":{"zh":"选择、移动、缩放","en":"Select, move, resize","vi":"Chọn, di chuyển, đổi cỡ"},"pin":{"zh":"点选批注","en":"Drop a pin","vi":"Ghim một điểm"},"arrow":{"zh":"箭头","en":"Arrow","vi":"Mũi tên"},"box":{"zh":"方框","en":"Box","vi":"Khung"},"ellipse":{"zh":"椭圆","en":"Ellipse","vi":"Elip"},"spot":{"zh":"聚光灯","en":"Spotlight","vi":"Đèn chiếu"},"text":{"zh":"文字标签","en":"Text","vi":"Chữ"},"undo":{"zh":"撤销","en":"Undo","vi":"Hoàn tác"},"voice":{"zh":"按住说话","en":"Hold to speak","vi":"Giữ để nói"},"steps":{"zh":"逐步记录","en":"Record steps","vi":"Ghi các bước"},"export":{"zh":"导出清单","en":"Export checklist","vi":"Xuất danh sách"},"note":{"zh":"备注:回车确认,Esc 跳过","en":"Note: Return confirms, Esc skips","vi":"Ghi chú: Enter xác nhận, Esc bỏ qua"},"toolbar":{"zh":"DingAI  p 钉  g 步骤  按住 v 说话  Esc 完成","en":"DingAI  p pin  g steps  hold v to speak  Esc done","vi":"DingAI  p ghim  g các bước  giữ v để nói  Esc xong"}};
+  function uiLang() {
+    var value = (typeof window !== 'undefined' && window.DINGAI_LANG) || '';
+    try { value = value || localStorage.getItem('dingai-lang') || ''; } catch (e) {}
+    if (!value && typeof navigator !== 'undefined') value = navigator.language || '';
+    value = String(value || 'zh').toLowerCase().slice(0, 2);
+    return (value === 'en' || value === 'vi') ? value : 'zh';
+  }
+  function t(key) {
+    var row = STRINGS[key] || {};
+    return row[uiLang()] || row.zh || key;
+  }
+  /* @i18n-end */
+  function applyChrome() {
+    var titles = { select: 'select', point: 'pin', arrow: 'arrow', box: 'box', ellipse: 'ellipse', spot: 'spot', text: 'text' };
+    Object.keys(titles).forEach(function (tool) {
+      var btn = document.querySelector('[data-tool="' + tool + '"]');
+      if (btn) btn.title = t(titles[tool]);
+    });
+    var extra = { undo: 'undo', voice: 'voice', steps: 'steps', export: 'export' };
+    Object.keys(extra).forEach(function (name) {
+      var btn = document.querySelector('[data-' + name + ']') || document.querySelector('[data-voice]');
+      if (name === 'undo') btn = document.querySelector('[data-undo]');
+      if (name === 'voice') btn = document.querySelector('[data-voice]');
+      if (name === 'steps') btn = document.querySelector('[data-steps]');
+      if (name === 'export') btn = document.querySelector('[data-export]');
+      if (btn) btn.title = t(extra[name]);
+    });
+    var copy = document.getElementById('av7copy'); if (copy) copy.textContent = t('copy');
+    var clear = document.getElementById('av7clear'); if (clear) clear.textContent = t('clear');
+    var save = document.getElementById('av7save'); if (save) save.textContent = t('save');
+    var cancel = document.getElementById('av7cancel'); if (cancel) cancel.textContent = t('cancel');
+    var unlock = document.getElementById('av7unlock');
+    if (unlock) { unlock.title = t('unlock'); unlock.textContent = '✎ ' + t('unlock'); }
+  }
   var oldBtn = document.getElementById('annotationLaunch');
   if (oldBtn) oldBtn.style.display = 'none';
 
@@ -166,15 +202,64 @@
           return '<button type="button" data-style="' + k + '" title="' + AV_STYLES[k].name + '" ' + (i === 0 ? 'class="on"' : '') + '><svg width="30" height="14" viewBox="0 0 30 14">' + ic + '</svg></button>';
         }).join('')
       + '<span class="sep"></span>'
-      + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>';
+      + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>'
+      + '<button type="button" data-voice="1" title="按住说话，本地转写到备注">🎤</button>'
+      + '<button type="button" data-steps="1" title="逐步记录，导出 SOP">#</button>'
+      + '<button type="button" data-export="1" title="导出 Markdown 清单">☑</button>';
     var head = hostPanel.querySelector('.av7head');
     head.insertAdjacentElement('afterend', row);
+    var voiceBtn = row.querySelector('[data-voice]');
+    var voiceRec = null, voiceChunks = [];
+    if (voiceBtn) {
+      voiceBtn.addEventListener('mousedown', function (ev) {
+        ev.stopPropagation();
+        voiceChunks = [];
+        if (!navigator.mediaDevices) return;
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+          var mime = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/wav')) ? 'audio/wav' : '';
+          voiceRec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+          voiceRec.ondataavailable = function (e) { if (e.data && e.data.size) voiceChunks.push(e.data); };
+          voiceRec.start();
+        }).catch(function () {});
+      });
+      voiceBtn.addEventListener('mouseup', function () {
+        if (!voiceRec) return;
+        var rec = voiceRec; voiceRec = null;
+        rec.onstop = function () {
+          try { rec.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+          var token = (av7bridge && av7bridge.token) || '';
+          bridgeFetch('http://127.0.0.1:8763/voice?token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
+            .then(function (r) { return r.text(); })
+            .then(function (text) {
+              text = (text || '').trim();
+              var box = document.getElementById('av7comment');
+              if (box && text) box.value = box.value ? (box.value + ' ' + text) : text;
+            }).catch(function () {});
+        };
+        try { rec.stop(); } catch (e2) {}
+      });
+    }
     return row;
   }
   panelToolsClick = function (e) {
     var b = e.target.closest('button'); if (!b) return;
     e.stopPropagation();
-    if (b.dataset.tool) {
+    if (b.dataset.export) {
+      var lines = ['# DingAI checklist', ''];
+      annos.forEach(function (a) {
+        var loc = a.source && a.source.file ? ' (' + a.source.file + ':' + (a.source.line || 1) + ')' : '';
+        lines.push('- [' + (a.status === 'confirmed' ? 'x' : ' ') + '] ' + (a.pinType || 'bug') + ': ' + (a.comment || '') + loc);
+      });
+      var blob = new Blob([lines.join('\n') + '\n'], { type: 'text/markdown' });
+      var link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = 'dingai-checklist.md';
+      link.click();
+    } else if (b.dataset.steps) {
+      stepMode = !stepMode;
+      b.classList.toggle('on', stepMode);
+      if (!stepMode) downloadSop();
+    } else if (b.dataset.tool) {
       curTool = b.dataset.tool;
       tools.querySelectorAll('button[data-tool]').forEach(function (x) { x.classList.toggle('on', x === b); });
     } else if (b.dataset.color) {
@@ -194,6 +279,7 @@
   panel.innerHTML = '<div class="av7head">DingAI（页面）<button type="button" id="av7exit">退出批注</button><button type="button" id="av7hide">收起</button></div><div id="av7list"></div>'
     + '<div id="av7foot"><button type="button" id="av7copy">复制 JSON</button><button type="button" id="av7clear">清空</button></div>';
   tools = buildTools(panel);
+  applyChrome();
   tools.addEventListener('click', panelToolsClick);
   var modal = el('div', 'av7modal');
   modal.innerHTML = '<div id="av7card"><h3 id="av7title">添加批注</h3><div id="av7ctx"></div>'
@@ -351,8 +437,36 @@
     } catch (e) {}
     return DEFAULT_HANDOFF_RULES;
   }
+  function redactOn() {
+    if (window.DINGAI_REDACT === true) return true;
+    try { return localStorage.getItem('dingai-redact') === '1'; } catch (e) { return false; }
+  }
+  function redactText(s) {
+    if (!redactOn() || s == null) return s == null ? '' : String(s);
+    return String(s)
+      .replace(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/gi, '[redacted]')
+      .replace(/(?:\+?86[-\s]?)?1[3-9]\d{9}/g, '[redacted]')
+      .replace(/(?:\+?84|0)(?:3|5|7|8|9)\d{8}/g, '[redacted]')
+      .replace(/\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/g, '[redacted]')
+      .replace(/\b(?:PO|P\.O\.|SO|订单号|订单|订货单)\s*[#:：\-]?\s*[A-Z0-9][A-Z0-9\-]{2,}/gi, '[redacted]')
+      .replace(/(?:[$€£₫]|¥|USD|CNY|VND)\s?\d[\d,]*(?:\.\d{1,2})?/gi, '[redacted]');
+  }
   function handoffPrompt(jsonText) {
-    return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + jsonText;
+    return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + redactText(jsonText);
+  }
+  function downloadSop() {
+    var lines = ['# DingAI steps', ''], n = 0;
+    annos.forEach(function (a) {
+      if (!a.step) return;
+      n += 1;
+      lines.push(n + '. ' + (a.comment || 'Step'));
+      lines.push('');
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+    var link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'sop.md';
+    link.click();
   }
   function exportV7() {
     return { page: location.pathname || 'page', version: 7.9, exportedAt: new Date().toISOString(), count: annos.length, annotations: annos, handoff_rules: handoffRules() };
@@ -511,6 +625,7 @@
       var it = document.createElement('div'); it.className = 'av7item';
       var ae = anchorElOf(a.key), state = ae && ae.getClientRects().length ? '已锚定' : '坐标回退';
       it.innerHTML = '<strong>A' + pad(i + 1) + '</strong> · ' + esc(a.pinType || 'bug') + ' · ' + esc(a.status || 'open') + ' · ' + esc(a.target)
+        + (a.source && a.source.file ? '<div><small>' + esc(a.source.file) + ':' + esc(a.source.line || 1) + '</small></div>' : '')
         + (a.field ? ' · <b>' + esc(a.field) + '</b>' : '')
         + '<div>' + esc(a.comment.slice(0, 120)) + '</div>'
         + '<small>' + esc(fmtXY(a.geometry)) + ' · 视口 ' + a.geometry.viewportW + ' · ' + state + '</small>'
@@ -533,7 +648,7 @@
 
   function openModal(p, editing) {
     pending = p;
-    document.getElementById('av7title').textContent = editing ? '编辑批注' : '添加批注';
+    document.getElementById('av7title').textContent = editing ? t('edit') : t('add');
     document.getElementById('av7ctx').textContent = targetName(p.key) + '｜' + (p.field ? p.field + '：' + (p.value || '—') + '｜' : '') + fmtXY(p.geometry) + (p.existing ? ('｜更新 ' + p.existing.id) : '');
     document.getElementById('av7comment').value = p.existing ? p.existing.comment : '';
     var typeEl = document.getElementById('av7type');
@@ -547,13 +662,14 @@
 
   document.getElementById('av7save').addEventListener('click', function () {
     var txt = document.getElementById('av7comment').value.trim();
-    if (!txt) { alert('问题描述（含期望结果）必填'); return; }
+    if (!txt) { alert(t('needComment')); return; }
     var kind = document.getElementById('av7type').value;
     if (kind !== 'change' && kind !== 'question') kind = 'bug';
     if (pending) {
       if (pending.existing) {
         pending.existing.comment = txt; /* 编辑既有条（钉子/列表进入） */
         pending.existing.pinType = kind;
+        if (pending.source) pending.existing.source = pending.source;
         if (!pending.existing.status) pending.existing.status = 'open';
         if (pending.mark) pending.existing.mark = pending.mark;
       } else {
@@ -563,6 +679,8 @@
           geometry: pending.geometry, mark: pending.mark || null, anchor: pending.anchor || null,
           field: pending.field || '', value: pending.value || '',
           pinType: kind, status: 'open',
+          source: pending.source || null,
+          step: stepMode ? (annos.filter(function (x) { return x.step; }).length + 1) : 0,
           free: pending.key.indexOf('free:') === 0, ts: Date.now(), by: me
         });
       }
@@ -573,7 +691,7 @@
   document.getElementById('av7cancel').addEventListener('click', closeModal);
   document.getElementById('av7clear').addEventListener('click', function () {
     if (!annos.length) { alert('本页暂无批注'); return; }
-    if (confirm('确定清空本页全部批注？')) { annos = []; saveLocal(); render(); }
+    if (confirm(t('confirmClear'))) { annos = []; saveLocal(); render(); }
   });
   document.getElementById('av7copy').addEventListener('click', function () {
     var text = handoffPrompt(JSON.stringify(exportV7(), null, 2));
@@ -868,7 +986,7 @@
     var page = { x: Math.round((mk.x1 + mk.x2) / 2), y: Math.round((mk.y1 + mk.y2) / 2) };
     var key = keyOf(d.target) || ('free:' + page.x + ',' + page.y);
     var fi = fieldInfoOf(d.target);
-    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, mark: mk, anchor: mk.anchors.a1, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, mark: mk, anchor: mk.anchors.a1, field: fi.field, value: fi.value, source: sourceFromElement(d.target), existing: null }, false);
   }, true);
 
   document.addEventListener('click', function (e) {
@@ -889,7 +1007,7 @@
     var ae = anchorElOf(key);
     var anchor = null;
     if (ae) { var r = ae.getBoundingClientRect(); anchor = { dx: page.x - (window.scrollX + r.left), dy: page.y - (window.scrollY + r.top) }; }
-    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, source: sourceFromElement(e.target), existing: null }, false);
   }, true);
 
   /* 三级管理员门（260920 全站版）：①页面自定义 ANNO_ADMIN_CHECK() 回调 ②页面自定义 window.ANNO_V7_ADMIN / 门户 annoPortalAdmin ③?anno=1 会话级解锁（公开页管理员自救通道） */
@@ -913,8 +1031,8 @@
     var ub = document.createElement('button');
     ub.type = 'button'; ub.id = 'av7unlock';
     ub.setAttribute('data-annotation-ui', 'true');
-    ub.title = '开启 DingAI（管理员）';
-    ub.textContent = '✎ DingAI';
+    ub.title = t('unlock');
+    ub.textContent = '✎ ' + t('unlock');
     ub.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99992;background:#0f172acc;color:#cbd5e1;border:1px solid #334155;border-radius:8px;padding:5px 11px;font:12px sans-serif;cursor:pointer;opacity:.55';
     ub.addEventListener('mouseenter', function () { ub.style.opacity = '1'; });
     ub.addEventListener('mouseleave', function () { ub.style.opacity = '.55'; });
@@ -937,8 +1055,125 @@
      App 侧择优写入桌面钉 pin.page（key/field/value 与本页批注同源语义）。
      无桥(App 未跑)→探测失败安静、30s 低频重试；非管理员态不启动。 */
   var AV7_BRIDGE = 'http://127.0.0.1:8763';
+  function bridgeFetch(url, options) {
+    if (typeof window.DINGAI_BRIDGE_FETCH === 'function') return window.DINGAI_BRIDGE_FETCH(url, options || {});
+    return fetch(url, options);
+  }
   var av7bridge = null;   // {client, token, since, pollTimer}
 
+  /* @source-start */
+  function decodeVLQ(str) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var i = 0, values = [];
+    while (i < str.length) {
+      var value = 0, shift = 0, digit = 0;
+      do {
+        digit = chars.indexOf(str.charAt(i++));
+        if (digit < 0) return values;
+        value += (digit & 31) * Math.pow(2, shift);
+        shift += 5;
+      } while (digit & 32);
+      values.push((value & 1) ? -(value >> 1) : (value >> 1));
+    }
+    return values;
+  }
+  function originalPosition(map, genLine, genColumn) {
+    if (!map || !map.mappings) return null;
+    var lines = String(map.mappings).split(';');
+    var srcIdx = 0, srcLine = 0, srcCol = 0;
+    var best = null;
+    for (var li = 0; li < lines.length && li < genLine; li++) {
+      var genCol = 0;
+      var segs = lines[li] ? lines[li].split(',') : [];
+      for (var s = 0; s < segs.length; s++) {
+        if (!segs[s]) continue;
+        var v = decodeVLQ(segs[s]);
+        if (!v.length) continue;
+        genCol += v[0] || 0;
+        if (v.length >= 4) {
+          srcIdx += v[1] || 0;
+          srcLine += v[2] || 0;
+          srcCol += v[3] || 0;
+          if (li === genLine - 1 && genCol <= genColumn) {
+            best = { file: (map.sources || [])[srcIdx] || '', line: srcLine + 1, column: srcCol + 1 };
+          }
+        }
+      }
+    }
+    return best;
+  }
+  function attrOf(el, name) {
+    if (!el) return '';
+    if (typeof el.getAttribute === 'function') return el.getAttribute(name) || '';
+    return (el.attrs && el.attrs[name]) || '';
+  }
+  function componentName(type) {
+    if (!type) return '';
+    if (typeof type === 'string') return type;
+    return type.displayName || type.name || type.__name || '';
+  }
+  function applySourceMap(source, map) {
+    if (!source || !map) return source;
+    var base = String(source.file || '').split('?')[0].split('/').pop();
+    var mapFile = String(map.file || '').split('/').pop();
+    if (!mapFile || mapFile !== base) return source;
+    var mapped = originalPosition(map, source.line || 1, Math.max(0, (source.column || 1) - 1));
+    if (!mapped || !mapped.file) return source;
+    return { framework: source.framework, component: source.component || '', file: mapped.file, line: mapped.line, column: mapped.column, mapped: true };
+  }
+  function sourceFromElement(el) {
+    var node = el, guard = 0, found = null;
+    while (node && guard++ < 12 && !found) {
+      var path = attrOf(node, 'data-insp-path') || attrOf(node, 'data-source');
+      if (path && path.indexOf(':') > 0) {
+        var bits = path.split(':');
+        found = { framework: 'inspector', component: '', file: bits.slice(0, -2).join(':') || bits[0], line: parseInt(bits[bits.length - 2], 10) || 0, column: parseInt(bits[bits.length - 1], 10) || 1 };
+        break;
+      }
+      var fileAttr = attrOf(node, 'data-source-file');
+      if (fileAttr) {
+        found = { framework: 'inspector', component: attrOf(node, 'data-source-component') || '', file: fileAttr, line: parseInt(attrOf(node, 'data-source-line'), 10) || 1, column: parseInt(attrOf(node, 'data-source-column'), 10) || 1 };
+        break;
+      }
+      var fiber = node.fiber || null;
+      if (!fiber) {
+        var keys = Object.keys(node);
+        for (var k = 0; k < keys.length; k++) {
+          if (keys[k].indexOf('__reactFiber') === 0 || keys[k].indexOf('__reactInternalInstance') === 0) { fiber = node[keys[k]]; break; }
+        }
+      }
+      var walked = 0;
+      while (fiber && walked++ < 25) {
+        var src = fiber._debugSource;
+        if (src && src.fileName) {
+          found = { framework: 'react', component: componentName(fiber.type), file: src.fileName, line: src.lineNumber || 1, column: src.columnNumber || 1 };
+          break;
+        }
+        fiber = fiber._debugOwner || fiber.return || null;
+      }
+      if (found) break;
+      var vue = node.__vueParentComponent || node.__vue__ || null;
+      if (vue) {
+        var vtype = vue.type || (vue.$options) || {};
+        var vfile = vtype.__file || (vue.$options && vue.$options.__file) || '';
+        if (vfile) {
+          found = { framework: node.__vue__ ? 'vue2' : 'vue', component: componentName(vtype) || (vue.$options && vue.$options.name) || '', file: vfile, line: vtype.__line || 1, column: 1 };
+          break;
+        }
+      }
+      var svelte = node.__svelte_meta;
+      if (svelte && svelte.loc) {
+        found = { framework: 'svelte', component: '', file: svelte.loc.file || svelte.loc.filename || '', line: svelte.loc.line || 1, column: svelte.loc.column || 1 };
+        break;
+      }
+      node = node.parentElement || node.parent || null;
+    }
+    if (!found) return null;
+    var maps = (typeof window !== 'undefined' && window.__DINGAI_SOURCE_MAPS) || [];
+    for (var m = 0; m < maps.length; m++) found = applySourceMap(found, maps[m]) || found;
+    return found;
+  }
+  /* @source-end */
   /* 视口坐标→元素描述（与批注点击同源：keyOf/fieldInfoOf/targetName 复用） */
   function describePoint(cx, cy) {
     var list = [];
@@ -955,7 +1190,8 @@
       key: key || ('free:' + Math.round(cx + window.scrollX) + ',' + Math.round(cy + window.scrollY)),
       target: key ? targetName(key) : '自由位置',
       field: fi.field, value: fi.value, text: txt,
-      anchorDx: cx - rect.left, anchorDy: cy - rect.top
+      anchorDx: cx - rect.left, anchorDy: cy - rect.top,
+      source: sourceFromElement(t)
     };
   }
   function av7Describe(req) {
@@ -977,6 +1213,7 @@
     o.scrollX = Math.round(window.scrollX); o.scrollY = Math.round(window.scrollY);
     o.viewportW = window.innerWidth; o.viewportH = window.innerHeight;
     o.key = d.key; o.target = d.target; o.field = d.field; o.value = d.value; o.text = d.text;
+    if (d.source) o.source = d.source;
     o.anchorKey = d.key; o.anchorDx = Math.round(d.anchorDx || 0); o.anchorDy = Math.round(d.anchorDy || 0);
     return o;
   }
@@ -985,11 +1222,11 @@
     var o = av7Describe(req);
     o.client = b.client; o.token = b.token; o.reqId = req.id; o.url = location.href;
     /* text/plain=简单请求免 CORS preflight(App 手写 HTTP 不处理 OPTIONS) */
-    fetch(AV7_BRIDGE + '/answer', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(o) }).catch(function () {});
+    bridgeFetch(AV7_BRIDGE + '/answer', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(o) }).catch(function () {});
   }
   function av7Poll() {
     var b = av7bridge; if (!b || b.client == null) return;
-    fetch(AV7_BRIDGE + '/pending?client=' + b.client + '&token=' + encodeURIComponent(b.token) + '&since=' + b.since, { cache: 'no-store' })
+    bridgeFetch(AV7_BRIDGE + '/pending?client=' + b.client + '&token=' + encodeURIComponent(b.token) + '&since=' + b.since, { cache: 'no-store' })
       .then(function (r) {
         if (r.status === 403) {  /* App 重启→token 变→重注册 */
           b.client = null; b.token = null;
@@ -1018,7 +1255,7 @@
   }
   function av7Probe() {
     var b = av7bridge; if (!b) return;
-    fetch(AV7_BRIDGE + '/ping', { cache: 'no-store' })
+    bridgeFetch(AV7_BRIDGE + '/ping', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (!j || !j.token || !av7bridge) return;
@@ -1063,7 +1300,7 @@
             });
           });
           if (!positions.length) return;
-          fetch(AV7_BRIDGE + '/track', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ client: bNow.client, token: bNow.token, positions: positions }) }).catch(function () {});
+          bridgeFetch(AV7_BRIDGE + '/track', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ client: bNow.client, token: bNow.token, positions: positions }) }).catch(function () {});
         } catch (e2) {}
       });
       es.onerror = function () {

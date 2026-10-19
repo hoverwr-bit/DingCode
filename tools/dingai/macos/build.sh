@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 swiftc -O -swift-version 5 -o DingAI DingAI.swift \
-  -framework AppKit -framework Carbon -framework Vision \
+  -framework AppKit -framework AVFoundation -framework Carbon -framework Vision \
   -framework ScreenCaptureKit -framework ApplicationServices
 
 APP="DingAI.app"
@@ -14,6 +14,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp DingAI "$APP/Contents/MacOS/"
 cp Info.plist "$APP/Contents/"
+cp ../i18n/strings.json "$APP/Contents/Resources/strings.json"
 
 if codesign --force --sign "DingAI Dev" "$APP" >/dev/null 2>&1; then
     echo "OK: 固定证书签名 → $APP (重编译不再丢授权)"

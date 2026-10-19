@@ -1,0 +1,9 @@
+{
+  "mcp": {
+    "dingai": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8764/mcp",
+      "enabled": true
+    }
+  }
+}

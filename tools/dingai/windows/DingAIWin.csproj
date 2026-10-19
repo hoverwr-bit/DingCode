@@ -10,6 +10,9 @@
     <RootNamespace>DingAIWin</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Content Include="..\i18n\strings.json" Link="strings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- Framework assemblies shipped with the Windows desktop pack. Not a NuGet package. -->
     <Reference Include="UIAutomationClient" />
     <Reference Include="UIAutomationTypes" />

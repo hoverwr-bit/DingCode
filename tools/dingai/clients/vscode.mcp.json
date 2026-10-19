@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "dingai": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/ABS/PATH/tools/dingai/dingai", "mcp"]
+    }
+  }
+}

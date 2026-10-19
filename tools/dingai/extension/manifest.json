@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "DingAI",
+  "version": "0.1.0",
+  "description": "Pins on any page, with DOM anchors, talking to the DingAI desktop app on this computer.",
+  "permissions": ["scripting"],
+  "host_permissions": ["http://127.0.0.1:8763/*", "<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["anno.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

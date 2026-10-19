@@ -12,6 +12,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -21,6 +22,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using Windows.Graphics.Imaging;
+using Windows.Media.FaceAnalysis;
 using Windows.Media.Ocr;
 using Windows.Storage.Streams;
 using WF = System.Windows.Forms;
@@ -48,6 +50,7 @@ namespace DingAIWin;
 
 internal static class Win32
 {
+    [DllImport("winmm.dll", CharSet = CharSet.Unicode)] public static extern int mciSendString(string command, StringBuilder ret, int retLen, IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -60,6 +63,7 @@ internal static class Win32
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr ho);
 
     public const int WM_HOTKEY = 0x0312;
     public const int GWL_EXSTYLE = -20;
@@ -93,12 +97,32 @@ record BoxRec(int Id, int X, int Y, int W, int H, string Color, int Width)
 {
     public string Shape { get; set; } = "rect";
 }
-record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project);
+record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project, bool Redact);
+
+static class UiText
+{
+    public static string T(string key)
+    {
+        var lang = Environment.GetEnvironmentVariable("DINGAI_LANG") ?? "zh";
+        if (lang != "en" && lang != "vi") lang = "zh";
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "strings.json");
+            var row = (JsonNode.Parse(File.ReadAllText(path)) as JsonObject)?[key] as JsonObject;
+            return row?[lang]?.ToString() ?? row?["zh"]?.ToString() ?? key;
+        }
+        catch { return key; }
+    }
+}
 abstract record Item { public int Id = 0; }
 record PinItem(PinRec Pin) : Item;
 record ArrowItem(ArrowRec A) : Item;
 record BoxItem(BoxRec B) : Item;
-record OcrText(string Text, double Cx, double Cy);
+record OcrText(string Text, double Cx, double Cy)
+{
+    public double W { get; set; }
+    public double H { get; set; }
+}
 record WinCand(string Owner, string Title, int[] FramePhys);   // 物理像素
 
 #endregion
@@ -119,6 +143,7 @@ internal class Controller
     public System.Drawing.Bitmap Shot;
     public string ShotFile;
     public List<OcrText> Ocr = new();
+    string VoiceWav = "";
     public volatile bool OcrDone;
     public List<WinCand> WinCands = new();
     public int ScreenW, ScreenH;   // 物理像素
@@ -295,7 +320,7 @@ internal class Controller
                     var b = word.BoundingRect;   // 物理像素
                     var t = word.Text?.Trim();
                     if (!string.IsNullOrEmpty(t))
-                        outList.Add(new OcrText(t, b.X + b.Width / 2, b.Y + b.Height / 2));
+                        outList.Add(new OcrText(t, b.X + b.Width / 2, b.Y + b.Height / 2) { W = b.Width, H = b.Height });
                 }
         }
         catch { }
@@ -335,6 +360,56 @@ internal class Controller
         return null;
     }
 
+    public void StartVoice()
+    {
+        try
+        {
+            VoiceWav = Path.Combine(Path.GetTempPath(), "dingai-hold.wav");
+            var sink = new StringBuilder(8);
+            Native.mciSendString("close dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("open new type waveaudio alias dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("record dingai", sink, sink.Capacity, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    public string StopVoice()
+    {
+        try
+        {
+            var sink = new StringBuilder(8);
+            Native.mciSendString("stop dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("save dingai \"" + VoiceWav + "\"", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("close dingai", sink, sink.Capacity, IntPtr.Zero);
+        }
+        catch { return ""; }
+        return TranscribeWav(VoiceWav);
+    }
+
+    static string TranscribeWav(string wav)
+    {
+        var bin = Environment.GetEnvironmentVariable("DINGAI_WHISPER");
+        var model = Environment.GetEnvironmentVariable("DINGAI_WHISPER_MODEL");
+        var lang = Environment.GetEnvironmentVariable("DINGAI_WHISPER_LANG") ?? "zh";
+        if (lang != "zh" && lang != "en" && lang != "vi") lang = "zh";
+        if (string.IsNullOrEmpty(bin) || string.IsNullOrEmpty(model) || !File.Exists(wav)) return "";
+        try
+        {
+            var info = new ProcessStartInfo(bin, "-m \"" + model + "\" -f \"" + wav + "\" -l " + lang + " -nt")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var proc = Process.Start(info);
+            if (proc == null) return "";
+            var text = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(20000);
+            return proc.ExitCode == 0 ? text.Trim() : "";
+        }
+        catch { return ""; }
+    }
+
     public void Finish(bool clipboard)
     {
         var view = Overlay?.Canvas; if (view == null) return;
@@ -358,21 +433,152 @@ internal class Controller
             }
             catch { OcrDone = true; }
         }
+        if (LoadSync().Redact) RedactSession(view);
         var json = BuildJson(view.Items);
+        WriteSteps(view);
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
         RecordHandoffBaseline();
-        if (clipboard)
+        try
         {
-            try { System.Windows.Clipboard.SetText(HandoffPrompt(json)); } catch { }
+            if (clipboard) CopyExport(json);
+            else WriteExportBundle(json);
         }
+        catch { }
         Publish(json, path, ShotFile);
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
+    }
+
+    void WriteSteps(AnnoCanvas view)
+    {
+        if (view.Steps.Count == 0) return;
+        var dir = Path.Combine(OutRoot, "notes");
+        Directory.CreateDirectory(dir);
+        var lines = new List<string> { "# DingAI steps", "" };
+        var clean = new JsonArray();
+        for (int i = 0; i < view.Steps.Count; i++)
+        {
+            var step = view.Steps[i];
+            var name = "step-" + (i + 1) + ".png";
+            lines.Add((i + 1) + ". " + step.Note);
+            lines.Add("");
+            lines.Add("![](" + name + ")");
+            lines.Add("");
+            if (Shot != null)
+            {
+                var rect = new System.Drawing.Rectangle(Math.Max(0, step.X - 240), Math.Max(0, step.Y - 160), 480, 320);
+                rect.Intersect(new System.Drawing.Rectangle(0, 0, Shot.Width, Shot.Height));
+                if (rect.Width > 2 && rect.Height > 2)
+                {
+                    try { using var crop = Shot.Clone(rect, Shot.PixelFormat); crop.Save(Path.Combine(dir, name), System.Drawing.Imaging.ImageFormat.Png); } catch { }
+                }
+            }
+            clean.Add(new JsonObject { ["n"] = i + 1, ["x_px"] = step.X, ["y_px"] = step.Y, ["note"] = step.Note, ["shot"] = name });
+        }
+        File.WriteAllText(Path.Combine(dir, "sop.md"), string.Join("\n", lines) + "\n");
+        File.WriteAllText(Path.Combine(dir, "repro.json"), new JsonObject { ["schema"] = "dingai-steps-v1", ["steps"] = clean }.ToJsonString());
+    }
+
+    static string RedactString(string text, List<Regex> regs)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        foreach (var reg in regs) text = reg.Replace(text, "[redacted]");
+        return text;
+    }
+
+    List<Regex> RedactPatterns()
+    {
+        var regs = new List<Regex>();
+        string[] builtin =
+        {
+            "[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+\\.[A-Z]{2,}",
+            "(?:\\+?86[-\\s]?)?1[3-9]\\d{9}",
+            "(?:\\+?84|0)(?:3|5|7|8|9)\\d{8}",
+            "\\(?\\d{3}\\)?[-.\\s]\\d{3}[-.\\s]\\d{4}",
+            "\\b(?:PO|P\\.O\\.|SO|订单号|订单|订货单)\\s*[#:：\\-]?\\s*[A-Z0-9][A-Z0-9\\-]{2,}",
+            "(?:[$€£₫]|¥|USD|CNY|VND)\\s?\\d[\\d,]*(?:\\.\\d{1,2})?",
+        };
+        foreach (var pattern in builtin)
+        {
+            try { regs.Add(new Regex(pattern, RegexOptions.IgnoreCase)); } catch { }
+        }
+        var home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI");
+        void Read(string name, bool literal)
+        {
+            try
+            {
+                foreach (var line in File.ReadAllLines(Path.Combine(home, name)))
+                {
+                    var text = line.Trim();
+                    if (text.Length == 0 || text.StartsWith("#")) continue;
+                    try { regs.Add(new Regex(literal ? Regex.Escape(text) : text, RegexOptions.IgnoreCase)); } catch { }
+                }
+            }
+            catch { }
+        }
+        Read("redact-names.txt", true);
+        Read("redact-patterns.txt", false);
+        return regs;
+    }
+
+    void Pixelate(System.Drawing.Bitmap bmp, System.Drawing.Rectangle rect)
+    {
+        rect.Intersect(new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height));
+        if (rect.Width < 2 || rect.Height < 2) return;
+        int sw = Math.Max(1, rect.Width / 14), sh = Math.Max(1, rect.Height / 14);
+        using var small = new System.Drawing.Bitmap(sw, sh);
+        using (var g = System.Drawing.Graphics.FromImage(small))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.DrawImage(bmp, new System.Drawing.Rectangle(0, 0, sw, sh), rect, System.Drawing.GraphicsUnit.Pixel);
+        }
+        using (var g = System.Drawing.Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.DrawImage(small, rect);
+        }
+    }
+
+    void RedactSession(AnnoCanvas view)
+    {
+        var regs = RedactPatterns();
+        if (Shot != null)
+        {
+            foreach (var item in Ocr)
+            {
+                if (RedactString(item.Text, regs) == item.Text) continue;
+                int w = item.W > 4 ? (int)item.W : 80;
+                int h = item.H > 4 ? (int)item.H : 22;
+                Pixelate(Shot, new System.Drawing.Rectangle((int)item.Cx - w / 2, (int)item.Cy - h / 2, w, h));
+            }
+            try
+            {
+                var software = Task.Run(async () => await SoftwareBitmapFromBmp(Shot)).GetAwaiter().GetResult();
+                var gray = SoftwareBitmap.Convert(software, BitmapPixelFormat.Gray8);
+                var detector = FaceDetector.CreateAsync().AsTask().GetAwaiter().GetResult();
+                foreach (var face in detector.DetectFacesAsync(gray).AsTask().GetAwaiter().GetResult())
+                {
+                    var box = face.FaceBox;
+                    Pixelate(Shot, new System.Drawing.Rectangle(box.X, box.Y, box.Width, box.Height));
+                }
+            }
+            catch { }
+            try { if (!string.IsNullOrEmpty(ShotFile)) Shot.Save(ShotFile, System.Drawing.Imaging.ImageFormat.Png); } catch { }
+        }
+        foreach (var it in view.Items)
+        {
+            if (it is PinItem pi)
+            {
+                pi.Pin.OcrNearby = RedactString(pi.Pin.OcrNearby, regs);
+                pi.Pin.Note = RedactString(pi.Pin.Note, regs);
+            }
+        }
     }
 
     public SyncCfg LoadSync()
     {
         string mode = "local", share = "", server = "", token = "", project = "inbox";
+        bool fileRedact = false;
         var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "settings.json");
         try
         {
@@ -385,6 +591,7 @@ internal class Controller
                 token = obj["token"]?.ToString() ?? "";
                 var named = obj["project"]?.ToString();
                 if (!string.IsNullOrEmpty(named)) project = named;
+                fileRedact = obj["redact"]?.ToString() == "true";
             }
         }
         catch { }
@@ -400,8 +607,10 @@ internal class Controller
         if (mode != "folder" && mode != "server") mode = "local";
         project = project.Replace("/", "-").Replace("\\", "-");
         if (string.IsNullOrEmpty(project)) project = "inbox";
+        var redactEnv = Env("DINGAI_REDACT");
+        bool redact = redactEnv == "1" ? true : redactEnv == "0" ? false : fileRedact;
         var hosts = server.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return new SyncCfg(mode, share, hosts, token ?? "", project);
+        return new SyncCfg(mode, share, hosts, token ?? "", project, redact);
     }
 
     public void Publish(string json, string noteFile, string shotFile)
@@ -531,6 +740,7 @@ internal class Controller
             ["screen_capture_ok"] = Shot != null,
             ["live"] = Live,
             ["project"] = LoadSync().Project,
+            ["redacted"] = LoadSync().Redact,
             ["handoff_rules"] = HandoffRules(),
         };
         return root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
@@ -573,6 +783,46 @@ internal class Controller
             catch { }
         }
         return DefaultHandoffRules;
+    }
+
+    public string WriteExportBundle(string json)
+    {
+        var dir = Path.Combine(OutRoot, "export", Stamp());
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "prompt.txt"), HandoffPrompt(json));
+        File.WriteAllText(Path.Combine(dir, "note.json"), json);
+        if (!string.IsNullOrEmpty(ShotFile) && File.Exists(ShotFile))
+            File.Copy(ShotFile, Path.Combine(dir, "screenshot.png"), true);
+        return dir;
+    }
+
+    static BitmapSource BitmapSourceFrom(System.Drawing.Bitmap bmp)
+    {
+        var handle = bmp.GetHbitmap();
+        try
+        {
+            var src = Imaging.CreateBitmapSourceFromHBitmap(handle, IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+            src.Freeze();
+            return src;
+        }
+        finally { Win32.DeleteObject(handle); }
+    }
+
+    public void CopyExport(string json)
+    {
+        var dir = WriteExportBundle(json);
+        var data = new DataObject();
+        data.SetText(HandoffPrompt(json));
+        if (Shot != null)
+        {
+            try { data.SetImage(BitmapSourceFrom(Shot)); } catch { }
+        }
+        var files = new System.Collections.Specialized.StringCollection();
+        files.Add(dir);
+        var png = Path.Combine(dir, "screenshot.png");
+        if (File.Exists(png)) files.Add(png);
+        data.SetFileDropList(files);
+        Clipboard.SetDataObject(data, true);
     }
 
     public string HandoffPrompt(string json) =>
@@ -803,6 +1053,8 @@ internal class AnnoCanvas : Canvas
     Point? _draftFrom, _draftTo;
     public string CurColor = "red"; public int CurWidth = 4; public int DrawMode = 1;   // 1箭头 2方框 3椭圆 4聚光
     public string NextPinType = "bug";
+    public bool StepMode;
+    public List<(int X, int Y, string Note)> Steps = new();
     bool _spotDim;
     UIElement _draftPreview;
     TextBox _noteField; int _noteIdx;
@@ -831,6 +1083,7 @@ internal class AnnoCanvas : Canvas
         MouseMove += OnMove;
         MouseLeftButtonUp += OnUp;
         KeyDown += OnKey;
+        KeyUp += OnKeyUp;
         MouseEnter += (s, e) => Keyboard.Focus(this);
         Loaded += (s, e) => { InstallToolbar(); Keyboard.Focus(this); };
         SizeChanged += (s, e) => { if (Bg != null) { Bg.Width = e.NewSize.Width; Bg.Height = e.NewSize.Height; } };
@@ -882,6 +1135,18 @@ internal class AnnoCanvas : Canvas
         else if (e.Key == Key.B) NextPinType = "bug";
         else if (e.Key == Key.C) NextPinType = "change";
         else if (e.Key == Key.Q) NextPinType = "question";
+        else if (e.Key == Key.V && !e.IsRepeat) C.StartVoice();
+        else if (e.Key == Key.G) StepMode = !StepMode;
+    }
+
+    void OnKeyUp(object s, KeyEventArgs e)
+    {
+        if (e.Key != Key.V) return;
+        var text = C.StopVoice();
+        if (string.IsNullOrEmpty(text)) return;
+        var pin = Items.LastOrDefault(it => it is PinItem) as PinItem;
+        if (pin == null) return;
+        pin.Pin.Note = string.IsNullOrEmpty(pin.Pin.Note) ? text : pin.Pin.Note + " " + text;
     }
 
     public void AddPin(Point p)
@@ -898,6 +1163,7 @@ internal class AnnoCanvas : Canvas
         var uia = C.UiaAt(x, y);
         if (!string.IsNullOrEmpty(uia)) { pin.AnchorKind = "uia"; pin.AnchorNote = uia; }
         Items.Add(new PinItem(pin));
+        if (StepMode) Steps.Add((x, y, string.IsNullOrEmpty(pin.Note) ? "Pin at " + x + "," + y : pin.Note));
         RerenderAll();
         BeginNote(Items.Count - 1, p);
     }
@@ -952,7 +1218,7 @@ internal class AnnoCanvas : Canvas
         var tb = new TextBox
         {
             Width = 226, FontSize = 13,
-            ToolTip = "回车确认,Esc 跳过",
+            ToolTip = UiText.T("note"),
         };
         double fx = Math.Min(p.X + 14, ActualWidth - 240);
         double fy = Math.Min(Math.Max(p.Y - 30, 8), ActualHeight - 36);
@@ -1258,11 +1524,31 @@ internal class AnnoCanvas : Canvas
         x += 10;
         Btn(bar, ref x, "⌘Z撤销", 76).Click += (s, e) => Undo();
         Btn(bar, ref x, "清空", 56).Click += (s, e) => ClearAll();
-        Btn(bar, ref x, "复制JSON", 76).Click += (s, e) =>
+        var copy = Btn(bar, ref x, "复制JSON", 76);
+        System.Windows.Point? press = null;
+        copy.PreviewMouseLeftButtonDown += (s, e) => { press = e.GetPosition(copy); };
+        copy.PreviewMouseMove += (s, e) =>
+        {
+            if (press == null || e.LeftButton != MouseButtonState.Pressed) return;
+            var point = e.GetPosition(copy);
+            if (Math.Abs(point.X - press.Value.X) + Math.Abs(point.Y - press.Value.Y) < 6) return;
+            press = null;
+            try
+            {
+                CommitNoteField();
+                var folder = C.WriteExportBundle(C.BuildJson(Items));
+                var data = new DataObject();
+                var files = new System.Collections.Specialized.StringCollection();
+                files.Add(folder);
+                data.SetFileDropList(files);
+                DragDrop.DoDragDrop(copy, data, DragDropEffects.Copy);
+            }
+            catch { }
+        };
+        copy.Click += (s, e) =>
         {
             CommitNoteField();
-            var json = C.BuildJson(Items);
-            try { System.Windows.Clipboard.SetText(C.HandoffPrompt(json)); } catch { }
+            try { C.CopyExport(C.BuildJson(Items)); } catch { }
         };
         Btn(bar, ref x, "完成 ✓", 70).Click += (s, e) => C.Finish(true);
 

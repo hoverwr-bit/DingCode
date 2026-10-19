@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""DingAI handoff: rules on the prompt, plus a stdio MCP server.
+"""DingAI handoff: rules on the prompt, plus one MCP server.
 
-No third-party packages. The desktop and page clients copy a prompt themselves;
-this script is the CLI and the MCP server (nothing else in the toolbox speaks MCP).
+No third-party packages. `dingai` and this file are the same program.
 
   python3 handoff.py rules
-  python3 handoff.py prompt [note.json]     # stdin when the path is omitted
+  python3 handoff.py latest                 # newest local note, pins as JSON
+  python3 handoff.py prompt [note.json]     # stdin when the path is omitted and stdin is a pipe
   python3 handoff.py baseline [project]
   python3 handoff.py scope [project]
   python3 handoff.py reject [project]
-  python3 handoff.py pins [project]
+  python3 handoff.py pins [project]         # shared folder or team server
   python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
-  python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
+  python3 handoff.py export markdown <note.json> <dest>
+  python3 handoff.py export github <note.json> <dest>
+  python3 handoff.py verify <before.png> <after.png> <outdir>
+  python3 handoff.py confirm <note_id> <pin_id>
+  python3 handoff.py reopen <note_id> <pin_id>
+  python3 handoff.py update                 # only contacts GitHub when DINGAI_UPDATE=1
+  python3 handoff.py mcp                    # stdio: one JSON-RPC message per line, or Content-Length
+  python3 handoff.py mcp-http [--port 8764] # POST /mcp on 127.0.0.1, no SSE
 """
 
+import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_RULES = """- Make the smallest change that fixes the pinned issue. Do not refactor or rewrite surrounding code.
 - Follow the project's ARCHITECTURE or conventions file before adding code.
@@ -71,6 +81,13 @@ def load_rules():
 
 def prompt_for(note_text, rules=None):
     body = note_text if note_text is not None else ""
+    try:
+        from core.sync import load_settings
+        if load_settings().get("redact"):
+            from core.redact import redact_text
+            body = redact_text(body)
+    except Exception:
+        pass
     return (rules if rules is not None else load_rules()).strip() + "\n\n" + PROMPT_LEAD + "\n\n" + body
 
 
@@ -141,6 +158,232 @@ def mark_tool_schema():
             "required": ["note_id", "pin_id"],
         },
     }
+
+
+def screenshot_tool_schema():
+    return {
+        "name": "dingai_screenshot",
+        "description": "Return the PNG for a pin, or the newest local note when no pin is named.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "note_id": {"type": "string"},
+                "pin_id": {"type": "string"},
+                "uri": {"type": "string", "description": "dingai://screenshot/<note_id>/<pin_id>"},
+            },
+        },
+    }
+
+
+PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+MCP_SESSION = "dingai"
+
+
+def output_root():
+    env = os.environ.get("DINGAI_OUTPUT_DIR", "").strip() or os.environ.get("ANNO_OUTPUT_DIR", "").strip()
+    home = os.path.expanduser("~")
+    if not env:
+        return os.path.join(home, "DingAI")
+    if os.path.isabs(env):
+        return env
+    return os.path.join(home, env)
+
+
+def newest_local_note():
+    notes = os.path.join(output_root(), "notes")
+    if not os.path.isdir(notes):
+        return "", None
+    files = [os.path.join(notes, name) for name in os.listdir(notes) if name.endswith(".json")]
+    if not files:
+        return "", None
+    files.sort(key=lambda path: (os.path.getmtime(path), path))
+    path = files[-1]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return path, None
+    return path, data if isinstance(data, dict) else None
+
+
+def resolve_screenshot(note, note_path=""):
+    if not isinstance(note, dict):
+        return ""
+    name = str(note.get("screenshot") or "")
+    if not name:
+        return ""
+    root = output_root()
+    base = os.path.basename(name)
+    candidates = []
+    if os.path.isabs(name):
+        candidates.append(name)
+    candidates.append(os.path.join(root, "shots", base))
+    if note_path:
+        parent = os.path.dirname(note_path)
+        candidates.append(os.path.join(parent, base))
+        candidates.append(os.path.join(os.path.dirname(parent), "shots", base))
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def latest_pins_json():
+    path, note = newest_local_note()
+    if note is not None:
+        pins = note.get("pins")
+        return {
+            "ok": True,
+            "mode": "local",
+            "note": path,
+            "screenshot": resolve_screenshot(note, path),
+            "pins": pins if isinstance(pins, list) else [],
+        }
+    return list_agent_pins()
+
+
+def write_export_bundle(note_text, png_bytes=None, dest_root=None):
+    root = dest_root or os.path.join(output_root(), "export")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(root, stamp)
+    os.makedirs(folder, exist_ok=True)
+    prompt = prompt_for(note_text or "")
+    with open(os.path.join(folder, "prompt.txt"), "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    body = note_text or ""
+    if body and not body.endswith("\n"):
+        body += "\n"
+    with open(os.path.join(folder, "note.json"), "w", encoding="utf-8") as fh:
+        fh.write(body)
+    if png_bytes:
+        with open(os.path.join(folder, "screenshot.png"), "wb") as fh:
+            fh.write(png_bytes)
+    return folder
+
+
+_CLIP_PROCS = []
+
+
+def _xclip(exe, args, data):
+    try:
+        proc = subprocess.Popen(
+            [exe, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        proc.stdin.write(data)
+        proc.stdin.close()
+    except OSError:
+        return False
+    _CLIP_PROCS.append(proc)
+    while len(_CLIP_PROCS) > 2:
+        old = _CLIP_PROCS.pop(0)
+        old.kill()
+        try:
+            old.wait(timeout=1)
+        except Exception:
+            pass
+    return True
+
+
+def offer_clipboard(prompt, png_path=""):
+    """Best effort for a Linux session. xclip keeps one target per selection, so the prompt goes to the clipboard and the PNG to the primary selection."""
+    exe = shutil.which("xclip")
+    if not exe:
+        return False
+    ok = _xclip(exe, ["-selection", "clipboard", "-t", "text/plain"], (prompt or "").encode("utf-8"))
+    if png_path and os.path.isfile(png_path):
+        with open(png_path, "rb") as fh:
+            _xclip(exe, ["-selection", "primary", "-t", "image/png"], fh.read())
+    return ok
+
+
+def _add_shot(items, seen, uri, name, path):
+    if not uri or uri in seen or not path or not os.path.isfile(path):
+        return
+    seen.add(uri)
+    items.append({"uri": uri, "name": name or os.path.basename(path), "mimeType": "image/png", "path": path})
+
+
+def screenshot_index():
+    items = []
+    seen = set()
+    path, note = newest_local_note()
+    shot = resolve_screenshot(note, path) if note else ""
+    if note and shot:
+        note_id = str(note.get("file") or note.get("id") or os.path.splitext(os.path.basename(path))[0])
+        _add_shot(items, seen, "dingai://screenshot/%s" % note_id, os.path.basename(shot), shot)
+        for pin in note.get("pins") or []:
+            if not isinstance(pin, dict) or pin.get("id") is None:
+                continue
+            _add_shot(
+                items, seen,
+                "dingai://screenshot/%s/%s" % (note_id, pin.get("id")),
+                "pin-%s" % pin.get("id"),
+                shot,
+            )
+    try:
+        listed = list_agent_pins()
+    except Exception:
+        listed = {}
+    for pin in listed.get("pins") or []:
+        sp = pin.get("screenshot_path") or ""
+        note_id = str(pin.get("note_id") or "note")
+        _add_shot(items, seen, "dingai://screenshot/%s/%s" % (note_id, pin.get("id")), os.path.basename(sp), sp)
+        _add_shot(items, seen, "dingai://screenshot/%s" % note_id, os.path.basename(sp), sp)
+    return items
+
+
+def find_screenshot(uri):
+    for item in screenshot_index():
+        if item["uri"] == uri:
+            return item["path"]
+    return ""
+
+
+def call_screenshot(arguments):
+    arguments = arguments or {}
+    uri = arguments.get("uri") or ""
+    note_id = arguments.get("note_id") or ""
+    pin_id = arguments.get("pin_id")
+    if not uri and note_id and pin_id not in (None, ""):
+        uri = "dingai://screenshot/%s/%s" % (note_id, pin_id)
+    elif not uri and note_id:
+        uri = "dingai://screenshot/%s" % note_id
+    path = find_screenshot(uri) if uri else ""
+    if not path:
+        note_path, note = newest_local_note()
+        if note and (not note_id or str(note.get("file") or note.get("id") or "") == str(note_id)):
+            path = resolve_screenshot(note, note_path)
+    if not path:
+        try:
+            listed = list_agent_pins(arguments.get("project") or None)
+        except Exception:
+            listed = {}
+        for pin in listed.get("pins") or []:
+            if pin_id not in (None, "") and str(pin.get("id")) != str(pin_id):
+                continue
+            if note_id and str(pin.get("note_id") or "") != str(note_id):
+                continue
+            sp = pin.get("screenshot_path") or ""
+            if sp and os.path.isfile(sp):
+                path = sp
+                break
+    if not path or not os.path.isfile(path):
+        return {"content": [{"type": "text", "text": "screenshot not found"}], "isError": True}
+    with open(path, "rb") as fh:
+        blob = base64.b64encode(fh.read()).decode("ascii")
+    return {"content": [{"type": "image", "data": blob, "mimeType": "image/png"}]}
+
+
+def protocol_version(msg):
+    asked = (msg.get("params") or {}).get("protocolVersion")
+    if asked in PROTOCOL_VERSIONS:
+        return asked
+    return "2024-11-05"
 
 
 def list_agent_pins(project=None):
@@ -381,15 +624,29 @@ def handle_rpc(msg):
         return None
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
+            "protocolVersion": protocol_version(msg),
+            "capabilities": {"tools": {}, "resources": {}},
             "serverInfo": {"name": "dingai", "version": "0.1"},
         }}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
-            tool_schema(), scope_tool_schema(), reject_tool_schema(), list_tool_schema(), mark_tool_schema()]}}
+            tool_schema(), scope_tool_schema(), reject_tool_schema(),
+            list_tool_schema(), mark_tool_schema(), screenshot_tool_schema()]}}
+    if method == "resources/list":
+        rows = [{"uri": item["uri"], "name": item["name"], "mimeType": "image/png"} for item in screenshot_index()]
+        return {"jsonrpc": "2.0", "id": mid, "result": {"resources": rows}}
+    if method == "resources/read":
+        uri = ((msg.get("params") or {}).get("uri")) or ""
+        found = find_screenshot(uri)
+        if not found:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32002, "message": "screenshot not found"}}
+        with open(found, "rb") as fh:
+            blob = base64.b64encode(fh.read()).decode("ascii")
+        return {"jsonrpc": "2.0", "id": mid, "result": {"contents": [{
+            "uri": uri, "mimeType": "image/png", "blob": blob,
+        }]}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
@@ -408,6 +665,8 @@ def handle_rpc(msg):
         if name == "dingai_mark_fixed":
             result = mark_fixed(arguments)
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        if name == "dingai_screenshot":
+            return {"jsonrpc": "2.0", "id": mid, "result": call_screenshot(arguments)}
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
     if mid is None:
         return None
@@ -440,14 +699,165 @@ def write_message(obj, stream):
     stream.flush()
 
 
+class _Pushback:
+    def __init__(self, first, stream):
+        self._first = first
+        self._stream = stream
+
+    def readline(self):
+        if self._first is not None:
+            line, self._first = self._first, None
+            return line
+        return self._stream.readline()
+
+    def read(self, n):
+        return self._stream.read(n)
+
+
+def _write_ndjson(obj, stream):
+    stream.write(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n")
+    stream.flush()
+
+
 def serve_mcp(stdin, stdout):
-    while True:
-        msg = read_message(stdin)
-        if msg is None:
+    """MCP stdio. A leading Content-Length header keeps the old framing; otherwise one JSON object per line."""
+    first = stdin.readline()
+    if not first:
+        return
+    if first.lstrip()[:14].lower() == b"content-length":
+        wrapped = _Pushback(first, stdin)
+        while True:
+            msg = read_message(wrapped)
+            if msg is None:
+                return
+            reply = handle_rpc(msg)
+            if reply is not None:
+                write_message(reply, stdout)
+        return
+    line = first
+    while line:
+        text = line.decode("utf-8", "replace").strip()
+        if text:
+            try:
+                msg = json.loads(text)
+            except ValueError:
+                msg = None
+            if isinstance(msg, dict):
+                reply = handle_rpc(msg)
+                if reply is not None:
+                    _write_ndjson(reply, stdout)
+        line = stdin.readline()
+
+
+class McpHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s\n" % (fmt % args))
+
+    def _path_ok(self):
+        return self.path.split("?", 1)[0] in ("/mcp", "/")
+
+    def _authorized(self):
+        token = os.environ.get("DINGAI_MCP_TOKEN", "")
+        if not token:
+            return True
+        return self.headers.get("Authorization", "") == "Bearer " + token
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version")
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+
+    def _wants_json(self):
+        accept = self.headers.get("Accept", "")
+        if not accept:
+            return True
+        return "application/json" in accept or "*/*" in accept
+
+    def _send(self, code, body=b"", content_type="application/json", session=False):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if session:
+            self.send_header("Mcp-Session-Id", self.headers.get("Mcp-Session-Id") or MCP_SESSION)
+        self._cors()
+        self.end_headers()
+        if body and self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        if not self._path_ok():
+            self._send(404, b"")
             return
-        reply = handle_rpc(msg)
-        if reply is not None:
-            write_message(reply, stdout)
+        self._send(204, b"")
+
+    def do_GET(self):
+        if not self._path_ok():
+            self._send(404, b"")
+            return
+        if not self._authorized():
+            self._send(401, b'{"error":"unauthorized"}')
+            return
+        self.send_response(405)
+        self.send_header("Allow", "POST, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self._cors()
+        self.end_headers()
+
+    def do_DELETE(self):
+        if not self._path_ok():
+            self._send(404, b"")
+            return
+        if not self._authorized():
+            self._send(401, b'{"error":"unauthorized"}')
+            return
+        self._send(204, b"")
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b""
+        if not self._path_ok():
+            self._send(404, b"")
+            return
+        if not self._authorized():
+            self._send(401, b'{"error":"unauthorized"}')
+            return
+        if not self._wants_json():
+            self._send(406, b'{"error":"application/json only"}')
+            return
+        try:
+            msg = json.loads(raw.decode("utf-8") or "null")
+        except ValueError:
+            self._send(400, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}')
+            return
+        reply = handle_rpc(msg) if isinstance(msg, dict) else None
+        if reply is None:
+            self._send(202, b"")
+            return
+        body = json.dumps(reply, ensure_ascii=False).encode("utf-8")
+        self._send(200, body, session=True)
+
+
+def make_http_server(host, port):
+    return ThreadingHTTPServer((host, port), McpHandler)
+
+
+def serve_http(host="127.0.0.1", port=8764):
+    if host not in ("127.0.0.1", "::1"):
+        sys.stderr.write("mcp-http listens on loopback only\n")
+        return 1
+    server = make_http_server(host, port)
+    sys.stderr.write("dingai mcp-http http://%s:%s/mcp\n" % (host, server.server_address[1]))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 def main(argv):
@@ -455,12 +865,28 @@ def main(argv):
     if cmd in ("-h", "--help", "help"):
         sys.stdout.write(__doc__ or "")
         return 0
+    if cmd == "update":
+        from core.update import check_update
+        try:
+            result = check_update()
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "rules":
         sys.stdout.write(load_rules() + "\n")
+        return 0
+    if cmd == "latest":
+        sys.stdout.write(json.dumps(latest_pins_json(), ensure_ascii=False, indent=2) + "\n")
         return 0
     if cmd == "prompt":
         path = argv[2] if len(argv) > 2 else ""
         record_baseline()
+        if not path and sys.stdin.isatty():
+            path, _note = newest_local_note()
+            if not path:
+                sys.stderr.write("no local note\n")
+                return 1
         sys.stdout.write(prompt_for(read_note(path)))
         return 0
     if cmd == "baseline":
@@ -481,6 +907,36 @@ def main(argv):
     if cmd == "pins":
         sys.stdout.write(json.dumps(list_agent_pins(argv[2] if len(argv) > 2 else None), ensure_ascii=False, indent=2) + "\n")
         return 0
+    if cmd == "export":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py export <markdown|github|name> <note.json> <dest>\n")
+            return 2
+        from core.export import export_note
+        try:
+            note = json.loads(read_note(argv[3]) or "{}")
+        except ValueError:
+            note = {}
+        result = export_note(argv[2], note, argv[4])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if cmd == "verify":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py verify <before.png> <after.png> <outdir>\n")
+            return 2
+        from core.diff import write_diff
+        result = write_diff(argv[2], argv[3], argv[4])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if cmd in ("confirm", "reopen"):
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py %s <note_id> <pin_id>\n" % cmd)
+            return 2
+        from core.sync import load_settings, set_pin_status
+        cfg = load_settings()
+        status = "confirmed" if cmd == "confirm" else "open"
+        result = set_pin_status(cfg["project"], argv[2], argv[3], status, None, "")
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "mark-fixed":
         if len(argv) < 4:
             sys.stderr.write("usage: handoff.py mark-fixed <note_id> <pin_id> [verify.png]\n")
@@ -495,6 +951,20 @@ def main(argv):
     if cmd == "mcp":
         serve_mcp(sys.stdin.buffer, sys.stdout.buffer)
         return 0
+    if cmd == "mcp-http":
+        host, port = "127.0.0.1", 8764
+        index = 2
+        while index < len(argv):
+            if argv[index] == "--host" and index + 1 < len(argv):
+                host = argv[index + 1]
+                index += 2
+            elif argv[index] == "--port" and index + 1 < len(argv):
+                port = int(argv[index + 1])
+                index += 2
+            else:
+                sys.stderr.write("usage: handoff.py mcp-http [--host 127.0.0.1] [--port 8764]\n")
+                return 2
+        return serve_http(host, port)
     sys.stderr.write("unknown command: %s\n" % cmd)
     return 2
 

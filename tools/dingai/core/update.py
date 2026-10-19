@@ -1,0 +1,40 @@
+"""Opt-in update check against GitHub releases. Off unless DINGAI_UPDATE=1.
+
+The request is a GET of the public releases endpoint. No identifier is sent.
+Nothing is downloaded or installed.
+"""
+
+import json
+import os
+import urllib.request
+from pathlib import Path
+
+
+def current_version():
+    path = Path(__file__).resolve().parents[1] / "VERSION"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def check_update():
+    current = current_version()
+    if os.environ.get("DINGAI_UPDATE") != "1":
+        return {"ok": True, "checked": False, "current": current}
+    repo = os.environ.get("DINGAI_UPDATE_REPO") or "hoverwr-bit/AI-toolbox"
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/releases/latest" % repo,
+        headers={"User-Agent": "dingai", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    latest = str(data.get("tag_name") or "").lstrip("v")
+    return {
+        "ok": True,
+        "checked": True,
+        "current": current,
+        "latest": latest,
+        "url": data.get("html_url") or "",
+        "update": bool(latest) and latest != current,
+    }

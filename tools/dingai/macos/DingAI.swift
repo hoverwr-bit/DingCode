@@ -9,6 +9,18 @@
 //
 
 import AppKit
+import AVFoundation
+
+func dingaiText(_ key: String) -> String {
+    let env = ProcessInfo.processInfo.environment["DINGAI_LANG"] ?? "zh"
+    let lang = (env == "en" || env == "vi") ? env : "zh"
+    let url = Bundle.main.url(forResource: "strings", withExtension: "json")
+        ?? URL(fileURLWithPath: "strings.json")
+    guard let data = try? Data(contentsOf: url),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]],
+          let row = obj[key] else { return key }
+    return row[lang] ?? row["zh"] ?? key
+}
 import Carbon
 import Carbon.HIToolbox
 import Vision
@@ -98,6 +110,8 @@ struct OcrTextItem {
     var text: String
     var cx: Double        // 截图像素
     var cy: Double
+    var w: Double = 0
+    var h: Double = 0
 }
 
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
@@ -438,9 +452,56 @@ final class BridgeServer {
             let copy = positions
             RunLoop.main.perform { [weak self] in self?.onTrack?(copy) }
             return (json(["ok": 1]), false)
+        case ("POST", "/voice"):
+            lock.lock()
+            let voiceOk = req.query["token"].map { clients.values.contains($0) } ?? false
+            lock.unlock()
+            guard voiceOk else {
+                return (plain(403, "bad token"), false)
+            }
+            let text = BridgeServer.transcribe(body: req.body)
+            return (plain(200, text), false)
         default:
             return (plain(404, "not found"), false)
         }
+    }
+
+    static func transcribe(body: Data) -> String {
+        let dir = FileManager.default.temporaryDirectory
+        let raw = dir.appendingPathComponent("dingai-voice-in")
+        try? body.write(to: raw)
+        var wav = raw
+        if body.prefix(4) != Data("RIFF".utf8), let ffmpeg = ProcessInfo.processInfo.environment["DINGAI_FFMPEG"]
+            ?? (FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/ffmpeg") ? "/opt/homebrew/bin/ffmpeg" : nil)
+            ?? (FileManager.default.isExecutableFile(atPath: "/usr/local/bin/ffmpeg") ? "/usr/local/bin/ffmpeg" : nil) {
+            wav = dir.appendingPathComponent("dingai-voice.wav")
+            let ff = Process()
+            ff.executableURL = URL(fileURLWithPath: ffmpeg)
+            ff.arguments = ["-y", "-i", raw.path, "-ar", "16000", "-ac", "1", wav.path]
+            ff.standardOutput = Pipe(); ff.standardError = Pipe()
+            try? ff.run(); ff.waitUntilExit()
+        }
+        return BridgeServer.transcribeFile(wav)
+    }
+
+    static func transcribeFile(_ url: URL) -> String {
+        let env = ProcessInfo.processInfo.environment
+        let bin = env["DINGAI_WHISPER"] ?? ""
+        let model = env["DINGAI_WHISPER_MODEL"] ?? ""
+        var lang = env["DINGAI_WHISPER_LANG"] ?? "zh"
+        if !["zh", "en", "vi"].contains(lang) { lang = "zh" }
+        guard !bin.isEmpty, !model.isEmpty, FileManager.default.isExecutableFile(atPath: bin) else { return "" }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: bin)
+        proc.arguments = ["-m", model, "-f", url.path, "-l", lang, "-nt"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return "" }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     private func clientValid(_ id: Int, _ token: String) -> Bool {
@@ -881,7 +942,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             let b = obs.boundingBox
             let t = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !t.isEmpty else { continue }
-            out.append(OcrTextItem(text: t, cx: b.midX * W, cy: (1.0 - b.midY) * H))
+            out.append(OcrTextItem(text: t, cx: b.midX * W, cy: (1.0 - b.midY) * H,
+                                    w: b.width * W, h: b.height * H))
         }
         return out
     }
@@ -973,17 +1035,19 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         while !ocrDone && Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
+        if redactEnabled() { redactSession(view) }
         let json = buildJSON(items: view.items)
+        writeSteps(view: view, beside: outputRoot.appendingPathComponent("notes"))
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
         let url = outputRoot.appendingPathComponent("notes")
                         .appendingPathComponent("anno-" + stamp() + ".json")
         try? data.write(to: url)
         recordHandoffBaseline()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let folder = writeExportBundle(text)
         if copyToPasteboard {
-            let text = String(data: data, encoding: .utf8) ?? ""
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(handoffPrompt(text), forType: .string)
+            copyExport(prompt: handoffPrompt(text), image: shotURL, folder: folder)
         }
         let shotCopy = shotURL
         overlay?.orderOut(nil)
@@ -991,6 +1055,156 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         shotCG = nil
         reportToTeam(json: json, jsonData: data, noteFile: url, shotFile: shotCopy)
         done?()
+    }
+
+    func redactEnabled() -> Bool {
+        switch ProcessInfo.processInfo.environment["DINGAI_REDACT"] {
+        case "1": return true
+        case "0": return false
+        default:
+            let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/settings.json")
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return (obj["redact"] as? Bool) == true
+            }
+            return false
+        }
+    }
+
+    func redactPatterns() -> [NSRegularExpression] {
+        let builtin = [
+            "[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+\\.[A-Z]{2,}",
+            "(?:\\+?86[-\\s]?)?1[3-9]\\d{9}",
+            "(?:\\+?84|0)(?:3|5|7|8|9)\\d{8}",
+            "\\(?\\d{3}\\)?[-.\\s]\\d{3}[-.\\s]\\d{4}",
+            "\\b(?:PO|P\\.O\\.|SO|订单号|订单|订货单)\\s*[#:：\\-]?\\s*[A-Z0-9][A-Z0-9\\-]{2,}",
+            "(?:[$€£₫]|¥|USD|CNY|VND)\\s?\\d[\\d,]*(?:\\.\\d{1,2})?",
+        ]
+        var regs: [NSRegularExpression] = []
+        for pattern in builtin {
+            if let reg = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) { regs.append(reg) }
+        }
+        let home = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI")
+        if let text = try? String(contentsOfFile: (home as NSString).appendingPathComponent("redact-names.txt"), encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                let name = line.trimmingCharacters(in: .whitespaces)
+                if name.isEmpty || name.hasPrefix("#") { continue }
+                let escaped = NSRegularExpression.escapedPattern(for: name)
+                if let reg = try? NSRegularExpression(pattern: escaped, options: [.caseInsensitive]) { regs.append(reg) }
+            }
+        }
+        if let text = try? String(contentsOfFile: (home as NSString).appendingPathComponent("redact-patterns.txt"), encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                let pattern = line.trimmingCharacters(in: .whitespaces)
+                if pattern.isEmpty || pattern.hasPrefix("#") { continue }
+                if let reg = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) { regs.append(reg) }
+            }
+        }
+        return regs
+    }
+
+    func redactString(_ text: String, regs: [NSRegularExpression]) -> String {
+        var out = text
+        for reg in regs {
+            let range = NSRange(out.startIndex..., in: out)
+            out = reg.stringByReplacingMatches(in: out, range: range, withTemplate: "[redacted]")
+        }
+        return out
+    }
+
+    func faceRects(_ image: CGImage) -> [CGRect] {
+        let req = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cgImage: image)
+        try? handler.perform([req])
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        return (req.results ?? []).map { obs in
+            let b = obs.boundingBox
+            return CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h)
+        }
+    }
+
+    func pixelate(_ image: CGImage, rects: [CGRect]) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        for rect in rects {
+            let r = rect.integral.intersection(CGRect(x: 0, y: 0, width: w, height: h))
+            guard r.width > 2, r.height > 2, let crop = image.cropping(to: r) else { continue }
+            let sw = max(1, r.width / 14), sh = max(1, r.height / 14)
+            let destY = CGFloat(h) - r.maxY
+            ctx.saveGState()
+            ctx.translateBy(x: r.minX, y: destY)
+            ctx.scaleBy(x: r.width / sw, y: r.height / sh)
+            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+            ctx.restoreGState()
+        }
+        return ctx.makeImage() ?? image
+    }
+
+    func writeSteps(view: AnnotationView, beside dir: URL) {
+        guard !view.stepMarks.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var lines = ["# DingAI steps", ""]
+        var clean: [[String: Any]] = []
+        for (index, mark) in view.stepMarks.enumerated() {
+            let name = "step-\(index + 1).png"
+            let note = "Pin at \(mark.x),\(mark.y)"
+            lines.append("\(index + 1). \(note)")
+            lines.append("")
+            lines.append("![](\(name))")
+            lines.append("")
+            if let cg = shotCG {
+                let rect = CGRect(x: max(0, mark.x - 240), y: max(0, mark.y - 160), width: 480, height: 320)
+                    .intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+                if let crop = cg.cropping(to: rect),
+                   let dest = CGImageDestinationCreateWithURL(dir.appendingPathComponent(name) as CFURL, "public.png" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, crop, nil)
+                    CGImageDestinationFinalize(dest)
+                }
+            }
+            clean.append(["n": index + 1, "x_px": mark.x, "y_px": mark.y, "note": note, "shot": name])
+        }
+        try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("sop.md"), atomically: true, encoding: .utf8)
+        if let data = try? JSONSerialization.data(withJSONObject: ["schema": "dingai-steps-v1", "steps": clean], options: [.prettyPrinted]) {
+            try? data.write(to: dir.appendingPathComponent("repro.json"))
+        }
+    }
+
+    func redactSession(_ view: AnnotationView) {
+        let regs = redactPatterns()
+        var rects: [CGRect] = []
+        for item in ocrItems where redactString(item.text, regs: regs) != item.text {
+            let w = item.w > 4 ? item.w : 80
+            let h = item.h > 4 ? item.h : 22
+            rects.append(CGRect(x: item.cx - w / 2, y: item.cy - h / 2, width: w, height: h))
+        }
+        if let cg = shotCG {
+            rects.append(contentsOf: faceRects(cg))
+            if let next = pixelate(cg, rects: rects) {
+                shotCG = next
+                if let url = shotURL,
+                   let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, next, nil)
+                    CGImageDestinationFinalize(dest)
+                }
+            }
+        }
+        for i in view.items.indices {
+            switch view.items[i] {
+            case .pin(var pin):
+                pin.ocrNearby = redactString(pin.ocrNearby, regs: regs)
+                if let note = pin.note { pin.note = redactString(note, regs: regs) }
+                view.items[i] = .pin(pin)
+            case .text(var label):
+                label.text = redactString(label.text, regs: regs)
+                view.items[i] = .text(label)
+            default:
+                break
+            }
+        }
     }
 
     // MARK: 团队同步(环境变量或 ~/DingAI/settings.json;失败静默跳过)
@@ -1147,7 +1361,10 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                     d["window_nx"] = (nx * 1000).rounded() / 1000
                     d["window_ny"] = (ny * 1000).rounded() / 1000
                 }
-                if let pg = p.pageInfo { d["page"] = pg }   // 页内桥结果(可选;桥命中才有)
+                if let pg = p.pageInfo {
+                    d["page"] = pg
+                    if let src = pg["source"] { d["source"] = src }
+                }
                 var anch: [String: Any] = ["kind": p.anchorKind, "dx": (p.anchorDX * 10).rounded() / 10,
                                            "dy": (p.anchorDY * 10).rounded() / 10]
                 if let key = p.anchorKey { anch["key"] = key }
@@ -1196,6 +1413,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "screen_capture_ok": (shotCG != nil),
             "live": live,
             "project": syncChoice().project,
+            "redacted": redactEnabled(),
             "handoff_rules": handoffRules(),
         ]
         return json
@@ -1236,6 +1454,33 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     func handoffPrompt(_ json: String) -> String {
         handoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json
+    }
+
+    /// export/<stamp>/ holds the prompt, the note, and the annotated PNG. One pasteboard item carries all three.
+    func writeExportBundle(_ json: String) -> URL {
+        let dir = outputRoot.appendingPathComponent("export").appendingPathComponent(stamp())
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? handoffPrompt(json).write(to: dir.appendingPathComponent("prompt.txt"), atomically: true, encoding: .utf8)
+        try? json.write(to: dir.appendingPathComponent("note.json"), atomically: true, encoding: .utf8)
+        if let shot = shotURL, let data = try? Data(contentsOf: shot) {
+            try? data.write(to: dir.appendingPathComponent("screenshot.png"))
+        }
+        return dir
+    }
+
+    func copyExport(prompt: String, image: URL?, folder: URL) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        let item = NSPasteboardItem()
+        item.setString(prompt, forType: .string)
+        if let image, let data = try? Data(contentsOf: image) {
+            item.setData(data, forType: .png)
+        }
+        item.setString(folder.absoluteString, forType: .fileURL)
+        if !board.writeObjects([item]) {
+            board.clearContents()
+            board.setString(prompt, forType: .string)
+        }
     }
 
     func gitOutput(_ args: [String], dir: String) -> String? {
@@ -1516,6 +1761,39 @@ final class DragBar: NSView {
 
 // MARK: - 批注画布
 
+/// Drag copies the export folder. A click still runs the button action.
+final class ExportButton: NSButton, NSDraggingSource {
+    weak var controller: AnnoController?
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        .copy
+    }
+    override func mouseDown(with event: NSEvent) {
+        let start = event.locationInWindow
+        var dragged = false
+        while true {
+            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            if next.type == .leftMouseUp { break }
+            let point = next.locationInWindow
+            if hypot(point.x - start.x, point.y - start.y) > 4 {
+                beginBundleDrag(next)
+                dragged = true
+                break
+            }
+        }
+        if !dragged { sendAction(action, to: target) }
+    }
+    func beginBundleDrag(_ event: NSEvent) {
+        guard let c = controller, let view = c.overlay?.annoView else { return }
+        let data = (try? JSONSerialization.data(withJSONObject: c.buildJSON(items: view.items),
+                        options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let folder = c.writeExportBundle(text)
+        let item = NSDraggingItem(pasteboardWriter: folder as NSURL)
+        item.setDraggingFrame(bounds, contents: nil)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+}
+
 final class AnnotationView: NSView {
     weak var controller: AnnoController?
     var bgImage: NSImage?
@@ -1648,6 +1926,7 @@ final class AnnotationView: NSView {
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
                                     windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
+        if stepMode { stepMarks.append((x, y)) }
         let idx = items.count - 1
         nextId += 1
         selectedIndex = idx
@@ -1694,7 +1973,7 @@ final class AnnotationView: NSView {
         let fx = min(p.x + 14, bounds.width - 240)
         let fy = min(max(p.y - 30, 8), bounds.height - 34)
         let f = NSTextField(frame: NSRect(x: fx, y: fy, width: 226, height: 26))
-        f.placeholderString = "备注:回车确认,Esc 跳过"
+        f.placeholderString = dingaiText("note")
         f.bezelStyle = .roundedBezel
         f.font = .systemFont(ofSize: 13)
         f.backgroundColor = .white
@@ -1828,8 +2107,57 @@ final class AnnotationView: NSView {
         case UInt16(kVK_ANSI_B): setPinKind("bug")
         case UInt16(kVK_ANSI_C): setPinKind("change")
         case UInt16(kVK_ANSI_Q): setPinKind("question")
+        case UInt16(kVK_ANSI_V) where !event.isARepeat: startVoice()
+        case UInt16(kVK_ANSI_G): stepMode.toggle()
         default: super.keyDown(with: event)
         }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_ANSI_V) {
+            appendVoice(stopVoice())
+            return
+        }
+        super.keyUp(with: event)
+    }
+
+    var stepMode = false
+    var stepMarks: [(x: Int, y: Int)] = []
+    var voiceRecorder: AVAudioRecorder?
+    var voiceURL: URL?
+
+    func startVoice() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("dingai-hold.wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+        ]
+        voiceURL = url
+        voiceRecorder = try? AVAudioRecorder(url: url, settings: settings)
+        voiceRecorder?.record()
+    }
+
+    func stopVoice() -> String {
+        voiceRecorder?.stop()
+        voiceRecorder = nil
+        guard let url = voiceURL else { return "" }
+        return BridgeServer.transcribeFile(url)
+    }
+
+    func appendVoice(_ text: String) {
+        guard !text.isEmpty else { return }
+        var idx = selectedIndex
+        if idx == nil {
+            idx = items.lastIndex { if case .pin = $0 { return true }; return false }
+        }
+        guard let idx, items.indices.contains(idx), case .pin(var pin) = items[idx] else { return }
+        let note = pin.note ?? ""
+        pin.note = note.isEmpty ? text : note + " " + text
+        items[idx] = .pin(pin)
+        needsDisplay = true
     }
 
     func beginTextEditing(at p: NSPoint) {
@@ -2559,8 +2887,23 @@ final class AnnotationView: NSView {
                                           ("完成✓", #selector(doneNow))]
         for (t, sel) in acts {
             let w = CGFloat(t.count * 15 + 20)
-            let btn = textBtn(t, frame: NSRect(x: x, y: 8, width: w, height: 28))
-            btn.action = sel; btn.target = self
+            let btn: NSButton
+            if sel == #selector(copyJSON) {
+                let export = ExportButton(title: t, target: self, action: sel)
+                export.frame = NSRect(x: x, y: 8, width: w, height: 28)
+                export.isBordered = false
+                export.wantsLayer = true
+                export.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
+                export.layer?.cornerRadius = 6
+                export.font = .systemFont(ofSize: 12, weight: .medium)
+                export.contentTintColor = .black
+                export.controller = controller
+                btn = export
+            } else {
+                btn = textBtn(t, frame: NSRect(x: x, y: 8, width: w, height: 28))
+                btn.action = sel
+                btn.target = self
+            }
             bar.addSubview(btn); x += w + 8
         }
         addSubview(bar)
@@ -2615,8 +2958,8 @@ final class AnnotationView: NSView {
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
         let text = String(data: data, encoding: .utf8) ?? ""
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(c.handoffPrompt(text), forType: .string)
+        let folder = c.writeExportBundle(text)
+        c.copyExport(prompt: c.handoffPrompt(text), image: c.shotURL, folder: folder)
         flashBubble("JSON 已复制(\(items.count) 笔)")
     }
     @objc func doneNow() { controller?.finish(copyToPasteboard: true) }

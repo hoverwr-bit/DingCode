@@ -4,7 +4,9 @@ A toolbox of local helpers for AI coding agents. The first tool is **DingAI** (f
 
 **给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingAI**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
 
-DingAI drops pins on any app or web page and exports JSON: app, window, pixel coordinates, nearby OCR text and, inside a browser, the DOM element and field under the pin. Paste that into Claude Code, Codex or any other agent.
+Languages are Chinese, English, and Vietnamese (`DINGAI_LANG=zh|en|vi`). Signing, notarization, and packaged releases are described in `tools/dingai/RELEASE.md`. An update check runs only when `DINGAI_UPDATE=1`.
+
+DingAI drops pins on any app or web page and exports JSON: app, window, pixel coordinates, nearby OCR text and, inside a browser, the DOM element and field under the pin. `dingai` prints that JSON, or a prompt, for any agent. MCP config for the clients whose docs were checked is in `tools/dingai/clients/`.
 
 ## Layout / 目录
 
@@ -15,6 +17,8 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 | `tools/dingai/linux/` | Linux session. X11 toolbar, optional grim / Tesseract / AT-SPI |
 | `tools/dingai/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
 | `tools/dingai/core/` | Python standard library: note schema, label placement, folder and server sync. Used by Linux and `handoff.py` |
+| `tools/dingai/dingai` | CLI: newest pins as JSON, a pasteable prompt, and the MCP server (`mcp`, `mcp-http`) |
+| `tools/dingai/clients/` | MCP config snippets. Each file matches a format taken from that client's docs |
 | `tools/dingai/team-server/` | Optional self-hosted board. Accounts, SQLite, Docker. No telemetry |
 | `tools/dingai/probes/` | Diagnostic probes (display, capture, OCR, red-pixel scans) |
 
@@ -25,7 +29,7 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 - Windows: `cd tools/dingai/windows && dotnet build`  
   `Ctrl+Alt+A` starts a live session. Hold Alt to click the app underneath. `DINGAI_LIVE=0` freezes the screenshot first, as the older build did. B / C / Q set the next pin to bug, change, or question.
 - Linux: `python3 tools/dingai/linux/dingai_linux.py` on X11 or XWayland. `--check` prints which of X11, grim, Tesseract, and the AT-SPI bus are available. Focus the toolbar, press p then click to drop a pin, or a / r / s and two clicks for an arrow, box, or spotlight. B / C / Q set the pin type. Esc exports under `~/DingAI/linux`.
-- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. The note dialog has a pin type.
+- Web: load `tools/dingai/web/anno.js`, or install the Chrome/Edge extension. `bash tools/dingai/extension/pack.sh` writes `tools/dingai/extension/dist`. In `chrome://extensions` or `edge://extensions`, turn on Developer mode and choose Load unpacked. The extension injects the same page script and talks to the desktop app at `127.0.0.1:8763`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. The note dialog has a pin type.
 - Team server: see [tools/dingai/team-server/DEPLOY.md](tools/dingai/team-server/DEPLOY.md).
 
 ```
@@ -77,18 +81,24 @@ A shared folder is one directory on a NAS or a synced drive. Each pin is its own
 | `DINGAI_TEAM_ADMIN_TOKEN` | first admin token. If unset, the process prints one random token once | unset |
 | `DINGAI_TEAM_ROOT` | SQLite, notes, and screenshots | `~/anno-team` |
 
-## Handoff rules
+## Handoff
 
 Every clipboard export is a prompt: the handoff rules, then the JSON note. The note on disk keeps the same rules in `handoff_rules`. Edit them per project in `.dingai/handoff-rules.md` (set `DINGAI_PROJECT`, or put the project path in `~/DingAI/project.txt`). A user-wide file is `~/DingAI/handoff-rules.md`. On a page, set `window.DINGAI_HANDOFF_RULES` or `localStorage['dingai-handoff-rules']`.
 
+Finishing a desktop session writes `export/<stamp>/` (`prompt.txt`, `note.json`, `screenshot.png`) and puts the prompt, the PNG, and that folder on the clipboard. Drag the 复制JSON button to drop the folder on a chat app. On Linux the same files are written, `prompt.txt` is also placed next to the note, and `xclip` (when installed) copies the prompt to the clipboard and the PNG to the primary selection.
+
 ```
-python3 tools/dingai/handoff.py prompt notes/anno.json
-python3 tools/dingai/handoff.py pins
+python3 tools/dingai/dingai                         # newest local pins as JSON
+python3 tools/dingai/dingai prompt                  # rules + newest note, or stdin
+python3 tools/dingai/handoff.py pins                # shared folder or team server
 python3 tools/dingai/handoff.py mark-fixed <note_id> <pin_id> verify.png
-python3 tools/dingai/handoff.py mcp
+python3 tools/dingai/dingai mcp                     # stdio MCP
+python3 tools/dingai/dingai mcp-http                # http://127.0.0.1:8764/mcp
 ```
 
-`pins` and `mark-fixed` are also MCP tools (`dingai_list_pins`, `dingai_mark_fixed`). They read the shared folder or the team server from the settings above. Marking a pin fixed stores the PNG next to the pin. The handoff prompt stays the first MCP tool.
+A tool without MCP can read that prompt from a pipe or a file. Aider is one example; this repo does not ship an Aider config. Config files for MCP clients are in `tools/dingai/clients/`. Only clients whose docs were read are included.
+
+`dingai_list_pins` and `dingai_mark_fixed` read the shared folder or the team server from the settings above. Marking a pin fixed stores the PNG next to the pin. `dingai_screenshot` and `resources/read` return a PNG. The handoff prompt stays the first MCP tool.
 
 The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
 
