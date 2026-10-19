@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 
 import handoff
 from core.guide import write_bundle
+from core.i18n import t as ui_text
 from core.layout import layout_callouts
 from core.redact import hits, redact_note
 from core.schema import normalize_note
@@ -383,7 +384,7 @@ def notice_banner(path=None):
 
 
 def toolbar_title(pins=None, banner=""):
-    base = "DingAI pins %d" % pins if pins is not None else "DingAI  p pin  b/c/q type  a arrow  r box  s spot  hold v  Esc done"
+    base = "DingAI pins %d" % pins if pins is not None else ui_text("toolbar")
     if banner:
         return (base + " | " + banner)[:240]
     return base
@@ -501,6 +502,12 @@ def _keysym(lib, display, event):
 
 
 def main(argv):
+    if os.environ.get("DINGAI_UPDATE") == "1":
+        try:
+            from core.update import check_update
+            print(json.dumps(check_update()))
+        except Exception as exc:
+            print("update check skipped: %s" % exc, file=sys.stderr)
     if len(argv) > 1 and argv[1] == "recheck":
         if len(argv) < 6:
             print("usage: dingai_linux.py recheck before.png x y outdir", file=sys.stderr)
