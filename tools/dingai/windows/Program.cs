@@ -439,6 +439,7 @@ internal class Controller
         }
         if (LoadSync().Redact) RedactSession(view);
         var json = BuildJson(view.Items);
+        WriteSteps(view);
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
         RecordHandoffBaseline();
@@ -448,6 +449,36 @@ internal class Controller
         }
         Publish(json, path, ShotFile);
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
+    }
+
+    void WriteSteps(AnnoCanvas view)
+    {
+        if (view.Steps.Count == 0) return;
+        var dir = Path.Combine(OutRoot, "notes");
+        Directory.CreateDirectory(dir);
+        var lines = new List<string> { "# DingAI steps", "" };
+        var clean = new JsonArray();
+        for (int i = 0; i < view.Steps.Count; i++)
+        {
+            var step = view.Steps[i];
+            var name = "step-" + (i + 1) + ".png";
+            lines.Add((i + 1) + ". " + step.Note);
+            lines.Add("");
+            lines.Add("![](" + name + ")");
+            lines.Add("");
+            if (Shot != null)
+            {
+                var rect = new System.Drawing.Rectangle(Math.Max(0, step.X - 240), Math.Max(0, step.Y - 160), 480, 320);
+                rect.Intersect(new System.Drawing.Rectangle(0, 0, Shot.Width, Shot.Height));
+                if (rect.Width > 2 && rect.Height > 2)
+                {
+                    try { using var crop = Shot.Clone(rect, Shot.PixelFormat); crop.Save(Path.Combine(dir, name), System.Drawing.Imaging.ImageFormat.Png); } catch { }
+                }
+            }
+            clean.Add(new JsonObject { ["n"] = i + 1, ["x_px"] = step.X, ["y_px"] = step.Y, ["note"] = step.Note, ["shot"] = name });
+        }
+        File.WriteAllText(Path.Combine(dir, "sop.md"), string.Join("\n", lines) + "\n");
+        File.WriteAllText(Path.Combine(dir, "repro.json"), new JsonObject { ["schema"] = "dingai-steps-v1", ["steps"] = clean }.ToJsonString());
     }
 
     static string RedactString(string text, List<Regex> regs)
@@ -995,6 +1026,8 @@ internal class AnnoCanvas : Canvas
     Point? _draftFrom, _draftTo;
     public string CurColor = "red"; public int CurWidth = 4; public int DrawMode = 1;   // 1箭头 2方框 3椭圆 4聚光
     public string NextPinType = "bug";
+    public bool StepMode;
+    public List<(int X, int Y, string Note)> Steps = new();
     bool _spotDim;
     UIElement _draftPreview;
     TextBox _noteField; int _noteIdx;
@@ -1083,6 +1116,7 @@ internal class AnnoCanvas : Canvas
         else if (e.Key == Key.C) NextPinType = "change";
         else if (e.Key == Key.Q) NextPinType = "question";
         else if (e.Key == Key.V && !e.IsRepeat) C.StartVoice();
+        else if (e.Key == Key.G) StepMode = !StepMode;
     }
 
     void OnKeyUp(object s, KeyEventArgs e)
@@ -1109,6 +1143,7 @@ internal class AnnoCanvas : Canvas
         var uia = C.UiaAt(x, y);
         if (!string.IsNullOrEmpty(uia)) { pin.AnchorKind = "uia"; pin.AnchorNote = uia; }
         Items.Add(new PinItem(pin));
+        if (StepMode) Steps.Add((x, y, string.IsNullOrEmpty(pin.Note) ? "Pin at " + x + "," + y : pin.Note));
         RerenderAll();
         BeginNote(Items.Count - 1, p);
     }

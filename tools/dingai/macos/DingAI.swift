@@ -1027,6 +1027,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         }
         if redactEnabled() { redactSession(view) }
         let json = buildJSON(items: view.items)
+        writeSteps(view: view, beside: outputRoot.appendingPathComponent("notes"))
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
         let url = outputRoot.appendingPathComponent("notes")
@@ -1131,6 +1132,35 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             ctx.restoreGState()
         }
         return ctx.makeImage() ?? image
+    }
+
+    func writeSteps(view: AnnotationView, beside dir: URL) {
+        guard !view.stepMarks.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var lines = ["# DingAI steps", ""]
+        var clean: [[String: Any]] = []
+        for (index, mark) in view.stepMarks.enumerated() {
+            let name = "step-\(index + 1).png"
+            let note = "Pin at \(mark.x),\(mark.y)"
+            lines.append("\(index + 1). \(note)")
+            lines.append("")
+            lines.append("![](\(name))")
+            lines.append("")
+            if let cg = shotCG {
+                let rect = CGRect(x: max(0, mark.x - 240), y: max(0, mark.y - 160), width: 480, height: 320)
+                    .intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+                if let crop = cg.cropping(to: rect),
+                   let dest = CGImageDestinationCreateWithURL(dir.appendingPathComponent(name) as CFURL, "public.png" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, crop, nil)
+                    CGImageDestinationFinalize(dest)
+                }
+            }
+            clean.append(["n": index + 1, "x_px": mark.x, "y_px": mark.y, "note": note, "shot": name])
+        }
+        try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("sop.md"), atomically: true, encoding: .utf8)
+        if let data = try? JSONSerialization.data(withJSONObject: ["schema": "dingai-steps-v1", "steps": clean], options: [.prettyPrinted]) {
+            try? data.write(to: dir.appendingPathComponent("repro.json"))
+        }
     }
 
     func redactSession(_ view: AnnotationView) {
@@ -1834,6 +1864,7 @@ final class AnnotationView: NSView {
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
                                     windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
+        if stepMode { stepMarks.append((x, y)) }
         let idx = items.count - 1
         nextId += 1
         selectedIndex = idx
@@ -2015,6 +2046,7 @@ final class AnnotationView: NSView {
         case UInt16(kVK_ANSI_C): setPinKind("change")
         case UInt16(kVK_ANSI_Q): setPinKind("question")
         case UInt16(kVK_ANSI_V) where !event.isARepeat: startVoice()
+        case UInt16(kVK_ANSI_G): stepMode.toggle()
         default: super.keyDown(with: event)
         }
     }
@@ -2027,6 +2059,8 @@ final class AnnotationView: NSView {
         super.keyUp(with: event)
     }
 
+    var stepMode = false
+    var stepMarks: [(x: Int, y: Int)] = []
     var voiceRecorder: AVAudioRecorder?
     var voiceURL: URL?
 
