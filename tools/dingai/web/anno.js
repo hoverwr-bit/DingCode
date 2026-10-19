@@ -12,7 +12,7 @@
   window.ANNO_V7 = true; /* v7.9.1（261008）：修复防重入锁——原只检查不赋值，二次注入=双实例同 id 打架 */
   if (new URLSearchParams(location.search).get('qa') === '1') return;
   var LS_KEY = 'anno-v7:' + location.pathname;
-  var mode = false, annos = [], seq = 0, me = 'admin';
+  var mode = false, annos = [], seq = 0, me = 'admin', stepMode = false;
   var oldBtn = document.getElementById('annotationLaunch');
   if (oldBtn) oldBtn.style.display = 'none';
 
@@ -167,7 +167,8 @@
         }).join('')
       + '<span class="sep"></span>'
       + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>'
-      + '<button type="button" data-voice="1" title="按住说话，本地转写到备注">🎤</button>';
+      + '<button type="button" data-voice="1" title="按住说话，本地转写到备注">🎤</button>'
+      + '<button type="button" data-steps="1" title="逐步记录，导出 SOP">#</button>';
     var head = hostPanel.querySelector('.av7head');
     head.insertAdjacentElement('afterend', row);
     var voiceBtn = row.querySelector('[data-voice]');
@@ -206,7 +207,11 @@
   panelToolsClick = function (e) {
     var b = e.target.closest('button'); if (!b) return;
     e.stopPropagation();
-    if (b.dataset.tool) {
+    if (b.dataset.steps) {
+      stepMode = !stepMode;
+      b.classList.toggle('on', stepMode);
+      if (!stepMode) downloadSop();
+    } else if (b.dataset.tool) {
       curTool = b.dataset.tool;
       tools.querySelectorAll('button[data-tool]').forEach(function (x) { x.classList.toggle('on', x === b); });
     } else if (b.dataset.color) {
@@ -399,6 +404,20 @@
   }
   function handoffPrompt(jsonText) {
     return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + redactText(jsonText);
+  }
+  function downloadSop() {
+    var lines = ['# DingAI steps', ''], n = 0;
+    annos.forEach(function (a) {
+      if (!a.step) return;
+      n += 1;
+      lines.push(n + '. ' + (a.comment || 'Step'));
+      lines.push('');
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+    var link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'sop.md';
+    link.click();
   }
   function exportV7() {
     return { page: location.pathname || 'page', version: 7.9, exportedAt: new Date().toISOString(), count: annos.length, annotations: annos, handoff_rules: handoffRules() };
@@ -612,6 +631,7 @@
           field: pending.field || '', value: pending.value || '',
           pinType: kind, status: 'open',
           source: pending.source || null,
+          step: stepMode ? (annos.filter(function (x) { return x.step; }).length + 1) : 0,
           free: pending.key.indexOf('free:') === 0, ts: Date.now(), by: me
         });
       }

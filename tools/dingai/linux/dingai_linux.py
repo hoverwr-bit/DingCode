@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import handoff
+from core.guide import write_bundle
 from core.layout import layout_callouts
 from core.redact import hits, redact_note
 from core.schema import normalize_note
@@ -69,7 +70,7 @@ class _XImage(ctypes.Structure):
     ]
 
 
-def capture_x11(width=None, height=None):
+def capture_x11(width=None, height=None, origin_x=0, origin_y=0):
     lib = _x11()
     display = lib.XOpenDisplay(None)
     if not display:
@@ -78,10 +79,12 @@ def capture_x11(width=None, height=None):
         screen = lib.XDefaultScreen(display)
         full_w = lib.XDisplayWidth(display, screen)
         full_h = lib.XDisplayHeight(display, screen)
-        width = min(width or full_w, full_w)
-        height = min(height or full_h, full_h)
+        origin_x = max(0, min(int(origin_x), max(full_w - 1, 0)))
+        origin_y = max(0, min(int(origin_y), max(full_h - 1, 0)))
+        width = min(width or full_w, full_w - origin_x)
+        height = min(height or full_h, full_h - origin_y)
         root = lib.XRootWindow(display, screen)
-        image = lib.XGetImage(display, root, 0, 0, width, height, ctypes.c_ulong(-1).value, 2)
+        image = lib.XGetImage(display, root, origin_x, origin_y, width, height, ctypes.c_ulong(-1).value, 2)
         if not image:
             return None
         info = ctypes.cast(image, ctypes.POINTER(_XImage)).contents
@@ -274,6 +277,8 @@ class Session:
         self.drag_from = None
         self.voice = None
         self.voice_wav = ""
+        self.steps_on = False
+        self.steps = []
 
     def start_voice(self):
         if self.voice is not None or not shutil.which("arecord"):
@@ -306,6 +311,12 @@ class Session:
         pin = {"id": self.next_id, "x": int(x), "y": int(y), "note": note, "ocr": "", "pin_type": self.pin_type, "anchor": anchor}
         self.next_id += 1
         self.pins.append(pin)
+        if self.steps_on:
+            shot = capture_x11(480, 320, max(0, int(x) - 240), max(0, int(y) - 160))
+            png = shot[2] if shot else b""
+            name = "step-%d.png" % (len(self.steps) + 1)
+            self.steps.append({"n": len(self.steps) + 1, "x_px": int(x), "y_px": int(y), "note": note or ("Pin at %d,%d" % (x, y)), "shot": name, "png": png})
+            pin["step"] = len(self.steps)
         return pin
 
     def add_mark(self, kind, x0, y0, x1, y1):
@@ -353,6 +364,9 @@ class Session:
             note, png = redact_note(note, png or None, boxes)
             if png:
                 (out / "anno-linux.png").write_bytes(png)
+        if self.steps:
+            note["steps"] = [{key: value for key, value in step.items() if key != "png"} for step in self.steps]
+            write_bundle(out, self.steps)
         (out / "anno-linux.json").write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding="utf-8")
         publish_note(note, png or None, settings)
         return note
@@ -429,6 +443,8 @@ def run_toolbar():
                 session.pin_type = "question"
             elif keysym in (ord("v"), ord("V")):
                 session.start_voice()
+            elif keysym in (ord("g"),):
+                session.steps_on = not session.steps_on
         if kind == 3:  # KeyRelease
             keysym = _keysym(lib, display, event)
             if keysym in (ord("v"), ord("V")):

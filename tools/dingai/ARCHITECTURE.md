@@ -49,6 +49,8 @@ Shared-folder sync, used when there is no server, writes one JSON file per pin u
 
 Hold V on a desktop client, or the page microphone button, records a short clip and appends local speech-to-text to the pin note. The binary is whisper.cpp (`DINGAI_WHISPER`, `DINGAI_WHISPER_MODEL`). `DINGAI_WHISPER_LANG` is `zh`, `en`, or `vi`. The page posts the clip to `POST /voice` on the existing `127.0.0.1:8763` bridge; it does not call a cloud speech API. If the binary or model is missing, the note is unchanged.
 
+Step recording (Linux key `g`, desktop key G, page button) numbers each new pin and keeps a screenshot beside it. Finishing writes `sop.md` and `repro.json` (`schema: dingai-steps-v1`) through `core/guide.py`. The markdown is the how-to. The JSON is the bug-repro bundle an agent reads. Both stay on disk.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_compat` is `anno-desktop-v1`. Existing fields stay:

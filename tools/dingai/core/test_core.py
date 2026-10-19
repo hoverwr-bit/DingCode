@@ -2,7 +2,9 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
+from core.guide import sop_markdown, write_bundle
 from core.layout import layout_callouts
 from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
 from core.voice import transcribe
@@ -101,6 +103,19 @@ class RedactTests(unittest.TestCase):
         self.assertEqual((width, height), (8, 8))
         self.assertGreater(rgb[0], 0)
         self.assertGreater(rgb[2], 0)
+
+
+class GuideTests(unittest.TestCase):
+    def test_sop_and_repro_bundle(self):
+        text = sop_markdown([{"note": "Open the order", "shot": "step-1.png"}, {"text": "Save"}])
+        self.assertIn("1. Open the order", text)
+        self.assertIn("![](step-1.png)", text)
+        self.assertIn("2. Save", text)
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = write_bundle(tmp, [{"note": "Open", "shot": "step-1.png", "png": b"\x89PNG"}])
+            self.assertEqual(bundle["schema"], "dingai-steps-v1")
+            self.assertTrue((Path(tmp) / "sop.md").is_file())
+            self.assertEqual((Path(tmp) / "step-1.png").read_bytes(), b"\x89PNG")
 
 
 class VoiceTests(unittest.TestCase):
