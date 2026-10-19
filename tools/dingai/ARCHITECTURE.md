@@ -23,13 +23,13 @@ DingAI is one tool inside AI-toolbox. Each desktop client is still one program w
 
 Interaction stays on the view: `mouseDown` / `mouseDragged` / `mouseUp`, `keyDown` for Esc, ⌘Z, and Delete, and a `DragBar` of `NSButton`s built in `installToolBar`. Toolbar tags are modes: 20 select, 21 arrow, 22 box, 23 ellipse, 24 spotlight, 25 text. Select hit-tests in `hitItem` / `hitHandle` and moves or resizes the existing record. Coordinates are converted only in `ptToPx` / `pxToPt` (view points, bottom-left, to image pixels, top-left). Marks are an `ActionItem` enum (`.pin`, `.arrow`, `.box`, `.text`) held in an array. Undo removes the last item.
 
-The page bridge is `BridgeServer`, a hand-written HTTP/1.1 listener on `127.0.0.1:8763` (`NWListener`). Pages `GET /ping`, `GET /pending` or `GET /events`, and `POST /answer`. Failures are logged and ignored; a dead bridge does not block pinning. Team upload reads `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) and skips quietly when that is empty. There is no other network.
+The page bridge is `BridgeServer`, a hand-written HTTP/1.1 listener on `127.0.0.1:8763` (`NWListener`). Pages `GET /ping`, `GET /pending` or `GET /events`, and `POST /answer`. Failures are logged and ignored; a dead bridge does not block pinning. Team upload reads `~/DingAI/settings.json` (`mode`, `share_dir`, `server_url`, `token`, `project`), overridden by `DINGAI_MODE`, `DINGAI_SHARE_DIR`, `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`), and `DINGAI_TEAM_TOKEN`. Missing settings stay local. Keys B/C/Q set the selected pin's type (`bug`, `change`, `question`). There is no other network.
 
 Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinning flow because OCR, capture, or the bridge failed.
 
 ## Windows
 
-`Program.cs` mirrors the macOS session: tray icon, `Ctrl+Alt+A`, `AnnoCanvas` mouse handlers, the same JSON fields. The default session is live: the overlay is clear, the screenshot is taken in `Finish` after the window hides, and UI Automation supplies the pin anchor when that assembly is present. `DINGAI_LIVE=0` keeps the frozen screenshot. Window hit-testing walks `WinCands` front to back. OCR uses the Windows.Media.Ocr API. There is no page bridge on Windows. Team upload uses `DINGAI_TEAM_URLS` and `DINGAI_TEAM_TOKEN`, the same names as macOS. A shared folder uses `DINGAI_SHARE_DIR`.
+`Program.cs` mirrors the macOS session: tray icon, `Ctrl+Alt+A`, `AnnoCanvas` mouse handlers, the same JSON fields. The default session is live: the overlay is clear, hold Alt to pass clicks through, and the screenshot is taken in `Finish` after the window hides. UI Automation (`AutomationElement.FromPoint`) supplies the pin anchor. `DINGAI_LIVE=0` keeps the frozen screenshot. Window hit-testing walks `WinCands` front to back. OCR uses the Windows.Media.Ocr API. There is no page bridge on Windows. Team upload and the shared folder read `~/DingAI/settings.json`, overridden by `DINGAI_MODE`, `DINGAI_SHARE_DIR`, `DINGAI_TEAM_URLS`, and `DINGAI_TEAM_TOKEN`. Pin type is `bug`, `change`, or `question` (keys B/C/Q). Labels use the same placement rule as `core/layout.py`.
 
 ## Linux
 
