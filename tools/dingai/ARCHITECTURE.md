@@ -33,7 +33,7 @@ Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinnin
 
 ## Linux
 
-`dingai_linux.py` is one Python program. A small X11 toolbar grabs the pointer to drop a pin, so the app underneath keeps working, and the screenshot is taken when the session ends. Anchors come from AT-SPI over the session bus (`busctl`) when that bus is up. OCR shells out to the `tesseract` binary. On Wayland, a still capture uses `grim` when it is installed; the interactive toolbar needs X11 or XWayland. Export, placement, and sync go through `core/`. Failures in capture, OCR, or AT-SPI are skipped and written into the note as empty fields.
+`dingai_linux.py` is one Python program. A small X11 toolbar grabs the pointer to drop a pin, or two clicks for an arrow, box, or spotlight, so the app underneath keeps working. The screenshot is taken when the session ends. Anchors come from AT-SPI over the session bus (`busctl`) when that bus is up. OCR shells out to the `tesseract` binary. On Wayland, a still capture uses `grim` when it is installed; the interactive toolbar needs X11 or XWayland. Export, placement, and sync go through `core/`. Failures in capture, OCR, or AT-SPI are skipped and written into the note as empty fields.
 
 ## Web
 

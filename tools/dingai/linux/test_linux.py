@@ -26,6 +26,15 @@ class LinuxClientTests(unittest.TestCase):
         a, b = note["labels"]
         self.assertFalse(a["x_px"] < b["x_px"] + b["w_px"] and b["x_px"] < a["x_px"] + a["w_px"] and a["y_px"] < b["y_px"] + b["h_px"] and b["y_px"] < a["y_px"] + a["h_px"])
 
+    def test_two_clicks_record_an_arrow_and_a_box(self):
+        session = linux.Session()
+        session.add_mark("arrow", 10, 20, 30, 40)
+        session.add_mark("box", 50, 60, 80, 90)
+        session.add_mark("spotlight", 5, 6, 15, 26)
+        self.assertEqual(session.arrows[0]["to_px"], [30, 40])
+        self.assertEqual(session.boxes[0]["rect_px"], [50, 60, 30, 30])
+        self.assertEqual(session.boxes[1]["shape"], "spotlight")
+
     def test_x11_capture_when_display_is_open(self):
         caps = linux.capabilities()
         if not os.environ.get("DISPLAY"):

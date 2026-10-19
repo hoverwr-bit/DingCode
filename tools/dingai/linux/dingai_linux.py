@@ -216,6 +216,7 @@ class Session:
         self.boxes = []
         self.pin_type = "bug"
         self.next_id = 1
+        self.drag_from = None
 
     def add_pin(self, x, y, note=""):
         anchor = atspi_at_point(x, y) or {"kind": "viewport", "dx": 0, "dy": 0}
@@ -223,6 +224,20 @@ class Session:
         self.next_id += 1
         self.pins.append(pin)
         return pin
+
+    def add_mark(self, kind, x0, y0, x1, y1):
+        if kind == "arrow":
+            self.arrows.append({
+                "id": self.next_id, "from_px": [int(x0), int(y0)], "to_px": [int(x1), int(y1)],
+                "color": "red", "width": 4,
+            })
+        else:
+            self.boxes.append({
+                "id": self.next_id,
+                "rect_px": [int(min(x0, x1)), int(min(y0, y1)), int(abs(x1 - x0)), int(abs(y1 - y0))],
+                "color": "red", "width": 4, "shape": "rect" if kind == "box" else "spotlight",
+            })
+        self.next_id += 1
 
     def export(self, out_dir):
         out = Path(out_dir)
@@ -252,7 +267,7 @@ class Session:
 
 
 def run_toolbar():
-    """X11 toolbar. Number keys set the pin type. Click the desktop after pressing p to drop a pin. Esc exports."""
+    """X11 toolbar. p then click drops a pin. a, r, and s take two clicks for an arrow, box, or spotlight. Esc exports."""
     lib = _x11()
     lib.XCreateSimpleWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong]
     lib.XCreateSimpleWindow.restype = ctypes.c_ulong
@@ -270,8 +285,8 @@ def run_toolbar():
         return 1
     screen = lib.XDefaultScreen(display)
     root = lib.XRootWindow(display, screen)
-    window = lib.XCreateSimpleWindow(display, root, 40, 40, 640, 36, 1, 0, 0xFFFFFF)
-    lib.XStoreName(display, window, b"DingAI  p pin  b/c/q type  a arrow  Esc done")
+    window = lib.XCreateSimpleWindow(display, root, 40, 40, 720, 36, 1, 0, 0xFFFFFF)
+    lib.XStoreName(display, window, b"DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done")
     lib.XSelectInput(display, window, (1 << 0) | (1 << 2))
     lib.XMapWindow(display, window)
     lib.XFlush(display)
@@ -285,13 +300,21 @@ def run_toolbar():
         if kind == 4:  # ButtonPress. XButtonEvent on LP64: x, y, x_root, y_root at 64, 68, 72, 76.
             x = struct.unpack_from("i", event.raw, 64)[0]
             y = struct.unpack_from("i", event.raw, 68)[0]
-            if armed == "pin":
+            if armed in ("pin", "arrow", "box", "spotlight"):
                 # x_root, y_root sit just after x, y in XButtonEvent
                 xr = struct.unpack_from("i", event.raw, 72)[0]
                 yr = struct.unpack_from("i", event.raw, 76)[0]
-                session.add_pin(xr, yr)
-                lib.XUngrabPointer(display, 0)
-                armed = None
+                if armed == "pin":
+                    session.add_pin(xr, yr)
+                    lib.XUngrabPointer(display, 0)
+                    armed = None
+                elif session.drag_from is None:
+                    session.drag_from = (xr, yr)
+                else:
+                    session.add_mark(armed, session.drag_from[0], session.drag_from[1], xr, yr)
+                    session.drag_from = None
+                    lib.XUngrabPointer(display, 0)
+                    armed = None
                 lib.XStoreName(display, window, ("DingAI pins %d" % len(session.pins)).encode())
                 lib.XFlush(display)
             elif 0 <= x <= 80:
@@ -314,6 +337,19 @@ def run_toolbar():
                 session.pin_type = "question"
             elif keysym in (ord("a"),):
                 armed = "arrow"
+                session.drag_from = None
+                lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)
+                lib.XFlush(display)
+            elif keysym in (ord("r"),):
+                armed = "box"
+                session.drag_from = None
+                lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)
+                lib.XFlush(display)
+            elif keysym in (ord("s"),):
+                armed = "spotlight"
+                session.drag_from = None
+                lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)
+                lib.XFlush(display)
     out = Path.home() / "DingAI" / "linux"
     note = session.export(out)
     lib.XCloseDisplay(display)
