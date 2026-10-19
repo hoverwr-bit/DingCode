@@ -11,6 +11,9 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py reject [project]
   python3 handoff.py pins [project]
   python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
+  python3 handoff.py verify <before.png> <after.png> <outdir>
+  python3 handoff.py confirm <note_id> <pin_id>
+  python3 handoff.py reopen <note_id> <pin_id>
   python3 handoff.py release open [note.json] [--version V] [--tag T]
   python3 handoff.py release decide <id> <pin> approve|reject [--reviewer name]
   python3 handoff.py release publish <id> [--override reason] [--actor name]
@@ -815,6 +818,24 @@ def main(argv):
     if cmd == "pins":
         sys.stdout.write(json.dumps(list_agent_pins(argv[2] if len(argv) > 2 else None), ensure_ascii=False, indent=2) + "\n")
         return 0
+    if cmd == "verify":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py verify <before.png> <after.png> <outdir>\n")
+            return 2
+        from core.diff import write_diff
+        result = write_diff(argv[2], argv[3], argv[4])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if cmd in ("confirm", "reopen"):
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py %s <note_id> <pin_id>\n" % cmd)
+            return 2
+        from core.sync import load_settings, set_pin_status
+        cfg = load_settings()
+        status = "confirmed" if cmd == "confirm" else "open"
+        result = set_pin_status(cfg["project"], argv[2], argv[3], status, None, "")
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "mark-fixed":
         if len(argv) < 4:
             sys.stderr.write("usage: handoff.py mark-fixed <note_id> <pin_id> [verify.png]\n")

@@ -125,9 +125,11 @@ BOARD_HTML = """<!DOCTYPE html>
    document.querySelectorAll('.pin').forEach(n => n.classList.remove('on'));
    if (el) el.classList.add('on');
    const p = await (await fetch('/api/pins/' + id, {headers: headers()})).json();
-   const shot = p.screenshot ? '<img src="/api/shot/'+encodeURIComponent(p.screenshot)+'" alt="">' : '';
+   const before = p.screenshot ? '<figure><figcaption>before</figcaption><img src="/api/shot/'+encodeURIComponent(p.screenshot)+'" alt=""></figure>' : '';
+   const after = p.verification ? '<figure><figcaption>after</figcaption><img src="/api/shot/'+encodeURIComponent(p.verification)+'" alt=""></figure>' : '';
+   const over = p.verification ? '<figure><figcaption>overlay</figcaption><img src="/api/diff/'+p.id+'" alt=""></figure>' : '';
    const comments = (p.comments||[]).map(c => '<div class="m"><b>'+esc(c.author)+'</b> '+esc(c.body)+'</div>').join('');
-   document.getElementById('detail').innerHTML = shot +
+   document.getElementById('detail').innerHTML = before + after + over +
      '<p><span class="tag">'+esc(p.pin_type)+'</span><span class="tag">'+esc(p.status)+'</span> '+esc(p.note||'')+'</p>' +
      '<p class="m">'+p.x_px+','+p.y_px+' · '+esc(p.ocr||'')+'</p>' + comments +
      '<p><button type="button" data-s="ai-fixed">Mark AI-fixed</button> <button type="button" data-s="confirmed">Confirm</button> <button type="button" data-s="open">Reopen</button></p>' +
@@ -148,6 +150,13 @@ BOARD_HTML = """<!DOCTYPE html>
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def verification_name(row):
+    name = "verify-%s-%s.png" % (row["note_id"], row["pin_id"])
+    if (root_dir() / "shots" / name).is_file():
+        return name
+    return ""
 
 
 def root_dir():
@@ -285,6 +294,13 @@ class Handler(BaseHTTPRequestHandler):
                 if file.exists():
                     return self._send(200, file.read_text(encoding="utf-8"))
                 return self._send(404, '{"error":"not found"}')
+            if path.startswith("/api/diff/"):
+                if self._auth(conn, "viewer") is None:
+                    return
+                overlay = self._overlay(conn, os.path.basename(path))
+                if overlay:
+                    return self._send(200, overlay, "image/png")
+                return self._send(404, b"", "text/plain")
             if path.startswith("/api/shot/"):
                 name = os.path.basename(path)
                 file = root_dir() / "shots" / name
@@ -325,6 +341,26 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _overlay(self, conn, row_id):
+        row = conn.execute(
+            "SELECT pins.note_id, pins.pin_id, notes.screenshot FROM pins LEFT JOIN notes ON notes.id=pins.note_id WHERE pins.id=?",
+            (row_id,),
+        ).fetchone()
+        if not row:
+            return b""
+        before_name = row["screenshot"] or ""
+        after_name = verification_name(row)
+        if not before_name or not after_name:
+            return b""
+        try:
+            from core.diff import compare_png
+            before = (root_dir() / "shots" / os.path.basename(before_name)).read_bytes()
+            after = (root_dir() / "shots" / after_name).read_bytes()
+            result = compare_png(before, after)
+        except (OSError, ImportError):
+            return b""
+        return result["overlay"] if result else b""
+
     def _pin_list(self, conn, qs):
         sql = "SELECT pins.*, projects.name AS project, notes.screenshot FROM pins JOIN projects ON projects.id=pins.project_id LEFT JOIN notes ON notes.id=pins.note_id WHERE 1=1"
         args = []
@@ -345,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
         for row in conn.execute(sql, args):
             item = pin_public(row, row["project"])
             item["screenshot"] = row["screenshot"] or ""
+            item["verification"] = verification_name(row)
             rows.append(item)
         return rows
 
@@ -357,6 +394,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, '{"error":"not found"}')
         item = pin_public(row, row["project"])
         item["screenshot"] = row["screenshot"] or ""
+        item["verification"] = verification_name(row)
         comments = conn.execute("SELECT author, body, created_at FROM comments WHERE pin_row=? ORDER BY id", (row["id"],)).fetchall()
         item["comments"] = [dict(c) for c in comments]
         return self._send(200, json.dumps(item))

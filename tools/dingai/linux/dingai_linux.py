@@ -501,6 +501,21 @@ def _keysym(lib, display, event):
 
 
 def main(argv):
+    if len(argv) > 1 and argv[1] == "recheck":
+        if len(argv) < 6:
+            print("usage: dingai_linux.py recheck before.png x y outdir", file=sys.stderr)
+            return 2
+        from core.diff import write_diff
+        out = Path(argv[5])
+        shot = capture_x11(480, 320, max(0, int(argv[3]) - 240), max(0, int(argv[4]) - 160))
+        if not shot:
+            print("capture failed", file=sys.stderr)
+            return 1
+        out.mkdir(parents=True, exist_ok=True)
+        after = out / "after.png"
+        after.write_bytes(shot[2])
+        print(json.dumps(write_diff(argv[2], after, out)))
+        return 0
     if "--check" in argv:
         print(json.dumps(capabilities()))
         return 0
