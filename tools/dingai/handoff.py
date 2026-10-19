@@ -9,6 +9,8 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py baseline [project]
   python3 handoff.py scope [project]
   python3 handoff.py reject [project]
+  python3 handoff.py pins [project]
+  python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
 """
 
@@ -113,6 +115,57 @@ def reject_tool_schema():
             },
         },
     }
+
+
+def list_tool_schema():
+    return {
+        "name": "dingai_list_pins",
+        "description": "List DingAI pins from the shared folder or the team server. Each pin includes its note id and screenshot name.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}},
+    }
+
+
+def mark_tool_schema():
+    return {
+        "name": "dingai_mark_fixed",
+        "description": "Mark a pin ai-fixed and store a verification screenshot for the team to review.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "note_id": {"type": "string"},
+                "pin_id": {"type": "string"},
+                "verification_path": {"type": "string"},
+                "comment": {"type": "string"},
+            },
+            "required": ["note_id", "pin_id"],
+        },
+    }
+
+
+def list_agent_pins(project=None):
+    from core.sync import list_pins
+    return list_pins(project)
+
+
+def mark_fixed(arguments):
+    from core.sync import load_settings, set_pin_status
+    arguments = arguments or {}
+    note_id = arguments.get("note_id")
+    pin_id = arguments.get("pin_id")
+    if not note_id or pin_id in (None, ""):
+        return {"ok": False, "error": "note_id and pin_id are required"}
+    blob = None
+    path = arguments.get("verification_path") or ""
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+        except OSError as exc:
+            return {"ok": False, "error": "could not read verification screenshot: %s" % exc}
+    cfg = load_settings()
+    project = arguments.get("project") or cfg["project"]
+    return set_pin_status(project, note_id, str(pin_id), "ai-fixed", blob, arguments.get("comment") or "")
 
 
 def call_handoff(arguments):
@@ -335,7 +388,8 @@ def handle_rpc(msg):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [tool_schema(), scope_tool_schema(), reject_tool_schema()]}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            tool_schema(), scope_tool_schema(), reject_tool_schema(), list_tool_schema(), mark_tool_schema()]}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
@@ -347,6 +401,12 @@ def handle_rpc(msg):
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
         if name == "dingai_reject":
             result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        if name == "dingai_list_pins":
+            result = list_agent_pins(arguments.get("project") or None)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        if name == "dingai_mark_fixed":
+            result = mark_fixed(arguments)
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
     if mid is None:
@@ -416,6 +476,20 @@ def main(argv):
         return 0 if report.get("ok") else 1
     if cmd == "reject":
         result = reject_changes(None, argv[2] if len(argv) > 2 else None)
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if cmd == "pins":
+        sys.stdout.write(json.dumps(list_agent_pins(argv[2] if len(argv) > 2 else None), ensure_ascii=False, indent=2) + "\n")
+        return 0
+    if cmd == "mark-fixed":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py mark-fixed <note_id> <pin_id> [verify.png]\n")
+            return 2
+        result = mark_fixed({
+            "note_id": argv[2],
+            "pin_id": argv[3],
+            "verification_path": argv[4] if len(argv) > 4 else "",
+        })
         sys.stdout.write(json.dumps(result) + "\n")
         return 0 if result.get("ok") else 1
     if cmd == "mcp":

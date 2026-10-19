@@ -68,6 +68,49 @@ class HandoffTests(unittest.TestCase):
         reply = handoff.handle_rpc(msg)
         self.assertEqual(reply["result"], {})
 
+    def test_lists_and_marks_a_shared_folder_pin(self):
+        import core.sync as sync
+        keys = ("DINGAI_MODE", "DINGAI_SHARE_DIR", "DINGAI_TEAM_URLS", "ANNO_TEAM_URLS", "DINGAI_PROJECT_NAME")
+        saved = {key: os.environ.get(key) for key in keys}
+        with tempfile.TemporaryDirectory() as share:
+            os.environ["DINGAI_MODE"] = "folder"
+            os.environ["DINGAI_SHARE_DIR"] = share
+            os.environ["DINGAI_TEAM_URLS"] = ""
+            os.environ["ANNO_TEAM_URLS"] = ""
+            os.environ["DINGAI_PROJECT_NAME"] = "inbox"
+            try:
+                sync.publish_note({
+                    "file": "note-a",
+                    "project": "inbox",
+                    "screenshot": "anno.png",
+                    "pins": [{"id": 1, "x_px": 4, "y_px": 5, "pin_type": "bug", "note": "gap"}],
+                }, b"\x89PNG\r\n", sync.load_settings())
+                listed = handoff.handle_rpc({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "dingai_list_pins", "arguments": {}},
+                })
+                pins = listed["result"]["structured"]["pins"]
+                self.assertEqual(pins[0]["note_id"], "note-a")
+                self.assertTrue(pins[0]["screenshot_path"].endswith("anno.png"))
+                png = os.path.join(share, "verify.png")
+                with open(png, "wb") as fh:
+                    fh.write(b"\x89PNG\r\nverify")
+                marked = handoff.mark_fixed({
+                    "note_id": "note-a", "pin_id": "1", "verification_path": png, "comment": "checked",
+                })
+                self.assertTrue(marked["ok"])
+                self.assertEqual(marked["pin"]["status"], "ai-fixed")
+                self.assertEqual(marked["pin"]["verification"], "verify-note-a-1.png")
+                names = handoff.handle_rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+                self.assertEqual(names["result"]["tools"][0]["name"], "dingai_handoff")
+                self.assertIn("dingai_mark_fixed", [tool["name"] for tool in names["result"]["tools"]])
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
 
 class ScopeTests(unittest.TestCase):
     def git(self, cwd, *args):

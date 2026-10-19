@@ -3,6 +3,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -51,9 +52,15 @@ def _pin_name(note_id, pin_id):
     return "%s--%s.json" % (safe, pin_id)
 
 
+def safe_project(name):
+    text = str(name or "inbox").replace("\\", "-").replace("/", "-").strip(" .")
+    return text or "inbox"
+
+
 def publish_folder(root, note, png_bytes=None):
     note = normalize_note(note)
-    project = note["project"] or "inbox"
+    project = safe_project(note["project"])
+    note["project"] = project
     note_id = note.get("file") or note.get("id") or "note"
     base = Path(root) / "projects" / project
     _atomic_write(base / "notes" / (str(note_id) + ".json"), json.dumps(note, ensure_ascii=False, indent=2))
@@ -160,17 +167,36 @@ def publish_note(note, png_bytes=None, settings=None):
     return {"mode": "local"}
 
 
+def list_pins(project=None, settings=None):
+    cfg = settings or load_settings()
+    project = safe_project(project or cfg["project"])
+    if cfg["mode"] == "folder" and cfg["share_dir"]:
+        rows = list_folder_pins(cfg["share_dir"], project)
+        for row in rows:
+            shot = os.path.basename(str(row.get("screenshot") or ""))
+            if shot:
+                row["screenshot_path"] = str(Path(cfg["share_dir"]) / "projects" / safe_project(row.get("project") or project) / "shots" / shot)
+        return {"ok": True, "mode": "folder", "pins": rows}
+    if cfg["mode"] == "server" and cfg["server_url"]:
+        query = urllib.parse.urlencode({"project": project})
+        code, body = _request(cfg["server_url"] + "/api/pins?" + query, token=cfg["token"])
+        return {"ok": code == 200, "mode": "server", "pins": body if isinstance(body, list) else []}
+    return {"ok": True, "mode": "local", "pins": []}
+
+
 def set_pin_status(project, note_id, pin_id, status, verification=None, comment=None, settings=None, actor="agent"):
     cfg = settings or load_settings()
+    project = safe_project(project)
     if cfg["mode"] == "folder" and cfg["share_dir"]:
         row = folder_set_status(cfg["share_dir"], project, note_id, pin_id, status, verification, comment, actor)
         return {"ok": row is not None, "pin": row}
     if cfg["mode"] == "server" and cfg["server_url"]:
-        url = "%s/api/pins/by-note/%s/%s/status" % (cfg["server_url"], note_id, pin_id)
+        base = "%s/api/pins/by-note/%s/%s" % (
+            cfg["server_url"], urllib.parse.quote(str(note_id), safe=""), urllib.parse.quote(str(pin_id), safe=""))
         payload = {"status": status, "project": project, "comment": comment or ""}
-        code, body = _request(url, payload, token=cfg["token"])
+        code, body = _request(base + "/status", payload, token=cfg["token"])
         if verification:
-            shot = "%s/api/pins/by-note/%s/%s/verification" % (cfg["server_url"], note_id, pin_id)
-            _request(shot, verification, token=cfg["token"], content_type="image/png")
+            query = urllib.parse.urlencode({"project": project})
+            _request(base + "/verification?" + query, verification, token=cfg["token"], content_type="image/png")
         return {"ok": code == 200, "status": code, "body": body}
     return {"ok": False, "error": "local-only"}
