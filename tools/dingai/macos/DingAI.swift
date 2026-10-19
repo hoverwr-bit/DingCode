@@ -464,6 +464,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     var shotReady = false
     var screenW = 0, screenH = 0, imgW = 0, imgH = 0   // 点数 与 截图像素
     var scale: Double = 1
+    var scaleY: Double = 1          // 截图像素/点,高单独算;宽高比不一致时不能借用 scale
     var targetFrame = NSRect.zero          // 本轮批注目标屏(光标所在屏)
     var windowCandidates: [(owner: String, title: String, frame: [Int])] = []
     var cgOriginX = 0, cgOriginY = 0       // 目标屏在 CG 顶左全局系的原点(JS window.screenX 同系;resolve 用)
@@ -631,8 +632,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                 ($0[kCGWindowLayer as String] as? Int) == 0
             }.compactMap { dict -> (dict: [String: Any], inter: Int)? in
                 guard let b = dict[kCGWindowBounds as String] as? [String: Any],
-                      let x = b["X"] as? Int, let y = b["Y"] as? Int,
-                      let w = b["Width"] as? Int, let h = b["Height"] as? Int else { return nil }
+                      let x = cgInt(b["X"]), let y = cgInt(b["Y"]),
+                      let w = cgInt(b["Width"]), let h = cgInt(b["Height"]) else { return nil }
                 let ix = max(0, min(x + w, Int(cgMinX) + screenW) - max(x, Int(cgMinX)))
                 let iy = max(0, min(y + h, Int(cgMinY) + screenH) - max(y, Int(cgMinY)))
                 guard ix > 0 && iy > 0 else { return nil }
@@ -641,8 +642,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             if let w = wins.first?.dict {
                 windowInfo.title = w[kCGWindowName as String] as? String
                 if let b = w[kCGWindowBounds as String] as? [String: Any],
-                   let x = b["X"] as? Int, let y = b["Y"] as? Int,
-                   let bw = b["Width"] as? Int, let bh = b["Height"] as? Int {
+                   let x = cgInt(b["X"]), let y = cgInt(b["Y"]),
+                   let bw = cgInt(b["Width"]), let bh = cgInt(b["Height"]) {
                     windowInfo.framePx = [x - Int(cgMinX), y - Int(cgMinY), bw, bh]
                 }
             }
@@ -655,8 +656,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             for w in list {
                 guard (w[kCGWindowLayer as String] as? Int) == 0,
                       let b = w[kCGWindowBounds as String] as? [String: Any],
-                      let x = b["X"] as? Int, let y = b["Y"] as? Int,
-                      let bw = b["Width"] as? Int, let bh = b["Height"] as? Int,
+                      let x = cgInt(b["X"]), let y = cgInt(b["Y"]),
+                      let bw = cgInt(b["Width"]), let bh = cgInt(b["Height"]),
                       bw > 40, bh > 40 else { continue }
                 let lx = x - Int(cgMinX), ly = y - Int(cgMinY)
                 guard lx < screenW, ly < screenH, lx + bw > 0, ly + bh > 0 else { continue }
@@ -668,6 +669,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
         // 4) ScreenCaptureKit 截图:displayID 精确匹配目标屏(修「定格画面变形」——
         //    此前按 frame 宽高匹配失败后 fallback 到 displays.first,截到了别的屏再拉伸)
+        let pxScale = targetScreen.backingScaleFactor
         Task.detached { [weak self] in
             guard let self else { return }
             var captured: CGImage? = nil
@@ -682,9 +684,10 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                                                  exceptingWindows: [])
                     let cfg = SCStreamConfiguration()
                     cfg.showsCursor = false
-                    // 必须显式指定输出尺寸:默认会给 1920x1080(与屏无关),拉到 1.538 比例屏=变形
-                    cfg.width = Int(wanted.width) * 2
-                    cfg.height = Int(wanted.height) * 2
+                    // 必须显式指定输出尺寸:默认会给 1920x1080(与屏无关),拉到非 16:9 屏=变形。
+                    // 用该屏 backingScale,而不是写死 2,否则非 Retina / 缩放屏的像素和点对不齐。
+                    cfg.width = Int((wanted.width * pxScale).rounded())
+                    cfg.height = Int((wanted.height * pxScale).rounded())
                     captured = try? await SCScreenshotManager.captureImage(contentFilter: filter,
                                                                            configuration: cfg)
                 }
@@ -698,7 +701,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     /// 截图像素坐标 → 钉所在窗口(含该点的候选中取面积最小者=最精确窗;无则 nil)
     func windowAt(x px: Int, y py: Int) -> (owner: String, title: String, frame: [Int])? {
-        let sx = Double(px) / scale, sy = Double(py) / scale
+        let sx = Double(px) / scale, sy = Double(py) / (scaleY == 0 ? scale : scaleY)
         // CGWindowList 返回序=Z 序前→后;取第一个包含该点的 layer0 窗(视觉最前=钉子所见)。
         // 261014 前旧法「包含点最小面积窗」在多窗重叠时记成被盖住的下层小窗
         // (实测 14 钉 owner 大量误记「系统信息/访达」),anno-bridge 修正。
@@ -724,6 +727,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         if let cg {
             imgW = cg.width; imgH = cg.height
             scale = Double(cg.width) / Double(max(screenW, 1))
+            scaleY = Double(cg.height) / Double(max(screenH, 1))
             let name = "anno-" + stamp() + ".png"
             let url = outputRoot.appendingPathComponent("shots").appendingPathComponent(name)
             if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
@@ -736,7 +740,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             win.annoView.bgImage = NSImage(cgImage: cg,
                                            size: NSSize(width: self.screenW, height: self.screenH))
         } else {
-            imgW = screenW; imgH = screenH; scale = 1
+            imgW = screenW; imgH = screenH; scale = 1; scaleY = 1
             ocrDone = true
         }
 
@@ -894,10 +898,11 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                 // 无窗信息时退回会话主窗(此时 nx/ny 才可能是窗外负值)
                 let base = p.windowFrame ?? windowInfo.framePx
                 if let f = base {
+                    let sy = scaleY == 0 ? scale : scaleY
                     let fx = Double(f[0]) * scale
-                    let fy = Double(f[1]) * scale
+                    let fy = Double(f[1]) * sy
                     let fw = Double(f[2]) * scale
-                    let fh = Double(f[3]) * scale
+                    let fh = Double(f[3]) * sy
                     let nx = (Double(p.x) - fx) / fw
                     let ny = (Double(p.y) - fy) / fh
                     d["window_nx"] = (nx * 1000).rounded() / 1000
@@ -928,7 +933,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                     "name": appInfo.name ?? NSNull(),
                     "path": appInfo.path ?? NSNull()] as [String: Any],
             "screen": ["width_px": imgW, "height_px": imgH,
-                       "point_w": screenW, "point_h": screenH, "scale": scale] as [String: Any],
+                       "point_w": screenW, "point_h": screenH,
+                       "scale": scale, "scale_x": scale, "scale_y": scaleY] as [String: Any],
             "window": ["title": windowInfo.title ?? NSNull(),
                        "frame_px": windowInfo.framePx ?? NSNull()] as [String: Any],
             "pins": pins,
@@ -953,6 +959,17 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f.string(from: Date())
     }
+}
+
+/// CGWindow bounds 的 X/Y/Width/Height 是 CFNumber,常为小数。`as? Int` 会把小数帧整段丢掉,窗口就配错。
+private func cgInt(_ v: Any?) -> Int? {
+    let n: Double?
+    if let num = v as? NSNumber { n = num.doubleValue }
+    else if let d = v as? Double { n = d }
+    else if let i = v as? Int { n = Double(i) }
+    else { n = nil }
+    guard let n, n.isFinite else { return nil }
+    return Int(n.rounded())
 }
 
 private func area(_ b: [String: Any]?) -> Int {
@@ -1019,15 +1036,17 @@ final class AnnotationView: NSView {
     // MARK: 坐标换算:AppKit 点(左下原点) ↔ 截图像素(左上原点)
 
     func ptToPx(_ p: NSPoint) -> (Int, Int) {
-        let s = controller?.scale ?? 1
-        let x = Double(p.x) * s
-        let y = (Double(bounds.height) - Double(p.y)) * s
-        return (Int(x), Int(y))
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let x = Double(p.x) * sx
+        let y = (Double(bounds.height) - Double(p.y)) * sy
+        return (Int(x.rounded()), Int(y.rounded()))
     }
     func pxToPt(_ x: Int, _ y: Int) -> NSPoint {
-        let s = controller?.scale ?? 1
-        let px = Double(x) / s
-        let py = bounds.height - CGFloat(Double(y) / s)
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let px = Double(x) / sx
+        let py = bounds.height - CGFloat(Double(y) / sy)
         return NSPoint(x: CGFloat(px), y: py)
     }
 
@@ -1256,8 +1275,9 @@ final class AnnotationView: NSView {
                                           color: colorNamed(a.color), width: a.width)
             case .box(let b):
                 let tl = pxToPt(b.x, b.y + b.h)
+                let sy = controller?.scaleY ?? controller?.scale ?? 1
                 drawBox(rect: NSRect(origin: tl, size: NSSize(width: CGFloat(b.w) / CGFloat(controller?.scale ?? 1),
-                                                              height: CGFloat(b.h) / CGFloat(controller?.scale ?? 1))),
+                                                              height: CGFloat(b.h) / CGFloat(sy))),
                         color: colorNamed(b.color), width: b.width, shape: b.shape)
             }
         }

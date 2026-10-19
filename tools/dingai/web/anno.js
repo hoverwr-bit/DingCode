@@ -199,27 +199,65 @@
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
   function pad(n) { return (n < 10 ? '0' : '') + n; }
 
+  var anchorSeq = 0;
+  function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : s; }
   function anchorElOf(key) {
     if (!key) return null;
     if (key.indexOf('sec:') === 0) {
       var k = key.slice(4), hits;
-      try { hits = document.querySelectorAll('[data-annotation-key="' + (window.CSS && CSS.escape ? CSS.escape(k) : k) + '"]'); } catch (e) { return null; }
+      try { hits = document.querySelectorAll('[data-annotation-key="' + cssEscape(k) + '"]'); } catch (e) { return null; }
       return hits.length === 1 ? hits[0] : null;
     }
     if (key.indexOf('id:') === 0) return document.getElementById(key.slice(3)) || null;
+    if (key.indexOf('ding:') === 0) return document.querySelector('[data-dingai-anchor="' + cssEscape(key.slice(5)) + '"]');
     return null;
   }
   function targetName(key) {
     var el = anchorElOf(key);
+    if (!key) return '自由位置';
     if (key.indexOf('sec:') === 0) return el ? ('区块 ' + key.slice(4)) : ('区块 ' + key.slice(4) + '（未定位）');
     if (key.indexOf('id:') === 0) return el ? ('#' + key.slice(3) + ' ' + (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24)) : key;
+    if (key.indexOf('ding:') === 0) return el ? ('元素 ' + key.slice(5)) : ('元素 ' + key.slice(5) + '（未定位）');
     return '自由位置';
   }
+  /* 没有 id 的节点也打上 data-dingai-anchor,这样嵌套滚动容器里钉子跟的是元素而不是当时的 page 坐标。 */
   function keyOf(t) {
+    if (!t || !t.closest) return null;
     var sec = t.closest('[data-annotation-key]');
     if (sec && sec.dataset.annotationKey) return 'sec:' + sec.dataset.annotationKey;
-    if (t.id) return 'id:' + t.id;
-    return null;
+    if (t.id && t !== document.body && t !== document.documentElement) return 'id:' + t.id;
+    if (t === document.body || t === document.documentElement) return null;
+    if (!t.dataset.dingaiAnchor) t.dataset.dingaiAnchor = 'd' + (++anchorSeq);
+    return 'ding:' + t.dataset.dingaiAnchor;
+  }
+  function anchorForPage(pageX, pageY, target) {
+    var key = keyOf(target);
+    if (!key) return null;
+    var el = anchorElOf(key);
+    if (!el || !el.getClientRects().length) return null;
+    var r = el.getBoundingClientRect();
+    return { key: key, dx: pageX - (window.scrollX + r.left), dy: pageY - (window.scrollY + r.top) };
+  }
+  function resolveAnchor(a) {
+    if (!a) return null;
+    var el = anchorElOf(a.key);
+    if (!el || !el.getClientRects().length) return null;
+    var r = el.getBoundingClientRect();
+    return { x: window.scrollX + r.left + a.dx, y: window.scrollY + r.top + a.dy };
+  }
+  /* 渲染用副本:锚点还在就跟元素走,元素没了就留点击时的页面坐标。 */
+  function placedMark(mark) {
+    if (!mark || !mark.anchors) return mark;
+    var a1 = resolveAnchor(mark.anchors.a1);
+    var a2 = resolveAnchor(mark.anchors.a2);
+    var m = mark;
+    if (a1) {
+      var w = mark.x2 - mark.x1, h = mark.y2 - mark.y1;
+      m = Object.assign({}, mark, { x1: a1.x, y1: a1.y });
+      if (!a2 && mark.type !== 'arrow') m = Object.assign(m, { x2: a1.x + w, y2: a1.y + h });
+    }
+    if (a2) m = Object.assign({}, m, { x2: a2.x, y2: a2.y });
+    return m;
   }
   /* 点击位置字段信息：优先命中所点单元格的表头列名 */
   function fieldInfoOf(t) {
@@ -260,11 +298,12 @@
     markLayer.appendChild(svg);
     annos.forEach(function (a) {
       if (!a.mark) return;
-      if (a.mark.type === 'arrow') {
-        var mc = a.mark.color || '#dc2626', ms = a.mark.style || 'sharp';
-        var mw = a.mark.width || 5.5;
+      var mark = placedMark(a.mark);
+      if (mark.type === 'arrow') {
+        var mc = mark.color || '#dc2626', ms = mark.style || 'sharp';
+        var mw = mark.width || 5.5;
         var ln = document.createElementNS(NS, 'path');
-        ln.setAttribute('d', buildArrowD(ms, a.mark.x1, a.mark.y1, a.mark.x2, a.mark.y2, mw));
+        ln.setAttribute('d', buildArrowD(ms, mark.x1, mark.y1, mark.x2, mark.y2, mw));
         ln.setAttribute('class', 'av7arrow');
         if (AV_STYLES[ms] && (AV_STYLES[ms].kind === 'open' || AV_STYLES[ms].kind === 'dot')) { ln.setAttribute('fill', 'none'); ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', mw); ln.setAttribute('stroke-linecap', 'round'); }
         else { ln.setAttribute('fill', mc); ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', Math.max(1.5, mw * 0.32)); }
@@ -277,11 +316,11 @@
         var box = document.createElement('div');
         box.className = 'av7shape';
         box.setAttribute('data-annotation-ui', 'true');
-        box.style.borderColor = sc; box.style.borderWidth = (a.mark.width || 5.5) + 'px';
-        if (a.mark.type === 'ellipse') { box.style.borderRadius = '50%'; }
+        box.style.borderColor = sc; box.style.borderWidth = (mark.width || 5.5) + 'px';
+        if (mark.type === 'ellipse') { box.style.borderRadius = '50%'; }
         box.style.background = sc + '14';
-        box.style.left = a.mark.x1 + 'px'; box.style.top = a.mark.y1 + 'px';
-        box.style.width = (a.mark.x2 - a.mark.x1) + 'px'; box.style.height = (a.mark.y2 - a.mark.y1) + 'px';
+        box.style.left = mark.x1 + 'px'; box.style.top = mark.y1 + 'px';
+        box.style.width = (mark.x2 - mark.x1) + 'px'; box.style.height = (mark.y2 - mark.y1) + 'px';
         box.title = (a.field ? a.field + '：' + (a.value || '') + ' | ' : '') + (a.comment || '').slice(0, 60);
         box.addEventListener('click', function (ev) { ev.stopPropagation(); openModal({ key: a.key, geometry: a.geometry, anchor: a.anchor, mark: a.mark, field: a.field, value: a.value, existing: a }, true); });
         markLayer.appendChild(box);
@@ -290,12 +329,12 @@
         var box = document.createElement('div');
         box.className = 'av7spot';
         box.setAttribute('data-annotation-ui', 'true');
-        box.style.borderColor = sc; box.style.borderWidth = (a.mark.width || 5.5) + 'px';
+        box.style.borderColor = sc; box.style.borderWidth = (mark.width || 5.5) + 'px';
         /* 261014c:遮罩只挂第一个 spot——多聚光灯 box-shadow 9999px 叠加会让页面其余区域逐层变暗(用户报) */
         box.style.boxShadow = spotSeen ? '0 0 26px 4px ' + sc + '59' : '0 0 0 9999px rgba(3,7,18,.58), 0 0 26px 4px ' + sc + '59';
         spotSeen = true;
-        box.style.left = a.mark.x1 + 'px'; box.style.top = a.mark.y1 + 'px';
-        box.style.width = (a.mark.x2 - a.mark.x1) + 'px'; box.style.height = (a.mark.y2 - a.mark.y1) + 'px';
+        box.style.left = mark.x1 + 'px'; box.style.top = mark.y1 + 'px';
+        box.style.width = (mark.x2 - mark.x1) + 'px'; box.style.height = (mark.y2 - mark.y1) + 'px';
         box.title = (a.field ? a.field + '：' + (a.value || '') + ' | ' : '') + (a.comment || '').slice(0, 60);
         box.addEventListener('click', function (ev) { ev.stopPropagation(); openModal({ key: a.key, geometry: a.geometry, anchor: a.anchor, mark: a.mark, field: a.field, value: a.value, existing: a }, true); });
         markLayer.appendChild(box);
@@ -505,10 +544,12 @@
     var mk = curTool === 'arrow'
       ? { type: 'arrow', x1: Math.round(d.x1), y1: Math.round(d.y1), x2: Math.round(d.x2), y2: Math.round(d.y2), color: curColor, width: curWidth, style: curStyle }
       : { type: curTool, x1: Math.round(Math.min(d.x1, d.x2)), y1: Math.round(Math.min(d.y1, d.y2)), x2: Math.round(Math.max(d.x1, d.x2)), y2: Math.round(Math.max(d.y1, d.y2)), color: curColor, width: curWidth };
+    var endEl = document.elementFromPoint(e.clientX, e.clientY) || d.target;
+    mk.anchors = { a1: anchorForPage(mk.x1, mk.y1, d.target), a2: anchorForPage(mk.x2, mk.y2, endEl) };
     var page = { x: Math.round((mk.x1 + mk.x2) / 2), y: Math.round((mk.y1 + mk.y2) / 2) };
     var key = keyOf(d.target) || ('free:' + page.x + ',' + page.y);
     var fi = fieldInfoOf(d.target);
-    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollY: window.scrollY }, mark: mk, anchor: null, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, mark: mk, anchor: mk.anchors.a1, field: fi.field, value: fi.value, existing: null }, false);
   }, true);
 
   document.addEventListener('click', function (e) {
@@ -524,7 +565,7 @@
     var ae = anchorElOf(key);
     var anchor = null;
     if (ae) { var r = ae.getBoundingClientRect(); anchor = { dx: page.x - (window.scrollX + r.left), dy: page.y - (window.scrollY + r.top) }; }
-    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, existing: null }, false);
   }, true);
 
   /* 三级管理员门（260920 全站版）：①页面自定义 ANNO_ADMIN_CHECK() 回调 ②页面自定义 window.ANNO_V7_ADMIN / 门户 annoPortalAdmin ③?anno=1 会话级解锁（公开页管理员自救通道） */
@@ -585,10 +626,12 @@
     if (!t) t = list[0] || document.body;
     var key = keyOf(t), fi = fieldInfoOf(t);
     var txt = (t.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    var rect = t.getBoundingClientRect ? t.getBoundingClientRect() : { left: cx, top: cy };
     return {
       key: key || ('free:' + Math.round(cx + window.scrollX) + ',' + Math.round(cy + window.scrollY)),
       target: key ? targetName(key) : '自由位置',
-      field: fi.field, value: fi.value, text: txt
+      field: fi.field, value: fi.value, text: txt,
+      anchorDx: cx - rect.left, anchorDy: cy - rect.top
     };
   }
   function av7Describe(req) {
@@ -607,9 +650,10 @@
     var d = describePoint(cx, cy);
     o.clientX = Math.round(cx); o.clientY = Math.round(cy);
     o.pageX = Math.round(cx + window.scrollX); o.pageY = Math.round(cy + window.scrollY);
-    o.scrollY = Math.round(window.scrollY);
+    o.scrollX = Math.round(window.scrollX); o.scrollY = Math.round(window.scrollY);
     o.viewportW = window.innerWidth; o.viewportH = window.innerHeight;
     o.key = d.key; o.target = d.target; o.field = d.field; o.value = d.value; o.text = d.text;
+    o.anchorKey = d.key; o.anchorDx = Math.round(d.anchorDx || 0); o.anchorDy = Math.round(d.anchorDy || 0);
     return o;
   }
   function av7Answer(req) {

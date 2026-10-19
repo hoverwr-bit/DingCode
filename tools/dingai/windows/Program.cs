@@ -278,20 +278,16 @@ internal class Controller
         return string.Join(" | ", hits.Select(h => h.Text.Length > 42 ? h.Text[..42] + "…" : h.Text));
     }
 
-    /// 钉所在窗:含该点候选中面积最小(候选倒序=上层优先,先命中再比面积)
+    /// 钉所在窗:WinCands 已按从前到后排列,取第一个包含该点的窗(被盖住的小窗不再抢记录)。
     public WinCand WindowAt(int x, int y)
     {
-        WinCand best = null; int bestA = int.MaxValue;
         foreach (var c in WinCands)
         {
             var f = c.FramePhys;
             if (x >= f[0] && x <= f[0] + f[2] && y >= f[1] && y <= f[1] + f[3])
-            {
-                int a = f[2] * f[3];
-                if (a < bestA) { bestA = a; best = c; }
-            }
+                return c;
         }
-        return best;
+        return null;
     }
 
     public void Finish(bool clipboard)
