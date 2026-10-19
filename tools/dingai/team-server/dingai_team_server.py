@@ -10,11 +10,15 @@ import json
 import os
 import secrets
 import sqlite3
+import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core import release as release_lib
 
 PIN_TYPES = ("bug", "change", "question")
 PIN_STATUSES = ("open", "ai-fixed", "confirmed")
@@ -87,6 +91,7 @@ BOARD_HTML = """<!DOCTYPE html>
  <select id="st"><option value="">status</option><option>open</option><option>ai-fixed</option><option>confirmed</option></select>
  <select id="ty"><option value="">type</option><option>bug</option><option>change</option><option>question</option></select>
  <button id="go" type="button">Refresh</button>
+ <a href="/releases" style="color:#fff">Releases</a>
  <span id="cnt"></span>
 </header>
 <main><div id="list"></div><div id="detail">Select a pin.</div></main>
@@ -291,6 +296,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 row_id = path.split("/")[-1]
                 return self._pin_detail(conn, row_id)
+            if path == "/api/releases" or path.startswith("/api/releases/") or path == "/releases" or path.startswith("/release/"):
+                if self._auth(conn, "viewer") is None:
+                    return
+                if path.startswith("/release/"):
+                    return self._release_page(path)
+                if path == "/releases":
+                    return self._send(200, release_lib.index_html(release_lib.list_releases(state_dir())), "text/html; charset=utf-8")
+                return self._release_get(path, qs)
             self._send(404, '{"error":"bad path"}')
         finally:
             conn.close()
@@ -387,6 +400,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._status_by_row(conn, path)
             if path.startswith("/api/pins/") and path.endswith("/comments"):
                 return self._comment_by_row(conn, path)
+            if path == "/api/releases" or path.startswith("/api/releases/"):
+                return self._release_post(conn, path)
             self._send(404, '{"error":"bad path"}')
         finally:
             conn.close()
@@ -522,6 +537,111 @@ class Handler(BaseHTTPRequestHandler):
         conn.execute("INSERT INTO comments(pin_row, author, body, created_at) VALUES (?,?,?,?)", (row_id, user["name"], body.get("body") or "", now()))
         conn.commit()
         return self._send(200, '{"ok":true}')
+
+
+def state_dir():
+    path = root_dir() / "state"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _release_methods():
+    def _release_page(self, path):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 2 or not release_lib.safe_release_id(parts[1]):
+            return self._send(404, '{"error":"not found"}')
+        if len(parts) == 2 and not path.endswith("/"):
+            self.send_response(302)
+            self.send_header("Location", path + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        name = "review.html" if len(parts) == 2 else parts[2]
+        if not release_lib.safe_file_name(name):
+            return self._send(404, '{"error":"not found"}')
+        file = state_dir() / "releases" / parts[1] / name
+        if not file.is_file():
+            return self._send(404, '{"error":"not found"}')
+        if name.endswith(".html"):
+            ctype = "text/html; charset=utf-8"
+        elif name.endswith(".png"):
+            ctype = "image/png"
+        elif name.endswith(".json"):
+            ctype = "application/json; charset=utf-8"
+        else:
+            ctype = "application/octet-stream"
+        return self._send(200, file.read_bytes(), ctype)
+
+    def _release_get(self, path, qs):
+        parts = [part for part in path.split("/") if part]
+        if parts == ["api", "releases"]:
+            return self._send(200, json.dumps(release_lib.search_releases(state_dir(), (qs.get("q") or [""])[0])))
+        if len(parts) == 4 and parts[3] == "export":
+            fmt = (qs.get("format") or ["zip"])[0]
+            dest = state_dir() / "exports"
+            dest.mkdir(parents=True, exist_ok=True)
+            result = release_lib.export_release(state_dir(), parts[2], fmt, str(dest))
+            if not result.get("ok"):
+                return self._send(404, json.dumps(result))
+            ctype = "application/zip" if fmt == "zip" else "text/markdown; charset=utf-8"
+            return self._send(200, Path(result["path"]).read_bytes(), ctype)
+        if len(parts) == 3:
+            rel = release_lib.load_release(state_dir(), parts[2])
+            if not rel:
+                return self._send(404, '{"error":"not found"}')
+            return self._send(200, json.dumps(rel))
+        return self._send(404, '{"error":"bad path"}')
+
+    def _release_post(self, conn, path):
+        user = self._auth(conn, "member")
+        if user is None:
+            return
+        parts = [part for part in path.split("/") if part]
+        try:
+            body = self._json()
+        except (json.JSONDecodeError, UnicodeError):
+            return self._send(400, '{"error":"bad json"}')
+        if parts == ["api", "releases"]:
+            pins = body.get("pins") or []
+            shots = {}
+            for pin in pins:
+                key = pin.get("key") or release_lib.pin_key(pin.get("note_id") or "note", pin.get("pin_id") if pin.get("pin_id") is not None else pin.get("id"))
+                pair = {}
+                for side in ("before", "after"):
+                    name = os.path.basename(str(pin.get(side) or ""))
+                    if name and (root_dir() / "shots" / name).is_file():
+                        pair[side] = str(root_dir() / "shots" / name)
+                        pin[side] = ""
+                if pair:
+                    shots[key] = pair
+            rel = release_lib.open_release(
+                state_dir(), pins, version=body.get("version") or "", tag=body.get("tag") or "",
+                project=body.get("project") or "", repo=body.get("repo") or "",
+                rules=body.get("rules") or "", diff_summary=body.get("diff_summary") or "",
+                scope_warnings=body.get("scope_warnings") or [], head=body.get("head") or "",
+                commits=body.get("commits") or [], parent_id=body.get("parent_id") or "", shots=shots,
+            )
+            return self._send(200, json.dumps({"ok": True, "id": rel["id"]}))
+        if len(parts) == 4 and parts[3] == "decide":
+            result = release_lib.decide(state_dir(), parts[2], body.get("pin") or body.get("key") or "", body.get("decision") or "", user["name"])
+            code = 200 if result.get("ok") else 409
+            return self._send(code, json.dumps({k: v for k, v in result.items() if k != "release"}))
+        if len(parts) == 4 and parts[3] == "publish":
+            admin = ROLES.get(user["role"], 0) >= ROLES["admin"]
+            result = release_lib.publish(state_dir(), parts[2], actor=user["name"], admin=admin, override_reason=body.get("override") or body.get("reason") or "")
+            code = 200 if result.get("ok") else 409
+            return self._send(code, json.dumps({k: v for k, v in result.items() if k != "release"}))
+        if len(parts) == 4 and parts[3] == "rollback":
+            result = release_lib.rollback(state_dir(), parts[2], actor=user["name"])
+            code = 200 if result.get("ok") else 409
+            body_out = {"ok": result.get("ok"), "error": result.get("error", ""), "id": (result.get("release") or {}).get("id", ""), "restores": (result.get("release") or {}).get("restores", "")}
+            return self._send(code, json.dumps(body_out))
+        return self._send(404, '{"error":"bad path"}')
+
+    return _release_page, _release_get, _release_post
+
+
+Handler._release_page, Handler._release_get, Handler._release_post = _release_methods()
 
 
 def serve():

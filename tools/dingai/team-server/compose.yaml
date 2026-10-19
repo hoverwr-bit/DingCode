@@ -1,6 +1,8 @@
 services:
   dingai-team:
-    build: .
+    build:
+      context: ..
+      dockerfile: team-server/Dockerfile
     ports:
       - "8050:8050"
     environment:

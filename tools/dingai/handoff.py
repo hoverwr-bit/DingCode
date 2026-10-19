@@ -11,6 +11,12 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py reject [project]
   python3 handoff.py pins [project]
   python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
+  python3 handoff.py release open [note.json] [--version V] [--tag T]
+  python3 handoff.py release decide <id> <pin> approve|reject [--reviewer name]
+  python3 handoff.py release publish <id> [--override reason] [--actor name]
+  python3 handoff.py release export <id> zip|markdown <dest>
+  python3 handoff.py release search <query>
+  python3 handoff.py release rollback <id>
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
 """
 
@@ -450,6 +456,135 @@ def serve_mcp(stdin, stdout):
             write_message(reply, stdout)
 
 
+def state_root():
+    from core.sync import load_settings
+    cfg = load_settings()
+    if cfg["mode"] == "folder" and cfg["share_dir"]:
+        return os.path.join(cfg["share_dir"], "dingai-state")
+    env = os.environ.get("DINGAI_STATE_DIR", "").strip()
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), "DingAI")
+
+
+def _flag(argv, name):
+    if name in argv:
+        index = argv.index(name)
+        if index + 1 < len(argv):
+            return argv[index + 1]
+    return ""
+
+
+def open_from_note(path, version="", tag=""):
+    from core.release import open_release
+    try:
+        note = json.loads(read_note(path) or "{}")
+    except ValueError:
+        note = {}
+    if not isinstance(note, dict):
+        note = {}
+    note_id = str(note.get("file") or note.get("id") or "note")
+    project = project_dir()
+    report = scope_check(project) if project else {}
+    base = (load_baseline(project) or {}).get("head") if project else ""
+    diff = ""
+    commits = []
+    if project and base:
+        diff = git(project, ["diff", "--stat", "--no-renames", base]) or ""
+        commits = [line for line in (git(project, ["log", "--format=%H", "%s..HEAD" % base]) or "").splitlines() if line]
+    parent = os.path.dirname(os.path.abspath(path)) if path else ""
+    before = ""
+    shot_name = str(note.get("screenshot") or "")
+    if shot_name:
+        for candidate in (
+            os.path.join(parent, shot_name) if parent else "",
+            os.path.join(os.path.expanduser("~"), "DingAI", "shots", os.path.basename(shot_name)),
+        ):
+            if candidate and os.path.isfile(candidate):
+                before = candidate
+                break
+    pins = []
+    shots = {}
+    for pin in note.get("pins") or []:
+        if not isinstance(pin, dict):
+            continue
+        pid = pin.get("id")
+        key = "%s:%s" % (note_id, pid)
+        row = dict(pin)
+        row["note_id"] = note_id
+        row["pin_id"] = pid
+        row["key"] = key
+        pins.append(row)
+        after = ""
+        if parent:
+            verify = os.path.join(parent, "verify-%s-%s.png" % (note_id, pid))
+            if os.path.isfile(verify):
+                after = verify
+        if before or after:
+            shots[key] = {"before": before, "after": after}
+    return open_release(
+        state_root(), pins, version=version, tag=tag,
+        project=str(note.get("project") or ""), repo=project or "",
+        rules=load_rules(), diff_summary=diff,
+        scope_warnings=report.get("warnings") or [],
+        head=report.get("head") or "", commits=commits, shots=shots,
+    )
+
+
+def release_main(argv):
+    from core import release as rel
+    if len(argv) < 3:
+        sys.stderr.write("usage: handoff.py release open|decide|publish|export|search|rollback\n")
+        return 2
+    sub = argv[2]
+    root = state_root()
+    if sub == "open":
+        path = argv[3] if len(argv) > 3 and not str(argv[3]).startswith("--") else ""
+        opened = open_from_note(path, _flag(argv, "--version"), _flag(argv, "--tag"))
+        page = os.path.join(root, "releases", opened["id"], "review.html")
+        sys.stdout.write(json.dumps({"ok": True, "id": opened["id"], "page": page}) + "\n")
+        return 0
+    if sub == "decide":
+        if len(argv) < 6:
+            sys.stderr.write("usage: handoff.py release decide <id> <pin> approve|reject\n")
+            return 2
+        result = rel.decide(root, argv[3], argv[4], argv[5], _flag(argv, "--reviewer"))
+        sys.stdout.write(json.dumps({k: v for k, v in result.items() if k != "release"}) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "publish":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py release publish <id> [--override reason]\n")
+            return 2
+        result = rel.publish(
+            root, argv[3], actor=_flag(argv, "--actor") or "local",
+            admin=os.environ.get("DINGAI_RELEASE_ADMIN") == "1",
+            override_reason=_flag(argv, "--override"),
+        )
+        sys.stdout.write(json.dumps({k: v for k, v in result.items() if k != "release"}, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "export":
+        if len(argv) < 6:
+            sys.stderr.write("usage: handoff.py release export <id> zip|markdown <dest>\n")
+            return 2
+        result = rel.export_release(root, argv[3], argv[4], argv[5])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "search":
+        query = argv[3] if len(argv) > 3 else ""
+        sys.stdout.write(json.dumps(rel.search_releases(root, query), ensure_ascii=False) + "\n")
+        return 0
+    if sub == "rollback":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py release rollback <id>\n")
+            return 2
+        result = rel.rollback(root, argv[3], _flag(argv, "--actor") or "local")
+        body = {"ok": result.get("ok"), "error": result.get("error", ""), "id": (result.get("release") or {}).get("id", ""), "restores": (result.get("release") or {}).get("restores", "")}
+        sys.stdout.write(json.dumps(body) + "\n")
+        return 0 if result.get("ok") else 1
+    sys.stderr.write("unknown release command\n")
+    return 2
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "rules"
     if cmd in ("-h", "--help", "help"):
@@ -492,6 +627,8 @@ def main(argv):
         })
         sys.stdout.write(json.dumps(result) + "\n")
         return 0 if result.get("ok") else 1
+    if cmd == "release":
+        return release_main(argv)
     if cmd == "mcp":
         serve_mcp(sys.stdin.buffer, sys.stdout.buffer)
         return 0

@@ -37,7 +37,12 @@ class ServerTests(unittest.TestCase):
         try:
             with urllib.request.urlopen(request, timeout=5) as resp:
                 raw = resp.read()
-                return resp.status, json.loads(raw.decode() or "null") if raw else None
+                if not raw:
+                    return resp.status, None
+                try:
+                    return resp.status, json.loads(raw.decode())
+                except ValueError:
+                    return resp.status, raw
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             try:
@@ -83,6 +88,33 @@ class ServerTests(unittest.TestCase):
         code, body = self.req("POST", "/api/note", {"pins": [{"id": 1, "x_px": 1, "y_px": 1}]}, token="test-admin-token")
         self.assertEqual(code, 200)
         self.assertTrue(body["id"])
+
+    def test_release_review_override_and_archive(self):
+        code, opened = self.req("POST", "/api/releases", {
+            "version": "1.0", "tag": "v1.0", "project": "erp", "rules": "smallest change",
+            "diff_summary": "1 file changed", "head": "abc",
+            "commits": ["abc"],
+            "scope_warnings": [{"kind": "size", "detail": "9 files, 10 lines"}],
+            "pins": [{"note_id": "note-a", "pin_id": "1", "note": "gap", "x_px": 10, "y_px": 12, "project": "erp"}],
+        })
+        self.assertEqual(code, 200)
+        rel_id = opened["id"]
+        code, page = self.req("GET", "/release/%s/" % rel_id)
+        self.assertEqual(code, 200)
+        code, blocked = self.req("POST", "/api/releases/%s/publish" % rel_id, {})
+        self.assertEqual(code, 409)
+        code, decided = self.req("POST", "/api/releases/%s/decide" % rel_id, {"pin": "note-a:1", "decision": "reject"})
+        self.assertEqual(code, 200)
+        code, denied = self.req("POST", "/api/releases/%s/publish" % rel_id, {"override": "not an admin"})
+        self.assertEqual(code, 409)
+        code, published = self.req("POST", "/api/releases/%s/publish" % rel_id, {"override": "known reject"}, token="test-admin-token")
+        self.assertEqual(code, 200)
+        code, frozen = self.req("POST", "/api/releases/%s/decide" % rel_id, {"pin": "note-a:1", "decision": "approve"}, token="test-admin-token")
+        self.assertEqual(code, 409)
+        code, rows = self.req("GET", "/api/releases?q=v1.0")
+        self.assertEqual(rows[0]["id"], rel_id)
+        code, zipped = self.req("GET", "/api/releases/%s/export?format=zip" % rel_id)
+        self.assertEqual(code, 200)
 
 
 if __name__ == "__main__":
