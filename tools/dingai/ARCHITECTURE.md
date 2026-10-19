@@ -11,7 +11,8 @@ DingAI is one tool inside AI-toolbox. Each desktop client is still one program w
 | `macos/DingAI.swift` | Menu-bar app. Models, localhost bridge, capture, overlay, and JSON export live in this one file. |
 | `macos/build.sh`, `macos/Info.plist` | Build and bundle. Bundle id `io.github.dingai.mac`. Minimum macOS 14. |
 | `windows/Program.cs`, `windows/DingAIWin.csproj` | Same desktop contract on WPF. One source file, namespace `DingAIWin`. |
-| `web/anno.js` | One IIFE injected into a page. No build step. |
+| `web/anno.js` | One IIFE injected into a page. No build step. The Chrome and Edge extension loads this same file. |
+| `extension/` | Manifest V3 extension. `pack.sh` copies `anno.js` into `dist/` for Load unpacked. The service worker only fetches `127.0.0.1:8763`. |
 | `linux/dingai_linux.py` | Linux session. X11 toolbar, Wayland still capture when `grim` exists, AT-SPI anchors, Tesseract OCR. Imports `core/`. |
 | `core/` | Schema, label placement, folder sync, team HTTP client. Standard library only. |
 | `team-server/dingai_team_server.py` | Opt-in team server. Standard library and SQLite. Same process serves the old note API and the account API. |

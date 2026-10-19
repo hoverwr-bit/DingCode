@@ -192,7 +192,7 @@
         rec.onstop = function () {
           try { rec.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
           var token = (av7bridge && av7bridge.token) || '';
-          fetch('http://127.0.0.1:8763/voice?token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
+          bridgeFetch('http://127.0.0.1:8763/voice?token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
             .then(function (r) { return r.text(); })
             .then(function (text) {
               text = (text || '').trim();
@@ -1018,6 +1018,10 @@
      App 侧择优写入桌面钉 pin.page（key/field/value 与本页批注同源语义）。
      无桥(App 未跑)→探测失败安静、30s 低频重试；非管理员态不启动。 */
   var AV7_BRIDGE = 'http://127.0.0.1:8763';
+  function bridgeFetch(url, options) {
+    if (typeof window.DINGAI_BRIDGE_FETCH === 'function') return window.DINGAI_BRIDGE_FETCH(url, options || {});
+    return fetch(url, options);
+  }
   var av7bridge = null;   // {client, token, since, pollTimer}
 
   /* @source-start */
@@ -1181,11 +1185,11 @@
     var o = av7Describe(req);
     o.client = b.client; o.token = b.token; o.reqId = req.id; o.url = location.href;
     /* text/plain=简单请求免 CORS preflight(App 手写 HTTP 不处理 OPTIONS) */
-    fetch(AV7_BRIDGE + '/answer', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(o) }).catch(function () {});
+    bridgeFetch(AV7_BRIDGE + '/answer', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(o) }).catch(function () {});
   }
   function av7Poll() {
     var b = av7bridge; if (!b || b.client == null) return;
-    fetch(AV7_BRIDGE + '/pending?client=' + b.client + '&token=' + encodeURIComponent(b.token) + '&since=' + b.since, { cache: 'no-store' })
+    bridgeFetch(AV7_BRIDGE + '/pending?client=' + b.client + '&token=' + encodeURIComponent(b.token) + '&since=' + b.since, { cache: 'no-store' })
       .then(function (r) {
         if (r.status === 403) {  /* App 重启→token 变→重注册 */
           b.client = null; b.token = null;
@@ -1214,7 +1218,7 @@
   }
   function av7Probe() {
     var b = av7bridge; if (!b) return;
-    fetch(AV7_BRIDGE + '/ping', { cache: 'no-store' })
+    bridgeFetch(AV7_BRIDGE + '/ping', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (!j || !j.token || !av7bridge) return;
@@ -1259,7 +1263,7 @@
             });
           });
           if (!positions.length) return;
-          fetch(AV7_BRIDGE + '/track', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ client: bNow.client, token: bNow.token, positions: positions }) }).catch(function () {});
+          bridgeFetch(AV7_BRIDGE + '/track', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ client: bNow.client, token: bNow.token, positions: positions }) }).catch(function () {});
         } catch (e2) {}
       });
       es.onerror = function () {
