@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from core.diff import compare_png, write_diff
+from core.export import EXPORTERS, export_note, register_exporter
 from core.guide import sop_markdown, write_bundle
 from core.layout import layout_callouts
 from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
@@ -236,6 +237,34 @@ class RedactTests(unittest.TestCase):
         self.assertEqual((width, height), (8, 8))
         self.assertGreater(rgb[0], 0)
         self.assertGreater(rgb[2], 0)
+
+
+class ExportTests(unittest.TestCase):
+    def test_markdown_checklist_and_github_stays_local_without_a_token(self):
+        note = {"pins": [{"pin_type": "bug", "status": "open", "note": "Save fails", "source": {"file": "src/Save.tsx", "line": 12}}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = export_note("markdown", note, tmp)
+            text = Path(saved["path"]).read_text(encoding="utf-8")
+            self.assertIn("- [ ] bug: Save fails (src/Save.tsx:12)", text)
+            old = {key: os.environ.pop(key, None) for key in ("GITHUB_TOKEN", "GH_TOKEN", "DINGAI_GITHUB_REPO")}
+            try:
+                posted = export_note("github", note, tmp)
+            finally:
+                for key, value in old.items():
+                    if value is not None:
+                        os.environ[key] = value
+            self.assertFalse(posted["posted"])
+            self.assertTrue(posted["path"].endswith("github-issue.md"))
+        self.assertIn("markdown", EXPORTERS)
+        self.assertIn("github", EXPORTERS)
+
+        def jira(note, dest, options):
+            return {"ok": True, "exporter": "jira"}
+
+        register_exporter("jira", jira)
+        self.assertEqual(export_note("jira", {}, ".")["exporter"], "jira")
+        missing = export_note("feishu", {}, ".")
+        self.assertFalse(missing["ok"])
 
 
 class DiffTests(unittest.TestCase):
