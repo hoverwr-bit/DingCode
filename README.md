@@ -10,7 +10,7 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 
 | Path | What |
 |---|---|
-| `tools/dingai/macos/` | DingAI menu-bar app (Swift, AppKit, ScreenCaptureKit, Vision) |
+| `tools/dingai/macos/` | DingAI menu-bar app (Swift, AppKit, ScreenCaptureKit, Vision). Live overlay: the app underneath stays usable; the screenshot is taken when you finish |
 | `tools/dingai/windows/` | DingAIWin, same JSON contract |
 | `tools/dingai/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
 | `tools/dingai/team-server/` | Optional self-hosted collector and board. No authentication — trusted network only |

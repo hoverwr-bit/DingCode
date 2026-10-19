@@ -14,6 +14,7 @@ import Carbon.HIToolbox
 import Vision
 import ScreenCaptureKit
 import Network
+import ApplicationServices
 
 // MARK: - 数据模型(截图像素坐标,左上原点)
 
@@ -29,6 +30,11 @@ struct WindowInfo {
     var framePx: [Int]?   // 全局顶左原点点数 [x, y, w, h]
 }
 
+struct ScrollSample {
+    var v = 0.0, vMin = 0.0, vMax = 0.0, hasV = false
+    var h = 0.0, hMin = 0.0, hMax = 0.0, hasH = false
+}
+
 struct PinRecord {
     var id: Int
     var x: Int            // 截图像素 x
@@ -39,6 +45,12 @@ struct PinRecord {
     var windowTitle: String?
     var windowFrame: [Int]?    // 钉所在窗口 frame(本屏局部,点)——归一化坐标的基准
     var pageInfo: [String: Any]?  // 页内桥结果(anno-bridge;桌面钉落在网页时=页面坐标+元素描述,与 anno-v7 同语义)
+    var anchorKind: String = "viewport"   // ax | web | scroll | viewport
+    var anchorDX: Double = 0              // 元素左上角到钉点的偏移(全局点,顶左)
+    var anchorDY: Double = 0
+    var anchorKey: String?
+    var anchorNote: String?
+    var scroll: ScrollSample?
 }
 
 struct ArrowRecord {
@@ -103,6 +115,8 @@ final class BridgeServer {
     }
     private var requests: [ResolveReq] = []
     private var nextReqId = 1
+    private var watchPins: [[String: Any]] = []
+    var onTrack: (([[String: Any]]) -> Void)?
     private var pendingCompletions = 0     // 未回调完成的 resolve 数(drain 用)
     private var sseClients: [NWConnection] = []
     private var hbTimer: Timer?
@@ -400,6 +414,17 @@ final class BridgeServer {
             }
             lock.unlock()
             return (json(["ok": 1]), false)
+        case ("POST", "/track"):
+            // 实时模式:页面按元素 key+偏移回报当前屏幕坐标。旧页面不订阅 event:track,不受影响。
+            guard let obj = try? JSONSerialization.jsonObject(with: req.body) as? [String: Any],
+                  let id = obj["client"] as? Int, let tok = obj["token"] as? String,
+                  clientValid(id, tok),
+                  let positions = obj["positions"] as? [[String: Any]] else {
+                return (plain(403, "bad token"), false)
+            }
+            let copy = positions
+            RunLoop.main.perform { [weak self] in self?.onTrack?(copy) }
+            return (json(["ok": 1]), false)
         default:
             return (plain(404, "not found"), false)
         }
@@ -408,6 +433,16 @@ final class BridgeServer {
     private func clientValid(_ id: Int, _ token: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return clients[id] == token && token == sessionToken
+    }
+
+    func setWatch(_ pins: [[String: Any]]) {
+        lock.lock(); watchPins = pins; lock.unlock()
+        let obj: [String: Any] = ["pins": pins]
+        guard let body = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        var frame = Data("event: track\ndata: ".utf8)
+        frame.append(body)
+        frame.append(Data("\n\n".utf8))
+        broadcastRaw(frame)
     }
 
     private func pruneLocked() {
@@ -465,11 +500,15 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     var screenW = 0, screenH = 0, imgW = 0, imgH = 0   // 点数 与 截图像素
     var scale: Double = 1
     var scaleY: Double = 1          // 截图像素/点,高单独算;宽高比不一致时不能借用 scale
+    var live = true                 // 默认不冻结画面;导出时才截图
+    var passSticky = false
+    var trackTimer: Timer?
     var targetFrame = NSRect.zero          // 本轮批注目标屏(光标所在屏)
     var windowCandidates: [(owner: String, title: String, frame: [Int])] = []
     var cgOriginX = 0, cgOriginY = 0       // 目标屏在 CG 顶左全局系的原点(JS window.screenX 同系;resolve 用)
 
     var hotKeyRef: EventHotKeyRef?
+    var passHotKeyRef: EventHotKeyRef?
 
     override init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -489,6 +528,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         registerHotKey()
         trackFrontmostApp()
         BridgeServer.shared.start()   // 页内桥(-ANNOSYNC):失败静默禁用,不影响钉钉
+        BridgeServer.shared.onTrack = { rows in
+            AnnoController.shared.overlay?.annoView.applyWeb(rows)
+        }
         if CommandLine.arguments.contains("--auto-test") {
             perform(#selector(autoTestBegin), with: nil, afterDelay: 0.8)
         }
@@ -508,8 +550,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             view.debugAddBox(from: NSPoint(x: w * 0.58, y: h * 0.60),
                              to:   NSPoint(x: w * 0.78, y: h * 0.72), shape: "ellipse")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                self.finish(copyToPasteboard: false)
-                exit(0)
+                self.finish(copyToPasteboard: false) { exit(0) }
             }
         }
     }
@@ -522,6 +563,10 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         item.button?.image = statusIcon()
         let menu = NSMenu()
         menu.addItem(withTitle: "DingAI 开始批注  ⌥⌘A", action: #selector(toggle), keyEquivalent: "")
+        menu.addItem(withTitle: "交互穿透  ⌥⌘P", action: #selector(togglePass), keyEquivalent: "")
+        let axItem = NSMenuItem(title: AXIsProcessTrusted() ? "辅助功能:已允许(控件跟随)" : "辅助功能:未允许,点此请求",
+                                action: #selector(askAX), keyEquivalent: "")
+        menu.addItem(axItem)
         menu.addItem(.separator())
         let ok = CGPreflightScreenCaptureAccess()
         let st = NSMenuItem(title: ok ? "屏幕录制权限:正常" : "屏幕录制权限:缺失(截图/OCR 受限)",
@@ -556,6 +601,15 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggle() { overlay == nil ? begin() : finish(copyToPasteboard: true) }
+    @objc func togglePass() {
+        passSticky.toggle()
+        overlay?.ignoresMouseEvents = passSticky
+    }
+    @objc func askAX() {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let opts = [key: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+    }
     @objc func quit() { NSApp.terminate(nil) }
 
     // MARK: 前台 App 跟踪(overlay 自己出现前的前一个 App 即批注对象)
@@ -582,7 +636,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             if hkID.signature == OSType(0x414E4E4F) { // 'ANNO'
-                AnnoController.shared.toggle()
+                if hkID.id == 2 { AnnoController.shared.togglePass() }
+                else { AnnoController.shared.toggle() }
             }
             return noErr
         }, 1, &spec, nil, nil)
@@ -590,6 +645,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         RegisterEventHotKey(UInt32(kVK_ANSI_A), UInt32(cmdKey | optionKey),
                             EventHotKeyID(signature: OSType(0x414E4E4F), id: 1),
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        RegisterEventHotKey(UInt32(kVK_ANSI_P), UInt32(cmdKey | optionKey),
+                            EventHotKeyID(signature: OSType(0x414E4E4F), id: 2),
+                            GetApplicationEventTarget(), 0, &passHotKeyRef)
     }
 
     // MARK: 进入批注
@@ -667,25 +725,42 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 4) ScreenCaptureKit 截图:displayID 精确匹配目标屏(修「定格画面变形」——
-        //    此前按 frame 宽高匹配失败后 fallback 到 displays.first,截到了别的屏再拉伸)
+        // 4) 实时模式先把透明层盖上,截图留到导出,这样滚动和点击可以交给下层。
+        //    非实时(live=false)仍是原来的「先冻截图再画」。
         let pxScale = targetScreen.backingScaleFactor
-        Task.detached { [weak self] in
-            guard let self else { return }
-            var captured: CGImage? = nil
+        if live {
+            scale = Double(pxScale)
+            scaleY = scale
+            imgW = Int((Double(screenW) * scale).rounded())
+            imgH = Int((Double(screenH) * scaleY).rounded())
+            shotArrived(nil)
+            startLiveTracking()
+        } else {
+            captureDisplay(displayID: displayID, wanted: wanted, pxScale: pxScale) { [weak self] cg in
+                self?.shotArrived(cg)
+            }
+        }
+    }
+
+    /// ScreenCaptureKit 截图。导出时排除本进程,避免把批注层画进底图。
+    func captureDisplay(displayID: CGDirectDisplayID, wanted: NSRect, pxScale: CGFloat,
+                        completion: @escaping (CGImage?) -> Void) {
+        let myPid = pid_t(ProcessInfo.processInfo.processIdentifier)
+        Task.detached {
+            var captured: CGImage?
             if let content = try? await SCShareableContent.current {
                 let disp = content.displays.first { $0.displayID == displayID }
                     ?? content.displays.first {
                         abs($0.frame.width - wanted.width) < 2 && abs($0.frame.height - wanted.height) < 2
                     } ?? content.displays.first
                 if let disp {
+                    let me = content.applications.filter { $0.processID == myPid }
                     let filter = SCContentFilter(display: disp,
-                                                 excludingApplications: [],
+                                                 excludingApplications: me,
                                                  exceptingWindows: [])
                     let cfg = SCStreamConfiguration()
                     cfg.showsCursor = false
-                    // 必须显式指定输出尺寸:默认会给 1920x1080(与屏无关),拉到非 16:9 屏=变形。
-                    // 用该屏 backingScale,而不是写死 2,否则非 Retina / 缩放屏的像素和点对不齐。
+                    // 必须显式指定输出尺寸:默认会给 1920x1080(与屏无关)。尺寸跟 backingScale 走。
                     cfg.width = Int((wanted.width * pxScale).rounded())
                     cfg.height = Int((wanted.height * pxScale).rounded())
                     captured = try? await SCScreenshotManager.captureImage(contentFilter: filter,
@@ -693,10 +768,23 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                 }
             }
             let cg = captured
-            DispatchQueue.main.async {
-                self.shotArrived(cg)
-            }
+            DispatchQueue.main.async { completion(cg) }
         }
+    }
+
+    func startLiveTracking() {
+        trackTimer?.invalidate()
+        trackTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.tickLive()
+        }
+    }
+
+    func tickLive() {
+        guard live, let view = overlay?.annoView else { return }
+        let pass = passSticky || NSEvent.modifierFlags.contains(.option)
+        if overlay?.ignoresMouseEvents != pass { overlay?.ignoresMouseEvents = pass }
+        view.followAnchors()
+        BridgeServer.shared.setWatch(view.webWatches())
     }
 
     /// 截图像素坐标 → 钉所在窗口(含该点的候选中取面积最小者=最精确窗;无则 nil)
@@ -740,13 +828,18 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             win.annoView.bgImage = NSImage(cgImage: cg,
                                            size: NSSize(width: self.screenW, height: self.screenH))
         } else {
-            imgW = screenW; imgH = screenH; scale = 1; scaleY = 1
+            if !live {
+                imgW = screenW; imgH = screenH; scale = 1; scaleY = 1
+            }
             ocrDone = true
         }
 
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)   // 修「首击不算」:无激活时第一次点击只激活窗口不进画布
         overlay = win
+        if live && cg == nil {
+            win.annoView.flashBubble("实时:滚轮穿透 · 按住⌥操作下层 · ⌥⌘P锁定")
+        }
 
         if let cg {
             DispatchQueue.global(qos: .userInitiated).async {
@@ -809,10 +902,63 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                                     completion: completion)
     }
 
-    func finish(copyToPasteboard: Bool) {
-        guard let view = overlay?.annoView else { return }
+    func finish(copyToPasteboard: Bool, done: (() -> Void)? = nil) {
+        guard let view = overlay?.annoView else { done?(); return }
         view.endNoteEditing()
+        trackTimer?.invalidate(); trackTimer = nil
+        overlay?.ignoresMouseEvents = false
+        if live && shotCG == nil {
+            BridgeServer.shared.drain(seconds: 0.4)
+            let displayID = (NSScreen.screens.first { $0.frame == targetFrame }
+                ?? NSScreen.main)?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+            let pxScale = CGFloat(scale == 0 ? 2 : scale)
+            captureDisplay(displayID: displayID, wanted: targetFrame, pxScale: pxScale) { [weak self] cg in
+                guard let self else { done?(); return }
+                self.storeShot(cg)
+                self.writeSession(copy: copyToPasteboard, done: done)
+            }
+            return
+        }
         BridgeServer.shared.drain(seconds: 2.5)   // 排空未决桥请求(无未决则零等待)
+        writeSession(copy: copyToPasteboard, done: done)
+    }
+
+    /// 把刚截到的图记成这轮的底图,并按实际像素尺寸回写 scale。实时模式导出时才走到这里。
+    func storeShot(_ cg: CGImage?) {
+        shotCG = cg
+        guard let cg, let view = overlay?.annoView else { ocrDone = true; return }
+        let oldX = scale, oldY = scaleY
+        imgW = cg.width; imgH = cg.height
+        scale = Double(cg.width) / Double(max(screenW, 1))
+        scaleY = Double(cg.height) / Double(max(screenH, 1))
+        if oldX > 0, oldY > 0, (abs(oldX - scale) > 0.02 || abs(oldY - scaleY) > 0.02) {
+            view.rescalePixels(x: scale / oldX, y: scaleY / oldY)
+        }
+        let name = "anno-" + stamp() + ".png"
+        let url = outputRoot.appendingPathComponent("shots").appendingPathComponent(name)
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, cg, nil)
+            CGImageDestinationFinalize(dest)
+            shotURL = url
+        }
+        ocrDone = false
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let items = Self.runOCR(cgImage: cg)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.ocrItems = items
+                self.ocrDone = true
+                self.overlay?.annoView.refreshPinSigns()
+            }
+        }
+    }
+
+    func writeSession(copy copyToPasteboard: Bool, done: (() -> Void)? = nil) {
+        guard let view = overlay?.annoView else { done?(); return }
+        let deadline = Date().addingTimeInterval(ocrDone ? 0 : 1.2)
+        while !ocrDone && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
         let json = buildJSON(items: view.items)
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
@@ -827,8 +973,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         overlay?.orderOut(nil)
         overlay = nil
         shotCG = nil
-        // 团队账本上报(静默 fire-and-forget,失败不影响本地)
         if let shotCopy { reportToTeam(jsonData: data, shotFile: shotCopy) }
+        done?()
     }
 
     // MARK: 团队账本上报(configurable team server via ANNO_TEAM_URLS,失败静默跳过)
@@ -909,6 +1055,11 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                     d["window_ny"] = (ny * 1000).rounded() / 1000
                 }
                 if let pg = p.pageInfo { d["page"] = pg }   // 页内桥结果(可选;桥命中才有)
+                var anch: [String: Any] = ["kind": p.anchorKind, "dx": (p.anchorDX * 10).rounded() / 10,
+                                           "dy": (p.anchorDY * 10).rounded() / 10]
+                if let key = p.anchorKey { anch["key"] = key }
+                if let note = p.anchorNote { anch["scroll_tracking"] = note }
+                d["anchor"] = anch
                 pins.append(d)
             case .arrow(let a):
                 arrows.append(["id": a.id, "from_px": [a.fromX, a.fromY], "to_px": [a.toX, a.toY],
@@ -945,6 +1096,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "box_count": boxes.count,
             "screenshot": shotURL?.lastPathComponent ?? NSNull(),
             "screen_capture_ok": (shotCG != nil),
+            "live": live,
         ]
         return json
     }
@@ -993,6 +1145,7 @@ final class AnnotationWindow: NSWindow {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovable = false
         hasShadow = false
+        sharingType = .none   // 导出截图不包含批注层
     }
     override var canBecomeKey: Bool { true }
 }
@@ -1077,6 +1230,24 @@ final class AnnotationView: NSView {
         needsDisplay = true
     }
 
+    /// 滚轮交给下层应用。批注层先忽略鼠标再把事件投回去,避免自己把滚动吃掉。
+    var forwardingScroll = false
+    override func scrollWheel(with event: NSEvent) {
+        if forwardingScroll { return }
+        guard controller?.live == true, let cg = event.cgEvent?.copy() else {
+            super.scrollWheel(with: event); return
+        }
+        forwardingScroll = true
+        window?.ignoresMouseEvents = true
+        cg.post(tap: .cghidEventTap)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self else { return }
+            self.forwardingScroll = false
+            let hold = (self.controller?.passSticky == true) || NSEvent.modifierFlags.contains(.option)
+            if !hold { self.window?.ignoresMouseEvents = false }
+        }
+    }
+
     func addPin(at p: NSPoint) {
         let (x, y) = ptToPx(p)
         let near = controller?.ocrNear(x: x, y: y) ?? ""
@@ -1089,6 +1260,7 @@ final class AnnotationView: NSView {
         nextId += 1
         needsDisplay = true
         bridgeBackfill(idx: idx, pinId: pinId, win: win, xPx: x, yPx: y)
+        rememberAnchor(pinId: pinId, xPx: x, yPx: y, win: win)
         beginNoteEditing(pinIndex: idx, at: p)
     }
 
@@ -1106,6 +1278,12 @@ final class AnnotationView: NSView {
                       case .pin(var pin) = self.items[idx], pin.id == pinId else {
                     NSLog("anno-bridge backfill: SKIP idx=%d pinId=%d items=%d", idx, pinId, self?.items.count ?? -1)
                     return
+                }
+                if let key = page["anchorKey"] as? String ?? page["key"] as? String {
+                    pin.anchorKind = "web"
+                    pin.anchorKey = key
+                    pin.anchorDX = (page["anchorDx"] as? NSNumber)?.doubleValue ?? pin.anchorDX
+                    pin.anchorDY = (page["anchorDy"] as? NSNumber)?.doubleValue ?? pin.anchorDY
                 }
                 pin.pageInfo = page
                 self.items[idx] = .pin(pin)
@@ -1197,6 +1375,7 @@ final class AnnotationView: NSView {
         nextId += 1
         needsDisplay = true
         bridgeBackfill(idx: idx, pinId: pinId, win: win, xPx: x, yPx: y)
+        rememberAnchor(pinId: pinId, xPx: x, yPx: y, win: win)
     }
     // 自动测试直调(不弹备注框,note 走 nil;生产路径=addBox 弹备注)
     func debugAddBox(from: NSPoint, to: NSPoint, shape: String = "rect") {
@@ -1245,6 +1424,8 @@ final class AnnotationView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         if let img = bgImage {
             img.draw(in: bounds)
+        } else if controller?.live == true {
+            // 下层应用保持可见、可滚动
         } else {
             NSColor(calibratedWhite: 0.12, alpha: 1).setFill()
             bounds.fill()
@@ -1414,6 +1595,216 @@ final class AnnotationView: NSView {
     }
 
     // MARK: 底部工具条(viewDidMoveToWindow 挂载,窗口就绪必然触发)
+
+    var axByPin: [Int: AXUIElement] = [:]
+    var scrollByPin: [Int: AXUIElement] = [:]
+
+    func rescalePixels(x mx: Double, y my: Double) {
+        for i in items.indices {
+            switch items[i] {
+            case .pin(var p):
+                p.x = Int((Double(p.x) * mx).rounded()); p.y = Int((Double(p.y) * my).rounded())
+                items[i] = .pin(p)
+            case .arrow(var a):
+                a.fromX = Int((Double(a.fromX) * mx).rounded()); a.fromY = Int((Double(a.fromY) * my).rounded())
+                a.toX = Int((Double(a.toX) * mx).rounded()); a.toY = Int((Double(a.toY) * my).rounded())
+                items[i] = .arrow(a)
+            case .box(var b):
+                b.x = Int((Double(b.x) * mx).rounded()); b.y = Int((Double(b.y) * my).rounded())
+                b.w = Int((Double(b.w) * mx).rounded()); b.h = Int((Double(b.h) * my).rounded())
+                items[i] = .box(b)
+            }
+        }
+    }
+
+    func webWatches() -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for it in items {
+            if case .pin(let p) = it, p.anchorKind == "web", let key = p.anchorKey {
+                out.append(["id": p.id, "key": key, "dx": p.anchorDX, "dy": p.anchorDY])
+            }
+        }
+        return out
+    }
+
+    func applyWeb(_ rows: [[String: Any]]) {
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let ox = Double(controller?.cgOriginX ?? 0)
+        let oy = Double(controller?.cgOriginY ?? 0)
+        var changed = false
+        for row in rows {
+            let ok = (row["ok"] as? Bool) == true || (row["ok"] as? NSNumber)?.boolValue == true
+            guard ok, let id = (row["id"] as? NSNumber)?.intValue,
+                  let screenX = (row["screenX"] as? NSNumber)?.doubleValue,
+                  let screenY = (row["screenY"] as? NSNumber)?.doubleValue else { continue }
+            for i in items.indices {
+                guard case .pin(var p) = items[i], p.id == id else { continue }
+                let nx = Int(((screenX - ox) * sx).rounded())
+                let ny = Int(((screenY - oy) * sy).rounded())
+                if nx != p.x || ny != p.y { p.x = nx; p.y = ny; changed = true }
+                var page = p.pageInfo ?? [:]
+                for k in ["pageX", "pageY", "scrollX", "scrollY", "clientX", "clientY"] {
+                    if let v = row[k] { page[k] = v }
+                }
+                p.pageInfo = page
+                items[i] = .pin(p)
+            }
+        }
+        if changed { needsDisplay = true }
+    }
+
+    func followAnchors() {
+        if draftFrom != nil { return }
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let ox = Double(controller?.cgOriginX ?? 0)
+        let oy = Double(controller?.cgOriginY ?? 0)
+        var changed = false
+        for i in items.indices {
+            guard case .pin(var p) = items[i] else { continue }
+            if p.anchorKind == "ax", let el = axByPin[p.id], let f = axFrame(el) {
+                let lx = f.x + p.anchorDX - ox
+                let ly = f.y + p.anchorDY - oy
+                let nx = Int((lx * sx).rounded()), ny = Int((ly * sy).rounded())
+                if nx != p.x || ny != p.y { p.x = nx; p.y = ny; items[i] = .pin(p); changed = true }
+            } else if p.anchorKind == "scroll", let area = scrollByPin[p.id], let next = readScroll(area), var prev = p.scroll {
+                if let d = scrollPoints(prev.v, next.v, next.vMin, next.vMax), prev.hasV {
+                    p.y = Int((Double(p.y) - d * sy).rounded()); changed = true
+                } else if prev.hasV && abs(next.v - prev.v) > 0.0001 && (next.vMax - next.vMin) <= 1.5 {
+                    p.anchorNote = "normalized-unmapped"
+                }
+                if let d = scrollPoints(prev.h, next.h, next.hMin, next.hMax), prev.hasH {
+                    p.x = Int((Double(p.x) - d * sx).rounded()); changed = true
+                } else if prev.hasH && abs(next.h - prev.h) > 0.0001 && (next.hMax - next.hMin) <= 1.5 {
+                    p.anchorNote = "normalized-unmapped"
+                }
+                prev.v = next.v; prev.h = next.h; prev.vMax = next.vMax; prev.hMax = next.hMax
+                p.scroll = prev
+                items[i] = .pin(p)
+            }
+        }
+        if changed { needsDisplay = true }
+    }
+
+    func scrollPoints(_ previous: Double, _ next: Double, _ minV: Double, _ maxV: Double) -> Double? {
+        let span = maxV - minV
+        if !(span > 1.5) || !span.isFinite || !previous.isFinite || !next.isFinite { return nil }
+        return next - previous
+    }
+
+    func rememberAnchor(pinId: Int, xPx: Int, yPx: Int,
+                        win: (owner: String, title: String, frame: [Int])?) {
+        guard controller?.live == true else { return }
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let gx = Double(controller?.cgOriginX ?? 0) + Double(xPx) / sx
+        let gy = Double(controller?.cgOriginY ?? 0) + Double(yPx) / sy
+        let browser = AnnoController.browserOwners.contains { win?.owner.contains($0) == true }
+        let host = window
+        host?.alphaValue = 0
+        host?.orderOut(nil)
+        let el = axHit(gx, gy)
+        host?.orderFront(nil)
+        host?.alphaValue = 1
+        guard let el, let f = axFrame(el) else { return }
+        let big = f.w > bounds.width * 0.72 && f.h > bounds.height * 0.72
+        guard let idx = items.firstIndex(where: { if case .pin(let p) = $0 { return p.id == pinId }; return false }),
+              case .pin(var pin) = items[idx] else { return }
+        if !big && !browser {
+            pin.anchorKind = "ax"
+            pin.anchorDX = gx - f.x
+            pin.anchorDY = gy - f.y
+            pin.anchorKey = axRole(el)
+            if pin.ocrNearby.isEmpty, let text = axText(el), !text.isEmpty { pin.ocrNearby = text }
+            axByPin[pinId] = el
+        } else if !browser, let area = scrollArea(from: el), let sample = readScroll(area) {
+            pin.anchorKind = "scroll"
+            pin.scroll = sample
+            scrollByPin[pinId] = area
+        }
+        items[idx] = .pin(pin)
+    }
+
+    func axHit(_ x: Double, _ y: Double) -> AXUIElement? {
+        guard AXIsProcessTrusted() else { return nil }
+        let sys = AXUIElementCreateSystemWide()
+        var el: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(sys, Float(x), Float(y), &el) == .success, let el else { return nil }
+        var pid: pid_t = 0
+        if AXUIElementGetPid(el, &pid) == .success, pid == getpid() { return nil }
+        return el
+    }
+
+    func axCopy(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, name as CFString, &ref) == .success else { return nil }
+        return ref
+    }
+
+    func axFrame(_ el: AXUIElement) -> (x: Double, y: Double, w: Double, h: Double)? {
+        guard let posRef = axCopy(el, kAXPositionAttribute), let sizeRef = axCopy(el, kAXSizeAttribute) else { return nil }
+        var p = CGPoint.zero
+        var s = CGSize.zero
+        guard AXValueGetValue(unsafeBitCast(posRef, to: AXValue.self), .cgPoint, &p),
+              AXValueGetValue(unsafeBitCast(sizeRef, to: AXValue.self), .cgSize, &s) else { return nil }
+        return (Double(p.x), Double(p.y), Double(s.width), Double(s.height))
+    }
+
+    func axRole(_ el: AXUIElement) -> String? { axCopy(el, kAXRoleAttribute) as? String }
+
+    func axText(_ el: AXUIElement) -> String? {
+        for name in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+            if let s = axCopy(el, name) as? String {
+                let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty && t.count < 80 { return t }
+            }
+        }
+        return nil
+    }
+
+    func axParent(_ el: AXUIElement) -> AXUIElement? {
+        guard let ref = axCopy(el, kAXParentAttribute) else { return nil }
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+
+    func axChild(_ el: AXUIElement, _ name: String) -> AXUIElement? {
+        guard let ref = axCopy(el, name) else { return nil }
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+
+    func axNum(_ el: AXUIElement, _ name: String) -> Double? {
+        (axCopy(el, name) as? NSNumber)?.doubleValue
+    }
+
+    func scrollArea(from el: AXUIElement) -> AXUIElement? {
+        var cur: AXUIElement? = el
+        for _ in 0..<14 {
+            guard let c = cur else { return nil }
+            if axRole(c) == "AXScrollArea" || axRole(c) == kAXScrollAreaRole { return c }
+            cur = axParent(c)
+        }
+        return nil
+    }
+
+    func readScroll(_ area: AXUIElement) -> ScrollSample? {
+        var s = ScrollSample()
+        if let bar = axChild(area, kAXVerticalScrollBarAttribute) {
+            if let v = axNum(bar, kAXValueAttribute) {
+                s.hasV = true; s.v = v
+                s.vMin = axNum(bar, kAXMinValueAttribute) ?? 0
+                s.vMax = axNum(bar, kAXMaxValueAttribute) ?? 1
+            }
+        }
+        if let bar = axChild(area, kAXHorizontalScrollBarAttribute) {
+            if let v = axNum(bar, kAXValueAttribute) {
+                s.hasH = true; s.h = v
+                s.hMin = axNum(bar, kAXMinValueAttribute) ?? 0
+                s.hMax = axNum(bar, kAXMaxValueAttribute) ?? 1
+            }
+        }
+        return (s.hasV || s.hasH) ? s : nil
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()

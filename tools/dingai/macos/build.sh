@@ -5,7 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swiftc -O -swift-version 5 -o DingAI DingAI.swift
+swiftc -O -swift-version 5 -o DingAI DingAI.swift \
+  -framework AppKit -framework Carbon -framework Vision \
+  -framework ScreenCaptureKit -framework ApplicationServices
 
 APP="DingAI.app"
 rm -rf "$APP"

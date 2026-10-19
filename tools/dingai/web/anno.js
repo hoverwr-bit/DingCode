@@ -717,6 +717,31 @@
       es.onmessage = function (ev) {
         try { av7State('sse-msg'); av7Answer(JSON.parse(ev.data)); } catch (e) {}
       };
+      es.addEventListener('track', function (ev) {
+        try {
+          var msg = JSON.parse(ev.data);
+          var bNow = av7bridge; if (!bNow || bNow.client == null) return;
+          var positions = [];
+          (msg.pins || []).forEach(function (pin) {
+            var el = anchorElOf(pin.key);
+            if (!el || !el.getClientRects().length) { positions.push({ id: pin.id, ok: false }); return; }
+            var r = el.getBoundingClientRect();
+            var chrome = window.outerHeight - window.innerHeight;
+            var dx = +pin.dx || 0, dy = +pin.dy || 0;
+            positions.push({
+              id: pin.id, ok: true,
+              screenX: window.screenX + r.left + dx,
+              screenY: window.screenY + chrome + r.top + dy,
+              pageX: Math.round(window.scrollX + r.left + dx),
+              pageY: Math.round(window.scrollY + r.top + dy),
+              scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY),
+              clientX: Math.round(r.left + dx), clientY: Math.round(r.top + dy)
+            });
+          });
+          if (!positions.length) return;
+          fetch(AV7_BRIDGE + '/track', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ client: bNow.client, token: bNow.token, positions: positions }) }).catch(function () {});
+        } catch (e2) {}
+      });
       es.onerror = function () {
         try { es.close(); } catch (e2) {}
         if (av7bridge === b) { b.es = null; setTimeout(function () { if (av7bridge === b && b.client != null) av7SSE(); else av7Probe(); }, 3000); }

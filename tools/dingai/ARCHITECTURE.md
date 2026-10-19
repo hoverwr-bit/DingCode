@@ -15,7 +15,7 @@ DingAI is one tool inside AI-toolbox. Each client is a single self-contained pro
 
 ## macOS
 
-`DingAI.swift` is an AppKit app (`NSApplication` + `AnnoController` as delegate). A Carbon hotkey (`⌥⌘A`) calls `begin` / `finish`. `begin` records the previous frontmost app, the screen under the cursor, and on-screen windows, then captures that display with ScreenCaptureKit. `shotArrived` opens a borderless `AnnotationWindow` whose `AnnotationView` draws the shot and the marks.
+`DingAI.swift` is an AppKit app (`NSApplication` + `AnnoController` as delegate). A Carbon hotkey (`⌥⌘A`) calls `begin` / `finish`. `begin` records the previous frontmost app, the screen under the cursor, and on-screen windows. In the default live session it opens a clear `AnnotationWindow` immediately and captures with ScreenCaptureKit only in `finish`, so the JSON image matches the pin coordinates at export. `⌥⌘P` or holding ⌥ sets `ignoresMouseEvents`; `scrollWheel` posts the event through to the app underneath. Pins remember an AX element, a scroll-bar sample, or a web-bridge key and are updated from the existing timer/`BridgeServer` path. `shotArrived` still builds the overlay; `AnnotationView` draws the marks.
 
 Interaction stays on the view: `mouseDown` / `mouseDragged` / `mouseUp`, `keyDown` for Esc and ⌘Z, and a `DragBar` of `NSButton`s built in `installToolBar`. Coordinates are converted only in `ptToPx` / `pxToPt` (view points, bottom-left, to image pixels, top-left). Marks are an `ActionItem` enum (`.pin`, `.arrow`, `.box`) held in an array. Undo removes the last item.
 
