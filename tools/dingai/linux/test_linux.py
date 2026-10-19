@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,19 @@ class LinuxClientTests(unittest.TestCase):
         self.assertEqual(session.arrows[0]["to_px"], [30, 40])
         self.assertEqual(session.boxes[0]["rect_px"], [50, 60, 30, 30])
         self.assertEqual(session.boxes[1]["shape"], "spotlight")
+
+    def test_export_writes_the_prompt_bundle(self):
+        session = linux.Session()
+        session.add_pin(10, 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            note = session.export(tmp)
+            self.assertGreaterEqual(note["pin_count"], 1)
+            prompt = Path(tmp, "prompt.txt").read_text(encoding="utf-8")
+            self.assertIn("pinned element", prompt)
+            bundles = list(Path(tmp, "export").iterdir())
+            self.assertEqual(len(bundles), 1)
+            self.assertTrue((bundles[0] / "prompt.txt").is_file())
+            self.assertTrue((bundles[0] / "note.json").is_file())
 
     def test_x11_capture_when_display_is_open(self):
         caps = linux.capabilities()

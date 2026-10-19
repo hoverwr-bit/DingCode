@@ -1,0 +1,7 @@
+[mcp_servers.dingai]
+command = "python3"
+args = ["/ABS/PATH/tools/dingai/dingai", "mcp"]
+
+# HTTP, after `dingai mcp-http` is running. Do not set command on the same table.
+# [mcp_servers.dingai]
+# url = "http://127.0.0.1:8764/mcp"

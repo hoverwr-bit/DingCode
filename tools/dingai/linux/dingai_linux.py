@@ -368,7 +368,12 @@ class Session:
         if self.steps:
             note["steps"] = [{key: value for key, value in step.items() if key != "png"} for step in self.steps]
             write_bundle(out, self.steps)
-        (out / "anno-linux.json").write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding="utf-8")
+        text = json.dumps(note, ensure_ascii=False, indent=2)
+        (out / "anno-linux.json").write_text(text, encoding="utf-8")
+        (out / "prompt.txt").write_text(handoff.prompt_for(text), encoding="utf-8")
+        handoff.write_export_bundle(text, png or None, str(out / "export"))
+        shot = out / "anno-linux.png"
+        handoff.offer_clipboard(handoff.prompt_for(text), str(shot) if shot.is_file() else "")
         publish_note(note, png or None, settings)
         return note
 

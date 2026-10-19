@@ -63,6 +63,7 @@ internal static class Win32
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr ho);
 
     public const int WM_HOTKEY = 0x0312;
     public const int GWL_EXSTYLE = -20;
@@ -438,10 +439,12 @@ internal class Controller
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
         RecordHandoffBaseline();
-        if (clipboard)
+        try
         {
-            try { System.Windows.Clipboard.SetText(HandoffPrompt(json)); } catch { }
+            if (clipboard) CopyExport(json);
+            else WriteExportBundle(json);
         }
+        catch { }
         Publish(json, path, ShotFile);
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
     }
@@ -780,6 +783,46 @@ internal class Controller
             catch { }
         }
         return DefaultHandoffRules;
+    }
+
+    public string WriteExportBundle(string json)
+    {
+        var dir = Path.Combine(OutRoot, "export", Stamp());
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "prompt.txt"), HandoffPrompt(json));
+        File.WriteAllText(Path.Combine(dir, "note.json"), json);
+        if (!string.IsNullOrEmpty(ShotFile) && File.Exists(ShotFile))
+            File.Copy(ShotFile, Path.Combine(dir, "screenshot.png"), true);
+        return dir;
+    }
+
+    static BitmapSource BitmapSourceFrom(System.Drawing.Bitmap bmp)
+    {
+        var handle = bmp.GetHbitmap();
+        try
+        {
+            var src = Imaging.CreateBitmapSourceFromHBitmap(handle, IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+            src.Freeze();
+            return src;
+        }
+        finally { Win32.DeleteObject(handle); }
+    }
+
+    public void CopyExport(string json)
+    {
+        var dir = WriteExportBundle(json);
+        var data = new DataObject();
+        data.SetText(HandoffPrompt(json));
+        if (Shot != null)
+        {
+            try { data.SetImage(BitmapSourceFrom(Shot)); } catch { }
+        }
+        var files = new System.Collections.Specialized.StringCollection();
+        files.Add(dir);
+        var png = Path.Combine(dir, "screenshot.png");
+        if (File.Exists(png)) files.Add(png);
+        data.SetFileDropList(files);
+        Clipboard.SetDataObject(data, true);
     }
 
     public string HandoffPrompt(string json) =>
@@ -1481,11 +1524,31 @@ internal class AnnoCanvas : Canvas
         x += 10;
         Btn(bar, ref x, "⌘Z撤销", 76).Click += (s, e) => Undo();
         Btn(bar, ref x, "清空", 56).Click += (s, e) => ClearAll();
-        Btn(bar, ref x, "复制JSON", 76).Click += (s, e) =>
+        var copy = Btn(bar, ref x, "复制JSON", 76);
+        System.Windows.Point? press = null;
+        copy.PreviewMouseLeftButtonDown += (s, e) => { press = e.GetPosition(copy); };
+        copy.PreviewMouseMove += (s, e) =>
+        {
+            if (press == null || e.LeftButton != MouseButtonState.Pressed) return;
+            var point = e.GetPosition(copy);
+            if (Math.Abs(point.X - press.Value.X) + Math.Abs(point.Y - press.Value.Y) < 6) return;
+            press = null;
+            try
+            {
+                CommitNoteField();
+                var folder = C.WriteExportBundle(C.BuildJson(Items));
+                var data = new DataObject();
+                var files = new System.Collections.Specialized.StringCollection();
+                files.Add(folder);
+                data.SetFileDropList(files);
+                DragDrop.DoDragDrop(copy, data, DragDropEffects.Copy);
+            }
+            catch { }
+        };
+        copy.Click += (s, e) =>
         {
             CommitNoteField();
-            var json = C.BuildJson(Items);
-            try { System.Windows.Clipboard.SetText(C.HandoffPrompt(json)); } catch { }
+            try { C.CopyExport(C.BuildJson(Items)); } catch { }
         };
         Btn(bar, ref x, "完成 ✓", 70).Click += (s, e) => C.Finish(true);
 

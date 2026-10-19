@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "dingai": {
+      "type": "local",
+      "command": "python3",
+      "args": ["/ABS/PATH/tools/dingai/dingai", "mcp"],
+      "tools": ["*"]
+    }
+  }
+}

@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Print the newest DingAI pins, a pasteable prompt, or start the MCP server.
+
+With no arguments this prints the newest local note's pins as JSON.
+`dingai prompt` prints the rules plus that note. `dingai mcp` and
+`dingai mcp-http` are the same server as handoff.py.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import handoff
+
+argv = list(sys.argv)
+if len(argv) == 1:
+    argv.append("latest")
+raise SystemExit(handoff.main(argv))

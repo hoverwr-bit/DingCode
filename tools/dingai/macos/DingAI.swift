@@ -1044,10 +1044,10 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                         .appendingPathComponent("anno-" + stamp() + ".json")
         try? data.write(to: url)
         recordHandoffBaseline()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let folder = writeExportBundle(text)
         if copyToPasteboard {
-            let text = String(data: data, encoding: .utf8) ?? ""
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(handoffPrompt(text), forType: .string)
+            copyExport(prompt: handoffPrompt(text), image: shotURL, folder: folder)
         }
         let shotCopy = shotURL
         overlay?.orderOut(nil)
@@ -1456,6 +1456,33 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         handoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json
     }
 
+    /// export/<stamp>/ holds the prompt, the note, and the annotated PNG. One pasteboard item carries all three.
+    func writeExportBundle(_ json: String) -> URL {
+        let dir = outputRoot.appendingPathComponent("export").appendingPathComponent(stamp())
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? handoffPrompt(json).write(to: dir.appendingPathComponent("prompt.txt"), atomically: true, encoding: .utf8)
+        try? json.write(to: dir.appendingPathComponent("note.json"), atomically: true, encoding: .utf8)
+        if let shot = shotURL, let data = try? Data(contentsOf: shot) {
+            try? data.write(to: dir.appendingPathComponent("screenshot.png"))
+        }
+        return dir
+    }
+
+    func copyExport(prompt: String, image: URL?, folder: URL) {
+        let board = NSPasteboard.general
+        board.clearContents()
+        let item = NSPasteboardItem()
+        item.setString(prompt, forType: .string)
+        if let image, let data = try? Data(contentsOf: image) {
+            item.setData(data, forType: .png)
+        }
+        item.setString(folder.absoluteString, forType: .fileURL)
+        if !board.writeObjects([item]) {
+            board.clearContents()
+            board.setString(prompt, forType: .string)
+        }
+    }
+
     func gitOutput(_ args: [String], dir: String) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -1733,6 +1760,39 @@ final class DragBar: NSView {
 }
 
 // MARK: - 批注画布
+
+/// Drag copies the export folder. A click still runs the button action.
+final class ExportButton: NSButton, NSDraggingSource {
+    weak var controller: AnnoController?
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        .copy
+    }
+    override func mouseDown(with event: NSEvent) {
+        let start = event.locationInWindow
+        var dragged = false
+        while true {
+            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            if next.type == .leftMouseUp { break }
+            let point = next.locationInWindow
+            if hypot(point.x - start.x, point.y - start.y) > 4 {
+                beginBundleDrag(next)
+                dragged = true
+                break
+            }
+        }
+        if !dragged { sendAction(action, to: target) }
+    }
+    func beginBundleDrag(_ event: NSEvent) {
+        guard let c = controller, let view = c.overlay?.annoView else { return }
+        let data = (try? JSONSerialization.data(withJSONObject: c.buildJSON(items: view.items),
+                        options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let folder = c.writeExportBundle(text)
+        let item = NSDraggingItem(pasteboardWriter: folder as NSURL)
+        item.setDraggingFrame(bounds, contents: nil)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+}
 
 final class AnnotationView: NSView {
     weak var controller: AnnoController?
@@ -2827,8 +2887,23 @@ final class AnnotationView: NSView {
                                           ("完成✓", #selector(doneNow))]
         for (t, sel) in acts {
             let w = CGFloat(t.count * 15 + 20)
-            let btn = textBtn(t, frame: NSRect(x: x, y: 8, width: w, height: 28))
-            btn.action = sel; btn.target = self
+            let btn: NSButton
+            if sel == #selector(copyJSON) {
+                let export = ExportButton(title: t, target: self, action: sel)
+                export.frame = NSRect(x: x, y: 8, width: w, height: 28)
+                export.isBordered = false
+                export.wantsLayer = true
+                export.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
+                export.layer?.cornerRadius = 6
+                export.font = .systemFont(ofSize: 12, weight: .medium)
+                export.contentTintColor = .black
+                export.controller = controller
+                btn = export
+            } else {
+                btn = textBtn(t, frame: NSRect(x: x, y: 8, width: w, height: 28))
+                btn.action = sel
+                btn.target = self
+            }
             bar.addSubview(btn); x += w + 8
         }
         addSubview(bar)
@@ -2883,8 +2958,8 @@ final class AnnotationView: NSView {
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
         let text = String(data: data, encoding: .utf8) ?? ""
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(c.handoffPrompt(text), forType: .string)
+        let folder = c.writeExportBundle(text)
+        c.copyExport(prompt: c.handoffPrompt(text), image: c.shotURL, folder: folder)
         flashBubble("JSON 已复制(\(items.count) 笔)")
     }
     @objc func doneNow() { controller?.finish(copyToPasteboard: true) }
