@@ -24,6 +24,10 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 - Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`.
 - Team server: `python3 tools/dingai/team-server/dingai_team_server.py`
 
+## Annotating
+
+`⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. Esc writes JSON and a PNG taken at that moment.
+
 ## Desktop ↔ page bridge
 
 The macOS app listens on `127.0.0.1:8763` only. A page that has loaded `anno.js` answers `elementFromPoint` so a desktop pin landing in a browser can record the DOM field. Nothing else is contacted unless team upload is configured.
