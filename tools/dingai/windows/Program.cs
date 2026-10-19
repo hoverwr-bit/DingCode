@@ -12,6 +12,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -21,6 +22,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using Windows.Graphics.Imaging;
+using Windows.Media.FaceAnalysis;
 using Windows.Media.Ocr;
 using Windows.Storage.Streams;
 using WF = System.Windows.Forms;
@@ -93,12 +95,16 @@ record BoxRec(int Id, int X, int Y, int W, int H, string Color, int Width)
 {
     public string Shape { get; set; } = "rect";
 }
-record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project);
+record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project, bool Redact);
 abstract record Item { public int Id = 0; }
 record PinItem(PinRec Pin) : Item;
 record ArrowItem(ArrowRec A) : Item;
 record BoxItem(BoxRec B) : Item;
-record OcrText(string Text, double Cx, double Cy);
+record OcrText(string Text, double Cx, double Cy)
+{
+    public double W { get; set; }
+    public double H { get; set; }
+}
 record WinCand(string Owner, string Title, int[] FramePhys);   // 物理像素
 
 #endregion
@@ -316,7 +322,7 @@ internal class Controller
                     var b = word.BoundingRect;   // 物理像素
                     var t = word.Text?.Trim();
                     if (!string.IsNullOrEmpty(t))
-                        outList.Add(new OcrText(t, b.X + b.Width / 2, b.Y + b.Height / 2));
+                        outList.Add(new OcrText(t, b.X + b.Width / 2, b.Y + b.Height / 2) { W = b.Width, H = b.Height });
                 }
         }
         catch { }
@@ -379,6 +385,7 @@ internal class Controller
             }
             catch { OcrDone = true; }
         }
+        if (LoadSync().Redact) RedactSession(view);
         var json = BuildJson(view.Items);
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
@@ -391,9 +398,106 @@ internal class Controller
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
     }
 
+    static string RedactString(string text, List<Regex> regs)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        foreach (var reg in regs) text = reg.Replace(text, "[redacted]");
+        return text;
+    }
+
+    List<Regex> RedactPatterns()
+    {
+        var regs = new List<Regex>();
+        string[] builtin =
+        {
+            "[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+\\.[A-Z]{2,}",
+            "(?:\\+?86[-\\s]?)?1[3-9]\\d{9}",
+            "(?:\\+?84|0)(?:3|5|7|8|9)\\d{8}",
+            "\\(?\\d{3}\\)?[-.\\s]\\d{3}[-.\\s]\\d{4}",
+            "\\b(?:PO|P\\.O\\.|SO|订单号|订单|订货单)\\s*[#:：\\-]?\\s*[A-Z0-9][A-Z0-9\\-]{2,}",
+            "(?:[$€£₫]|¥|USD|CNY|VND)\\s?\\d[\\d,]*(?:\\.\\d{1,2})?",
+        };
+        foreach (var pattern in builtin)
+        {
+            try { regs.Add(new Regex(pattern, RegexOptions.IgnoreCase)); } catch { }
+        }
+        var home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI");
+        void Read(string name, bool literal)
+        {
+            try
+            {
+                foreach (var line in File.ReadAllLines(Path.Combine(home, name)))
+                {
+                    var text = line.Trim();
+                    if (text.Length == 0 || text.StartsWith("#")) continue;
+                    try { regs.Add(new Regex(literal ? Regex.Escape(text) : text, RegexOptions.IgnoreCase)); } catch { }
+                }
+            }
+            catch { }
+        }
+        Read("redact-names.txt", true);
+        Read("redact-patterns.txt", false);
+        return regs;
+    }
+
+    void Pixelate(System.Drawing.Bitmap bmp, System.Drawing.Rectangle rect)
+    {
+        rect.Intersect(new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height));
+        if (rect.Width < 2 || rect.Height < 2) return;
+        int sw = Math.Max(1, rect.Width / 14), sh = Math.Max(1, rect.Height / 14);
+        using var small = new System.Drawing.Bitmap(sw, sh);
+        using (var g = System.Drawing.Graphics.FromImage(small))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.DrawImage(bmp, new System.Drawing.Rectangle(0, 0, sw, sh), rect, System.Drawing.GraphicsUnit.Pixel);
+        }
+        using (var g = System.Drawing.Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.DrawImage(small, rect);
+        }
+    }
+
+    void RedactSession(AnnoCanvas view)
+    {
+        var regs = RedactPatterns();
+        if (Shot != null)
+        {
+            foreach (var item in Ocr)
+            {
+                if (RedactString(item.Text, regs) == item.Text) continue;
+                int w = item.W > 4 ? (int)item.W : 80;
+                int h = item.H > 4 ? (int)item.H : 22;
+                Pixelate(Shot, new System.Drawing.Rectangle((int)item.Cx - w / 2, (int)item.Cy - h / 2, w, h));
+            }
+            try
+            {
+                var software = Task.Run(async () => await SoftwareBitmapFromBmp(Shot)).GetAwaiter().GetResult();
+                var gray = SoftwareBitmap.Convert(software, BitmapPixelFormat.Gray8);
+                var detector = FaceDetector.CreateAsync().AsTask().GetAwaiter().GetResult();
+                foreach (var face in detector.DetectFacesAsync(gray).AsTask().GetAwaiter().GetResult())
+                {
+                    var box = face.FaceBox;
+                    Pixelate(Shot, new System.Drawing.Rectangle(box.X, box.Y, box.Width, box.Height));
+                }
+            }
+            catch { }
+            try { if (!string.IsNullOrEmpty(ShotFile)) Shot.Save(ShotFile, System.Drawing.Imaging.ImageFormat.Png); } catch { }
+        }
+        foreach (var it in view.Items)
+        {
+            if (it is PinItem pi)
+            {
+                pi.Pin.OcrNearby = RedactString(pi.Pin.OcrNearby, regs);
+                pi.Pin.Note = RedactString(pi.Pin.Note, regs);
+            }
+        }
+    }
+
     public SyncCfg LoadSync()
     {
         string mode = "local", share = "", server = "", token = "", project = "inbox";
+        bool fileRedact = false;
         var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "settings.json");
         try
         {
@@ -406,6 +510,7 @@ internal class Controller
                 token = obj["token"]?.ToString() ?? "";
                 var named = obj["project"]?.ToString();
                 if (!string.IsNullOrEmpty(named)) project = named;
+                fileRedact = obj["redact"]?.ToString() == "true";
             }
         }
         catch { }
@@ -421,8 +526,10 @@ internal class Controller
         if (mode != "folder" && mode != "server") mode = "local";
         project = project.Replace("/", "-").Replace("\\", "-");
         if (string.IsNullOrEmpty(project)) project = "inbox";
+        var redactEnv = Env("DINGAI_REDACT");
+        bool redact = redactEnv == "1" ? true : redactEnv == "0" ? false : fileRedact;
         var hosts = server.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return new SyncCfg(mode, share, hosts, token ?? "", project);
+        return new SyncCfg(mode, share, hosts, token ?? "", project, redact);
     }
 
     public void Publish(string json, string noteFile, string shotFile)
@@ -552,6 +659,7 @@ internal class Controller
             ["screen_capture_ok"] = Shot != null,
             ["live"] = Live,
             ["project"] = LoadSync().Project,
+            ["redacted"] = LoadSync().Redact,
             ["handoff_rules"] = HandoffRules(),
         };
         return root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });

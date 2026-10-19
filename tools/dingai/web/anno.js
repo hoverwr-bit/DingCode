@@ -351,8 +351,22 @@
     } catch (e) {}
     return DEFAULT_HANDOFF_RULES;
   }
+  function redactOn() {
+    if (window.DINGAI_REDACT === true) return true;
+    try { return localStorage.getItem('dingai-redact') === '1'; } catch (e) { return false; }
+  }
+  function redactText(s) {
+    if (!redactOn() || s == null) return s == null ? '' : String(s);
+    return String(s)
+      .replace(/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/gi, '[redacted]')
+      .replace(/(?:\+?86[-\s]?)?1[3-9]\d{9}/g, '[redacted]')
+      .replace(/(?:\+?84|0)(?:3|5|7|8|9)\d{8}/g, '[redacted]')
+      .replace(/\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/g, '[redacted]')
+      .replace(/\b(?:PO|P\.O\.|SO|订单号|订单|订货单)\s*[#:：\-]?\s*[A-Z0-9][A-Z0-9\-]{2,}/gi, '[redacted]')
+      .replace(/(?:[$€£₫]|¥|USD|CNY|VND)\s?\d[\d,]*(?:\.\d{1,2})?/gi, '[redacted]');
+  }
   function handoffPrompt(jsonText) {
-    return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + jsonText;
+    return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + redactText(jsonText);
   }
   function exportV7() {
     return { page: location.pathname || 'page', version: 7.9, exportedAt: new Date().toISOString(), count: annos.length, annotations: annos, handoff_rules: handoffRules() };

@@ -98,6 +98,8 @@ struct OcrTextItem {
     var text: String
     var cx: Double        // 截图像素
     var cy: Double
+    var w: Double = 0
+    var h: Double = 0
 }
 
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
@@ -882,7 +884,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             let b = obs.boundingBox
             let t = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !t.isEmpty else { continue }
-            out.append(OcrTextItem(text: t, cx: b.midX * W, cy: (1.0 - b.midY) * H))
+            out.append(OcrTextItem(text: t, cx: b.midX * W, cy: (1.0 - b.midY) * H,
+                                    w: b.width * W, h: b.height * H))
         }
         return out
     }
@@ -974,6 +977,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         while !ocrDone && Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
+        if redactEnabled() { redactSession(view) }
         let json = buildJSON(items: view.items)
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
@@ -992,6 +996,127 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         shotCG = nil
         reportToTeam(json: json, jsonData: data, noteFile: url, shotFile: shotCopy)
         done?()
+    }
+
+    func redactEnabled() -> Bool {
+        switch ProcessInfo.processInfo.environment["DINGAI_REDACT"] {
+        case "1": return true
+        case "0": return false
+        default:
+            let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/settings.json")
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return (obj["redact"] as? Bool) == true
+            }
+            return false
+        }
+    }
+
+    func redactPatterns() -> [NSRegularExpression] {
+        let builtin = [
+            "[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+\\.[A-Z]{2,}",
+            "(?:\\+?86[-\\s]?)?1[3-9]\\d{9}",
+            "(?:\\+?84|0)(?:3|5|7|8|9)\\d{8}",
+            "\\(?\\d{3}\\)?[-.\\s]\\d{3}[-.\\s]\\d{4}",
+            "\\b(?:PO|P\\.O\\.|SO|订单号|订单|订货单)\\s*[#:：\\-]?\\s*[A-Z0-9][A-Z0-9\\-]{2,}",
+            "(?:[$€£₫]|¥|USD|CNY|VND)\\s?\\d[\\d,]*(?:\\.\\d{1,2})?",
+        ]
+        var regs: [NSRegularExpression] = []
+        for pattern in builtin {
+            if let reg = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) { regs.append(reg) }
+        }
+        let home = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI")
+        if let text = try? String(contentsOfFile: (home as NSString).appendingPathComponent("redact-names.txt"), encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                let name = line.trimmingCharacters(in: .whitespaces)
+                if name.isEmpty || name.hasPrefix("#") { continue }
+                let escaped = NSRegularExpression.escapedPattern(for: name)
+                if let reg = try? NSRegularExpression(pattern: escaped, options: [.caseInsensitive]) { regs.append(reg) }
+            }
+        }
+        if let text = try? String(contentsOfFile: (home as NSString).appendingPathComponent("redact-patterns.txt"), encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                let pattern = line.trimmingCharacters(in: .whitespaces)
+                if pattern.isEmpty || pattern.hasPrefix("#") { continue }
+                if let reg = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) { regs.append(reg) }
+            }
+        }
+        return regs
+    }
+
+    func redactString(_ text: String, regs: [NSRegularExpression]) -> String {
+        var out = text
+        for reg in regs {
+            let range = NSRange(out.startIndex..., in: out)
+            out = reg.stringByReplacingMatches(in: out, range: range, withTemplate: "[redacted]")
+        }
+        return out
+    }
+
+    func faceRects(_ image: CGImage) -> [CGRect] {
+        let req = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cgImage: image)
+        try? handler.perform([req])
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        return (req.results ?? []).map { obs in
+            let b = obs.boundingBox
+            return CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h)
+        }
+    }
+
+    func pixelate(_ image: CGImage, rects: [CGRect]) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        for rect in rects {
+            let r = rect.integral.intersection(CGRect(x: 0, y: 0, width: w, height: h))
+            guard r.width > 2, r.height > 2, let crop = image.cropping(to: r) else { continue }
+            let sw = max(1, r.width / 14), sh = max(1, r.height / 14)
+            let destY = CGFloat(h) - r.maxY
+            ctx.saveGState()
+            ctx.translateBy(x: r.minX, y: destY)
+            ctx.scaleBy(x: r.width / sw, y: r.height / sh)
+            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+            ctx.restoreGState()
+        }
+        return ctx.makeImage() ?? image
+    }
+
+    func redactSession(_ view: AnnotationView) {
+        let regs = redactPatterns()
+        var rects: [CGRect] = []
+        for item in ocrItems where redactString(item.text, regs: regs) != item.text {
+            let w = item.w > 4 ? item.w : 80
+            let h = item.h > 4 ? item.h : 22
+            rects.append(CGRect(x: item.cx - w / 2, y: item.cy - h / 2, width: w, height: h))
+        }
+        if let cg = shotCG {
+            rects.append(contentsOf: faceRects(cg))
+            if let next = pixelate(cg, rects: rects) {
+                shotCG = next
+                if let url = shotURL,
+                   let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, next, nil)
+                    CGImageDestinationFinalize(dest)
+                }
+            }
+        }
+        for i in view.items.indices {
+            switch view.items[i] {
+            case .pin(var pin):
+                pin.ocrNearby = redactString(pin.ocrNearby, regs: regs)
+                if let note = pin.note { pin.note = redactString(note, regs: regs) }
+                view.items[i] = .pin(pin)
+            case .text(var label):
+                label.text = redactString(label.text, regs: regs)
+                view.items[i] = .text(label)
+            default:
+                break
+            }
+        }
     }
 
     // MARK: 团队同步(环境变量或 ~/DingAI/settings.json;失败静默跳过)
@@ -1200,6 +1325,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "screen_capture_ok": (shotCG != nil),
             "live": live,
             "project": syncChoice().project,
+            "redacted": redactEnabled(),
             "handoff_rules": handoffRules(),
         ]
         return json
