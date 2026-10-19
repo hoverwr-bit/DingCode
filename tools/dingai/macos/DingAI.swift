@@ -575,6 +575,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "DingAI 开始批注  ⌥⌘A", action: #selector(toggle), keyEquivalent: "")
         menu.addItem(withTitle: "交互穿透  ⌥⌘P", action: #selector(togglePass), keyEquivalent: "")
+        menu.addItem(withTitle: "检查本次改动", action: #selector(checkScope), keyEquivalent: "")
         let axItem = NSMenuItem(title: AXIsProcessTrusted() ? "辅助功能:已允许(控件跟随)" : "辅助功能:未允许,点此请求",
                                 action: #selector(askAX), keyEquivalent: "")
         menu.addItem(axItem)
@@ -976,6 +977,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         let url = outputRoot.appendingPathComponent("notes")
                         .appendingPathComponent("anno-" + stamp() + ".json")
         try? data.write(to: url)
+        recordHandoffBaseline()
         if copyToPasteboard {
             let text = String(data: data, encoding: .utf8) ?? ""
             NSPasteboard.general.clearContents()
@@ -1155,6 +1157,141 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     func handoffPrompt(_ json: String) -> String {
         handoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json
+    }
+
+    func gitOutput(_ args: [String], dir: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = args
+        p.currentDirectoryURL = URL(fileURLWithPath: dir)
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+
+    func recordHandoffBaseline() {
+        guard let project = projectDir(),
+              let head = gitOutput(["rev-parse", "HEAD"], dir: project) else { return }
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: project)) ?? []).filter { $0 != ".git" }.sorted()
+        let obj: [String: Any] = [
+            "head": head.trimmingCharacters(in: .whitespacesAndNewlines),
+            "project": project,
+            "top_dirs": names,
+            "at": isoNow()]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
+        let dir = (project as NSString).appendingPathComponent(".dingai")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("last-handoff.json")))
+    }
+
+    func scopeCheck() -> (text: String, paths: [String], moved: Bool) {
+        guard let project = projectDir() else {
+            return ("没有项目目录。设置 DINGAI_PROJECT，或把路径写进 ~/DingAI/project.txt。", [], false)
+        }
+        let baseURL = URL(fileURLWithPath: (project as NSString).appendingPathComponent(".dingai/last-handoff.json"))
+        guard let data = try? Data(contentsOf: baseURL),
+              let base = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let baseHead = base["head"] as? String else {
+            return ("还没有交接记录。完成一次批注后再检查。", [], false)
+        }
+        let head = (gitOutput(["rev-parse", "HEAD"], dir: project) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let diff = gitOutput(["diff", "--numstat", "--no-renames", baseHead], dir: project) ?? ""
+        var files: [(String, Int)] = []
+        var total = 0
+        for line in diff.split(separator: "\n") {
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard parts.count >= 3 else { continue }
+            let add = Int(parts[0]) ?? 0
+            let del = Int(parts[1]) ?? 0
+            let path = String(parts[2])
+            if path == ".dingai/last-handoff.json" { continue }
+            files.append((path, add + del))
+            total += add + del
+        }
+        var seen = Set(files.map { $0.0 })
+        let others = gitOutput(["ls-files", "--others", "--exclude-standard"], dir: project) ?? ""
+        for line in others.split(separator: "\n") {
+            let path = String(line)
+            if path.isEmpty || path == ".dingai/last-handoff.json" || seen.contains(path) { continue }
+            files.append((path, 0))
+            seen.insert(path)
+        }
+        let prefixes = scopePrefixes(project)
+        let tops = Set((base["top_dirs"] as? [String]) ?? [])
+        let deps: Set<String> = ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "packages.lock.json",
+                                 "Package.swift", "Package.resolved", "go.mod", "go.sum", "requirements.txt", "poetry.lock",
+                                 "Pipfile", "Pipfile.lock", "Cargo.toml", "Cargo.lock", "composer.json", "composer.lock",
+                                 "Gemfile", "Gemfile.lock", "Podfile", "Podfile.lock"]
+        var outside: [String] = [], depHits: [String] = [], modules: [String] = []
+        for (path, _) in files {
+            if let prefixes, !prefixes.contains(where: { path == $0 || path.hasPrefix($0) }) { outside.append(path) }
+            let baseName = (path as NSString).lastPathComponent
+            if deps.contains(baseName) || baseName.hasSuffix(".csproj") { depHits.append(path) }
+            let first = path.split(separator: "/", maxSplits: 1).first.map(String.init) ?? path
+            if !tops.contains(first) { modules.append(path) }
+        }
+        var lines = ["\(files.count) 个文件，\(total) 行，相对 \(baseHead.prefix(12))"]
+        if head != baseHead { lines.append("HEAD 已经前进。退回不会重置提交历史。") }
+        var paths: [String] = []
+        func add(_ title: String, _ list: [String]) {
+            guard !list.isEmpty else { return }
+            lines.append(title)
+            for p in list.prefix(30) { lines.append("  " + p) }
+            for p in list where !paths.contains(p) { paths.append(p) }
+        }
+        add("范围外（.dingai/scope.txt）：", outside)
+        add("新的依赖或锁文件：", depHits)
+        add("新的顶层文件或目录：", modules)
+        if total > 400 || files.count > 8 {
+            lines.append("改动偏大：\(files.count) 个文件，\(total) 行。")
+            for (path, _) in files where !paths.contains(path) { paths.append(path) }
+        }
+        if paths.isEmpty { lines.append("没有超出范围的改动。") }
+        return (lines.joined(separator: "\n"), paths, head != baseHead)
+    }
+
+    func scopePrefixes(_ project: String) -> [String]? {
+        let path = (project as NSString).appendingPathComponent(".dingai/scope.txt")
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return text.split(separator: "\n").compactMap { line in
+            let raw = line.split(separator: "#", maxSplits: 1).first.map(String.init) ?? ""
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            return t.isEmpty ? nil : t
+        }
+    }
+
+    func rejectScope(_ paths: [String], project: String) {
+        guard let head = gitOutput(["rev-parse", "HEAD"], dir: project)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        let targets = paths.filter { !$0.hasPrefix("/") && !$0.split(separator: "/").contains("..") }
+        guard !targets.isEmpty else { return }
+        let tracked = Set((gitOutput(["ls-files", "--"] + targets, dir: project) ?? "").split(separator: "\n").map(String.init))
+        let restore = targets.filter { tracked.contains($0) }
+        if !restore.isEmpty {
+            _ = gitOutput(["restore", "--source", head, "--worktree", "--staged", "--"] + restore, dir: project)
+        }
+        for path in targets where !tracked.contains(path) {
+            let full = (project as NSString).appendingPathComponent(path)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue {
+                try? FileManager.default.removeItem(atPath: full)
+            }
+        }
+    }
+
+    @objc func checkScope() {
+        let report = scopeCheck()
+        let alert = NSAlert()
+        alert.messageText = "改动范围"
+        alert.informativeText = report.text
+        alert.addButton(withTitle: "知道了")
+        if !report.paths.isEmpty && !report.moved { alert.addButton(withTitle: "退回这些改动") }
+        if alert.runModal() == .alertSecondButtonReturn, let project = projectDir() {
+            rejectScope(report.paths, project: project)
+        }
     }
 
     func stamp() -> String {

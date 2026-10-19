@@ -139,6 +139,7 @@ internal class Controller
         var icon = System.Drawing.Icon.FromHandle(bmp.GetHicon());
         var menu = new WF.ContextMenuStrip();
         menu.Items.Add("DingAI 开始批注  Ctrl+Alt+A", null, (s, e) => Toggle());
+        menu.Items.Add("检查本次改动", null, (s, e) => CheckScope());
         menu.Items.Add(new WF.ToolStripSeparator());
         menu.Items.Add("退出", null, (s, e) => { Tray.Visible = false; Application.Current.Shutdown(); });
         Tray = new WF.NotifyIcon { Icon = icon, Text = "DingAI", Visible = true, ContextMenuStrip = menu };
@@ -297,6 +298,7 @@ internal class Controller
         var json = BuildJson(view.Items);
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
+        RecordHandoffBaseline();
         if (clipboard)
         {
             try { System.Windows.Clipboard.SetText(HandoffPrompt(json)); } catch { }
@@ -401,6 +403,153 @@ internal class Controller
 
     public string HandoffPrompt(string json) =>
         HandoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json;
+
+    string Git(string dir, params string[] args)
+    {
+        try
+        {
+            var p = new Process();
+            p.StartInfo.FileName = "git";
+            p.StartInfo.WorkingDirectory = dir;
+            p.StartInfo.RedirectStandardOutput = true;
+            p.StartInfo.RedirectStandardError = true;
+            p.StartInfo.CreateNoWindow = true;
+            foreach (var a in args) p.StartInfo.ArgumentList.Add(a);
+            p.Start();
+            var text = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            return p.ExitCode == 0 ? text : null;
+        }
+        catch { return null; }
+    }
+
+    public void RecordHandoffBaseline()
+    {
+        var project = ProjectDir();
+        if (string.IsNullOrEmpty(project) || !Directory.Exists(project)) return;
+        var head = Git(project, "rev-parse", "HEAD");
+        if (string.IsNullOrEmpty(head)) return;
+        var names = Directory.GetFileSystemEntries(project).Select(Path.GetFileName).Where(n => n != ".git").OrderBy(n => n);
+        var topsArr = new JsonArray();
+        foreach (var n in names) topsArr.Add(JsonValue.Create(n));
+        var obj = new JsonObject
+        {
+            ["head"] = head.Trim(),
+            ["project"] = project,
+            ["top_dirs"] = topsArr,
+            ["at"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+        };
+        var dir = Path.Combine(project, ".dingai");
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "last-handoff.json"), obj.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
+    public void CheckScope()
+    {
+        var project = ProjectDir();
+        if (string.IsNullOrEmpty(project))
+        {
+            WF.MessageBox.Show("没有项目目录。设置 DINGAI_PROJECT，或把路径写进用户目录下的 DingAI/project.txt。", "改动范围");
+            return;
+        }
+        JsonObject baseObj = null;
+        try
+        {
+            baseObj = JsonNode.Parse(File.ReadAllText(Path.Combine(project, ".dingai", "last-handoff.json"))) as JsonObject;
+        }
+        catch { }
+        string baseHead = null;
+        try { baseHead = baseObj?["head"]?.GetValue<string>(); } catch { }
+        if (string.IsNullOrEmpty(baseHead))
+        {
+            WF.MessageBox.Show("还没有交接记录。完成一次批注后再检查。", "改动范围");
+            return;
+        }
+        var head = (Git(project, "rev-parse", "HEAD") ?? "").Trim();
+        var files = new List<(string path, int lines)>();
+        var diff = Git(project, "diff", "--numstat", "--no-renames", baseHead) ?? "";
+        var total = 0;
+        foreach (var line in diff.Split('\n'))
+        {
+            var parts = line.Split('\t');
+            if (parts.Length < 3 || parts[2] == ".dingai/last-handoff.json") continue;
+            int add = int.TryParse(parts[0], out var a) ? a : 0;
+            int del = int.TryParse(parts[1], out var d) ? d : 0;
+            files.Add((parts[2], add + del));
+            total += add + del;
+        }
+        var seen = new HashSet<string>(files.Select(f => f.path));
+        foreach (var line in (Git(project, "ls-files", "--others", "--exclude-standard") ?? "").Split('\n'))
+        {
+            var path = line.Trim();
+            if (path.Length == 0 || path == ".dingai/last-handoff.json" || seen.Contains(path)) continue;
+            files.Add((path, 0));
+            seen.Add(path);
+        }
+        string[] prefixes = null;
+        try
+        {
+            prefixes = File.ReadAllLines(Path.Combine(project, ".dingai", "scope.txt"))
+                .Select(l => l.Split('#')[0].Trim()).Where(l => l.Length > 0).ToArray();
+        }
+        catch { }
+        var tops = new HashSet<string>();
+        if (baseObj?["top_dirs"] is JsonArray arr)
+            foreach (var n in arr)
+            {
+                try { tops.Add(n.GetValue<string>()); } catch { }
+            }
+        var depNames = new HashSet<string> { "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "packages.lock.json", "Package.swift", "Package.resolved", "go.mod", "go.sum", "requirements.txt", "poetry.lock", "Pipfile", "Pipfile.lock", "Cargo.toml", "Cargo.lock", "composer.json", "composer.lock", "Gemfile", "Gemfile.lock", "Podfile", "Podfile.lock" };
+        var outside = new List<string>(); var deps = new List<string>(); var modules = new List<string>();
+        foreach (var f in files)
+        {
+            if (prefixes != null && !prefixes.Any(p => f.path == p || f.path.StartsWith(p))) outside.Add(f.path);
+            var name = Path.GetFileName(f.path);
+            if (depNames.Contains(name) || name.EndsWith(".csproj")) deps.Add(f.path);
+            var first = f.path.Split('/')[0];
+            if (!tops.Contains(first)) modules.Add(f.path);
+        }
+        var lines = new List<string> { files.Count + " 个文件，" + total + " 行，相对 " + baseHead.Substring(0, Math.Min(12, baseHead.Length)) };
+        var moved = head != baseHead;
+        if (moved) lines.Add("HEAD 已经前进。退回不会重置提交历史。");
+        var paths = new List<string>();
+        void Add(string title, List<string> list)
+        {
+            if (list.Count == 0) return;
+            lines.Add(title);
+            foreach (var p in list.Take(30)) lines.Add("  " + p);
+            foreach (var p in list) if (!paths.Contains(p)) paths.Add(p);
+        }
+        Add("范围外（.dingai/scope.txt）：", outside);
+        Add("新的依赖或锁文件：", deps);
+        Add("新的顶层文件或目录：", modules);
+        if (total > 400 || files.Count > 8)
+        {
+            lines.Add("改动偏大：" + files.Count + " 个文件，" + total + " 行。");
+            foreach (var f in files) if (!paths.Contains(f.path)) paths.Add(f.path);
+        }
+        if (paths.Count == 0) lines.Add("没有超出范围的改动。");
+        var text = string.Join("\n", lines);
+        if (paths.Count == 0 || moved)
+        {
+            WF.MessageBox.Show(text, "改动范围");
+            return;
+        }
+        if (WF.MessageBox.Show(text + "\n\n退回上面列出的改动？", "改动范围", WF.MessageBoxButtons.YesNo) != WF.DialogResult.Yes) return;
+        var tracked = new HashSet<string>((Git(project, new[] { "ls-files", "--" }.Concat(paths).ToArray()) ?? "").Split('\n').Select(s => s.Trim()).Where(s => s.Length > 0));
+        var restore = paths.Where(tracked.Contains).ToList();
+        if (restore.Count > 0) Git(project, new[] { "restore", "--source", head, "--worktree", "--staged", "--" }.Concat(restore).ToArray());
+        foreach (var path in paths)
+        {
+            if (tracked.Contains(path) || path.Contains("..") || Path.IsPathRooted(path)) continue;
+            var full = Path.Combine(project, path);
+            if (File.Exists(full)) try { File.Delete(full); } catch { }
+        }
+    }
 
     public string Stamp() => DateTime.Now.ToString("yyyyMMdd-HHmmss");
 }

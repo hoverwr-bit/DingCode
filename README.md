@@ -51,6 +51,14 @@ python3 tools/dingai/handoff.py mcp
 
 The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
 
+After the agent marks the pin fixed, compare the tree with the snapshot taken at export:
+
+```
+python3 tools/dingai/handoff.py scope
+```
+
+The macOS and Windows menus have the same check (“检查本次改动”). Put the paths the pin should touch in `.dingai/scope.txt`, one prefix per line. The check warns about other files, new dependencies or lockfiles, new top-level directories, and a diff over 400 lines or 8 files. Rejecting restores only those paths, and only while `HEAD` is still the snapshot. It does not reset commits. The page copy does not snapshot git; the desktop export and `handoff.py prompt` do.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Arrows use `from_px` / `to_px`. Boxes use `rect_px`.

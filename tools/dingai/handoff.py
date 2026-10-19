@@ -6,12 +6,17 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
 
   python3 handoff.py rules
   python3 handoff.py prompt [note.json]     # stdin when the path is omitted
+  python3 handoff.py baseline [project]
+  python3 handoff.py scope [project]
+  python3 handoff.py reject [project]
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
 """
 
 import json
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 
 DEFAULT_RULES = """- Make the smallest change that fixes the pinned issue. Do not refactor or rewrite surrounding code.
 - Follow the project's ARCHITECTURE or conventions file before adding code.
@@ -20,6 +25,16 @@ DEFAULT_RULES = """- Make the smallest change that fixes the pinned issue. Do no
 - Explain the diff and how it was verified."""
 
 PROMPT_LEAD = "Apply the rules above to this DingAI note. The pinned element is the only scope."
+
+DEP_NAMES = {
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "packages.lock.json",
+    "Package.swift", "Package.resolved", "go.mod", "go.sum",
+    "requirements.txt", "poetry.lock", "Pipfile", "Pipfile.lock",
+    "Cargo.toml", "Cargo.lock", "composer.json", "composer.lock",
+    "Gemfile", "Gemfile.lock", "Podfile", "Podfile.lock",
+}
+LINE_LIMIT = 400
+FILE_LIMIT = 8
 
 
 def project_dir():
@@ -78,14 +93,230 @@ def tool_schema():
     }
 
 
+def scope_tool_schema():
+    return {
+        "name": "dingai_scope_check",
+        "description": "Compare the working tree with the handoff baseline and report files outside the pinned scope, new dependencies, new top-level modules, and large diffs.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}},
+    }
+
+
+def reject_tool_schema():
+    return {
+        "name": "dingai_reject",
+        "description": "Restore the warned paths to the handoff HEAD. Refuses when HEAD has moved, and does not reset history.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    }
+
+
 def call_handoff(arguments):
     arguments = arguments or {}
     if arguments.get("note_path"):
         note = read_note(arguments["note_path"])
     else:
         note = arguments.get("note") or ""
+    record_baseline()
     text = prompt_for(note)
     return {"content": [{"type": "text", "text": text}]}
+
+
+def git(project, args):
+    try:
+        proc = subprocess.run(["git", *args], cwd=project, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def baseline_path(project):
+    if project:
+        return os.path.join(project, ".dingai", "last-handoff.json")
+    return os.path.join(os.path.expanduser("~"), "DingAI", "last-handoff.json")
+
+
+def load_baseline(project=None):
+    path = baseline_path(project if project is not None else project_dir())
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def record_baseline(project=None):
+    project = project if project is not None else project_dir()
+    if not project or not os.path.isdir(project):
+        return None
+    head = git(project, ["rev-parse", "HEAD"])
+    if not head:
+        return None
+    try:
+        names = [n for n in os.listdir(project) if n != ".git"]
+    except OSError:
+        names = []
+    data = {
+        "head": head.strip(),
+        "project": project,
+        "top_dirs": sorted(names),
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    path = baseline_path(project)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+    except OSError:
+        return None
+    return data
+
+
+def scope_prefixes(project):
+    path = os.path.join(project, ".dingai", "scope.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    out = []
+    for line in lines:
+        text = line.split("#", 1)[0].strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def is_dependency(path):
+    base = os.path.basename(path)
+    return base in DEP_NAMES or base.endswith(".csproj")
+
+
+def parse_numstat(text):
+    files = []
+    total = 0
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        added, deleted, path = parts[0], parts[1], parts[2]
+        lines = (int(added) if added.isdigit() else 0) + (int(deleted) if deleted.isdigit() else 0)
+        files.append({"path": path, "lines": lines, "untracked": False})
+        total += lines
+    return files, total
+
+
+def scope_check(project=None):
+    project = project if project is not None else project_dir()
+    base = load_baseline(project)
+    if not project or not base or not base.get("head"):
+        return {"ok": False, "error": "no baseline", "warnings": [], "reject_paths": []}
+    head = (git(project, ["rev-parse", "HEAD"]) or "").strip()
+    diff = git(project, ["diff", "--numstat", "--no-renames", base["head"]])
+    files, total = parse_numstat(diff or "")
+    seen = {item["path"] for item in files}
+    others = git(project, ["ls-files", "--others", "--exclude-standard"]) or ""
+    for path in others.splitlines():
+        if path and path not in seen and path != ".dingai/last-handoff.json":
+            files.append({"path": path, "lines": 0, "untracked": True})
+    files = [item for item in files if item["path"] != ".dingai/last-handoff.json"]
+    prefixes = scope_prefixes(project)
+    tops = set(base.get("top_dirs") or [])
+    outside, deps, modules = [], [], []
+    for item in files:
+        path = item["path"]
+        if prefixes is not None and not any(path == p or path.startswith(p) for p in prefixes):
+            outside.append(path)
+        if is_dependency(path):
+            deps.append(path)
+        first = path.split("/", 1)[0]
+        if first not in tops:
+            modules.append(path)
+    warnings = []
+    if outside:
+        warnings.append({"kind": "outside", "paths": outside, "detail": "files outside .dingai/scope.txt"})
+    if deps:
+        warnings.append({"kind": "dependency", "paths": deps, "detail": "dependency or lockfile changed"})
+    if modules:
+        warnings.append({"kind": "module", "paths": modules, "detail": "new top-level file or directory"})
+    if total > LINE_LIMIT or len(files) > FILE_LIMIT:
+        warnings.append({
+            "kind": "size",
+            "paths": [item["path"] for item in files],
+            "detail": "%d files, %d lines" % (len(files), total),
+        })
+    reject_paths = []
+    for warning in warnings:
+        for path in warning["paths"]:
+            if path not in reject_paths:
+                reject_paths.append(path)
+    return {
+        "ok": not warnings,
+        "head": head,
+        "baseline_head": base.get("head"),
+        "head_moved": head != base.get("head"),
+        "files": len(files),
+        "lines": total,
+        "warnings": warnings,
+        "reject_paths": reject_paths,
+    }
+
+
+def safe_path(path):
+    if not path or path.startswith("/") or path.startswith("\\"):
+        return False
+    return ".." not in path.split("/") and ".." not in path.split("\\")
+
+
+def reject_changes(paths=None, project=None):
+    project = project if project is not None else project_dir()
+    base = load_baseline(project)
+    if not project or not base or not base.get("head"):
+        return {"ok": False, "error": "no baseline"}
+    head = (git(project, ["rev-parse", "HEAD"]) or "").strip()
+    if head != base.get("head"):
+        return {"ok": False, "error": "HEAD moved; history was not reset"}
+    report = scope_check(project)
+    targets = [p for p in (paths if paths is not None else report.get("reject_paths") or []) if safe_path(p)]
+    if not targets:
+        return {"ok": True, "restored": [], "removed": []}
+    tracked = set((git(project, ["ls-files", "--"] + targets) or "").splitlines())
+    restore = [p for p in targets if p in tracked]
+    if restore:
+        if git(project, ["restore", "--source", head, "--worktree", "--staged", "--"] + restore) is None:
+            return {"ok": False, "error": "git restore failed"}
+    removed = []
+    for path in targets:
+        if path in tracked:
+            continue
+        full = os.path.join(project, path)
+        if os.path.isfile(full):
+            os.remove(full)
+            removed.append(path)
+    return {"ok": True, "restored": restore, "removed": removed}
+
+
+def format_scope(report):
+    if report.get("error"):
+        return "No handoff baseline. Export a note or run: python3 handoff.py baseline"
+    lines = ["%d files, %d lines since %s" % (report.get("files", 0), report.get("lines", 0), (report.get("baseline_head") or "")[:12])]
+    if report.get("head_moved"):
+        lines.append("HEAD has moved. Reject will not reset history.")
+    if not report.get("warnings"):
+        lines.append("No scope warnings.")
+    for warning in report.get("warnings") or []:
+        lines.append(warning["detail"] + ":")
+        for path in warning["paths"]:
+            lines.append("  " + path)
+    return "\n".join(lines)
 
 
 def handle_rpc(msg):
@@ -104,13 +335,20 @@ def handle_rpc(msg):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [tool_schema()]}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [tool_schema(), scope_tool_schema(), reject_tool_schema()]}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
-        if name != "dingai_handoff":
-            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
-        return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(params.get("arguments"))}
+        arguments = params.get("arguments") or {}
+        if name == "dingai_handoff":
+            return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(arguments)}
+        if name == "dingai_scope_check":
+            report = scope_check(arguments.get("project") or None)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
+        if name == "dingai_reject":
+            result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
     if mid is None:
         return None
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}}
@@ -162,8 +400,24 @@ def main(argv):
         return 0
     if cmd == "prompt":
         path = argv[2] if len(argv) > 2 else ""
+        record_baseline()
         sys.stdout.write(prompt_for(read_note(path)))
         return 0
+    if cmd == "baseline":
+        saved = record_baseline(argv[2] if len(argv) > 2 else None)
+        if not saved:
+            sys.stderr.write("could not record a baseline\n")
+            return 1
+        sys.stdout.write(saved["head"] + "\n")
+        return 0
+    if cmd == "scope":
+        report = scope_check(argv[2] if len(argv) > 2 else None)
+        sys.stdout.write(format_scope(report) + "\n")
+        return 0 if report.get("ok") else 1
+    if cmd == "reject":
+        result = reject_changes(None, argv[2] if len(argv) > 2 else None)
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "mcp":
         serve_mcp(sys.stdin.buffer, sys.stdout.buffer)
         return 0
