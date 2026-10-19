@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -43,6 +45,15 @@ class LinuxClientTests(unittest.TestCase):
         self.assertTrue(caps["x11"])
         shot = linux.capture_x11(16, 16)
         self.assertTrue(shot[2].startswith(b"\x89PNG"))
+
+
+    def test_notice_banner_reads_the_warning_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "notices.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"banners": [{"text": "Two sessions share erp main"}]}, fh)
+            self.assertIn("Two sessions share", linux.notice_banner(path))
+            self.assertIn("erp main", linux.toolbar_title(2, "Two sessions share erp main"))
 
 
 if __name__ == "__main__":

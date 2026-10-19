@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core import collide as collide_lib
 from core import release as release_lib
 
 PIN_TYPES = ("bug", "change", "question")
@@ -94,6 +95,7 @@ BOARD_HTML = """<!DOCTYPE html>
  <a href="/releases" style="color:#fff">Releases</a>
  <span id="cnt"></span>
 </header>
+<div id="banner" style="display:none;background:#ffe08a;color:#1c1e21;padding:8px 18px;font-size:13px"></div>
 <main><div id="list"></div><div id="detail">Select a pin.</div></main>
 <script>
  const tok = document.getElementById('tok');
@@ -107,6 +109,13 @@ BOARD_HTML = """<!DOCTYPE html>
    if (document.getElementById('ty').value) q.set('type', document.getElementById('ty').value);
    const rows = await (await fetch('/api/pins?' + q.toString(), {headers: headers()})).json();
    document.getElementById('cnt').textContent = (rows.length || 0) + ' pins';
+   try {
+     const note = await (await fetch('/api/notices', {headers: headers()})).json();
+     const el = document.getElementById('banner');
+     const text = (note.banners || []).map(function (b) { return b.text; }).filter(Boolean).join(' · ');
+     el.style.display = text ? 'block' : 'none';
+     el.textContent = text;
+   } catch (e) {}
    const L = document.getElementById('list');
    L.innerHTML = (rows||[]).map(p => '<div class="pin" data-id="'+p.id+'"><b>'+esc(p.pin_type)+'</b> · '+esc(p.status)+
      '<div class="m">#'+p.pin_id+' '+esc(p.project)+' · '+esc(p.assignee||'')+' · '+esc((p.note||'').slice(0,80))+'</div></div>').join('');
@@ -304,6 +313,14 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/releases":
                     return self._send(200, release_lib.index_html(release_lib.list_releases(state_dir())), "text/html; charset=utf-8")
                 return self._release_get(path, qs)
+            if path == "/api/notices":
+                if self._auth(conn, "viewer") is None:
+                    return
+                return self._send(200, json.dumps(collide_lib.read_notices(state_dir())))
+            if path == "/api/sessions" or path.startswith("/api/sessions/"):
+                if self._auth(conn, "viewer") is None:
+                    return
+                return self._sessions_get(path)
             self._send(404, '{"error":"bad path"}')
         finally:
             conn.close()
@@ -402,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._comment_by_row(conn, path)
             if path == "/api/releases" or path.startswith("/api/releases/"):
                 return self._release_post(conn, path)
+            if path == "/api/sessions" or path.startswith("/api/sessions/"):
+                return self._sessions_post(conn, path)
             self._send(404, '{"error":"bad path"}')
         finally:
             conn.close()
@@ -642,6 +661,45 @@ def _release_methods():
 
 
 Handler._release_page, Handler._release_get, Handler._release_post = _release_methods()
+
+
+def _session_get(self, path):
+    parts = [part for part in path.split("/") if part]
+    if parts == ["api", "sessions"]:
+        return self._send(200, json.dumps(collide_lib.list_sessions(state_dir())))
+    return self._send(404, '{"error":"bad path"}')
+
+
+def _session_post(self, conn, path):
+    user = self._auth(conn, "member")
+    if user is None:
+        return
+    parts = [part for part in path.split("/") if part]
+    try:
+        body = self._json()
+    except (json.JSONDecodeError, UnicodeError):
+        return self._send(400, '{"error":"bad json"}')
+    if parts == ["api", "sessions"]:
+        body = dict(body)
+        body["agent"] = body.get("agent") or user["name"]
+        result = collide_lib.register(state_dir(), body)
+        return self._send(200, json.dumps({
+            "ok": True, "id": result["session"]["id"],
+            "warnings": result.get("warnings") or [], "banner": result.get("banner") or "",
+        }))
+    if len(parts) == 4 and parts[3] == "choose":
+        result = collide_lib.choose(state_dir(), parts[2], body.get("choice") or "", actor=user["name"])
+        code = 200 if result.get("ok") else 409
+        return self._send(code, json.dumps({"ok": result.get("ok"), "error": result.get("error", ""), "status": (result.get("session") or {}).get("status", ""), "banner": result.get("banner") or ""}))
+    if len(parts) == 4 and parts[3] == "end":
+        result = collide_lib.end_session(state_dir(), parts[2])
+        code = 200 if result.get("ok") else 404
+        return self._send(code, json.dumps({"ok": result.get("ok"), "overlaps": result.get("overlaps") or [], "error": result.get("error", "")}))
+    return self._send(404, '{"error":"bad path"}')
+
+
+Handler._sessions_get = _session_get
+Handler._sessions_post = _session_post
 
 
 def serve():

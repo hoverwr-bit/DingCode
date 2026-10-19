@@ -187,6 +187,26 @@ internal class Controller
         t.Start();
     }
 
+    public static string NoticeText()
+    {
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "notices.json");
+            if (!File.Exists(path)) return "";
+            var root = JsonNode.Parse(File.ReadAllText(path)) as JsonObject;
+            var rows = root?["banners"] as JsonArray;
+            if (rows == null) return "";
+            var parts = new List<string>();
+            foreach (var row in rows)
+            {
+                var text = (row as JsonObject)?["text"]?.ToString();
+                if (!string.IsNullOrEmpty(text)) parts.Add(text);
+            }
+            return string.Join(" · ", parts);
+        }
+        catch { return ""; }
+    }
+
     public void Begin()
     {
         if (Overlay != null) return;
@@ -237,6 +257,7 @@ internal class Controller
 
         Overlay = new AnnotationWindow(this);
         Canvas = Overlay.Canvas;
+        Canvas.ShowNotice(NoticeText());
         Overlay.Show();
         Overlay.Activate();
 
@@ -765,6 +786,17 @@ internal class AnnotationWindow : Window
 
         Canvas = new AnnoCanvas(c) { Background = c.Live ? Brushes.Transparent : Brushes.Black };
         Content = Canvas;
+        Canvas.Notice = new TextBlock
+        {
+            Background = new SolidColorBrush(Color.FromArgb(242, 255, 214, 102)),
+            Foreground = Brushes.Black, FontSize = 13, Padding = new Thickness(10, 6, 10, 6),
+            TextWrapping = TextWrapping.Wrap, Visibility = Visibility.Collapsed, IsHitTestVisible = false,
+            MaxWidth = 860,
+        };
+        Canvas.Children.Add(Canvas.Notice);
+        System.Windows.Controls.Canvas.SetZIndex(Canvas.Notice, 50);
+        System.Windows.Controls.Canvas.SetLeft(Canvas.Notice, 12);
+        System.Windows.Controls.Canvas.SetTop(Canvas.Notice, 8);
         // 前台主窗 frame(物理像素)
         var fg = Win32.GetForegroundWindow();
         if (fg != IntPtr.Zero && Win32.GetWindowRect(fg, out var r))
@@ -807,6 +839,13 @@ internal class AnnoCanvas : Canvas
     UIElement _draftPreview;
     TextBox _noteField; int _noteIdx;
     List<UIElement> _markers = new();   // 当前会话的钉/箭/框元素(撤销时移除)
+    public TextBlock Notice;
+    public void ShowNotice(string text)
+    {
+        if (Notice == null) return;
+        Notice.Text = text ?? "";
+        Notice.Visibility = string.IsNullOrEmpty(Notice.Text) ? Visibility.Collapsed : Visibility.Visible;
+    }
     UIElement _toolbar;
 
     public AnnoCanvas(Controller c) { C = c; }

@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import unittest
 
+os.environ.setdefault("DINGAI_SESSIONS", "0")
+
 import handoff
 
 

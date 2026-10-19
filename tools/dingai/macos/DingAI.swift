@@ -851,6 +851,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)   // 修「首击不算」:无激活时第一次点击只激活窗口不进画布
         overlay = win
+        win.annoView.noticeBanner = noticeBannerText()
         if live && cg == nil {
             win.annoView.flashBubble("实时:滚轮穿透 · 按住⌥操作下层 · ⌥⌘P锁定")
         }
@@ -1232,6 +1233,14 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             }
         }
         return Self.defaultHandoffRules
+    }
+
+    func noticeBannerText() -> String {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/notices.json")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["banners"] as? [[String: Any]] else { return "" }
+        return rows.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     func handoffPrompt(_ json: String) -> String {
@@ -2070,6 +2079,15 @@ final class AnnotationView: NSView {
             NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
             (t as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.minY + 4), withAttributes: attr)
         }
+        if !noticeBanner.isEmpty {
+            let bar = NSRect(x: 12, y: bounds.height - 40, width: min(bounds.width - 24, 860), height: 28)
+            NSColor(calibratedRed: 1, green: 0.85, blue: 0.35, alpha: 0.95).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 6, yRadius: 6).fill()
+            let attr: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.black]
+            (noticeBanner as NSString).draw(in: bar.insetBy(dx: 8, dy: 6), withAttributes: attr)
+        }
     }
 
     func colorNamed(_ n: String) -> NSColor {
@@ -2623,6 +2641,7 @@ final class AnnotationView: NSView {
 
     var labelObstacles: [LayoutRect] = []
 
+    var noticeBanner = ""
     var flashText: String?
     var flashUntil = Date.distantPast
     func flashBubble(_ t: String) {

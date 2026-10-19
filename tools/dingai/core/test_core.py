@@ -106,7 +106,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue(published["ok"])
             self.assertEqual(published["release"]["overrides"][0]["reason"], "ship the known reject")
             self.assertTrue(published["release"]["immutable"])
-            audit = open(os.path.join(root, "releases", "audit.jsonl"), encoding="utf-8").read()
+            with open(os.path.join(root, "releases", "audit.jsonl"), encoding="utf-8") as fh:
+                audit = fh.read()
             self.assertIn("ship the known reject", audit)
             again = decide(root, first["id"], "note-a:1", "approve", "ada")
             self.assertEqual(again["error"], "read-only")
@@ -134,7 +135,68 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("smallest change", text)
             self.assertIn("abc123", text)
             md = export_release(root, first["id"], "markdown", os.path.join(dest, "one.md"))
-            self.assertTrue(open(md["path"], encoding="utf-8").read().startswith("# DingAI release"))
+            with open(md["path"], encoding="utf-8") as fh:
+                self.assertTrue(fh.read().startswith("# DingAI release"))
+
+
+class CollisionTests(unittest.TestCase):
+    def test_warns_for_shared_work_and_records_the_choice(self):
+        import subprocess
+        from core.collide import choose, end_session, list_sessions, load_session, read_notices, register
+        with tempfile.TemporaryDirectory() as root:
+            first = register(root, {
+                "agent": "codex", "repo": "/repos/erp", "branch": "main", "project": "erp",
+                "pins": ["note:1"], "pin_projects": {"note:1": "erp"}, "paths": ["src/erp"],
+                "ports": ["8080"], "databases": ["erp"], "deploys": ["erp-prod"], "services": ["erp-api"],
+                "head": "aaa",
+            }, current_head="aaa")
+            self.assertEqual(first["warnings"], [])
+            second = register(root, {
+                "agent": "claude", "repo": "/repos/erp", "branch": "main", "project": "portal",
+                "pins": ["note:1"], "pin_projects": {"note:2": "erp"}, "paths": ["src/erp/app.py"],
+                "ports": ["8080"], "head": "aaa",
+            }, current_head="bbb")
+            kinds = {item["kind"] for item in second["warnings"]}
+            self.assertIn("same-branch", kinds)
+            self.assertIn("overlap", kinds)
+            self.assertIn("pin", kinds)
+            self.assertIn("wrong-window", kinds)
+            self.assertIn("target", kinds)
+            self.assertIn("stale", kinds)
+            self.assertIn("Two sessions share", read_notices(root)["banners"][0]["text"])
+            queued = choose(root, second["session"]["id"], "queue", actor="ada")
+            self.assertEqual(queued["session"]["status"], "queued")
+            self.assertTrue(queued["session"]["log"])
+            self.assertEqual(queued["session"]["locks"], [])
+            continued = choose(root, second["session"]["id"], "continue", actor="ada")
+            self.assertEqual(continued["session"]["log"][-1]["choice"], "continue")
+            handed = choose(root, second["session"]["id"], "hand", actor="ada")
+            owner = load_session(root, first["session"]["id"])
+            self.assertIn("note:1", owner["pins"])
+            self.assertNotIn("note:1", handed["session"]["pins"])
+            ended = end_session(root, first["session"]["id"], differ=lambda path, left, right: "left %s\nright %s\n%s" % (left, right, path))
+            self.assertTrue(ended["overlaps"])
+            self.assertIn("src/erp", ended["overlaps"][0]["diff"])
+            self.assertEqual(len([row for row in list_sessions(root) if row["id"] == first["session"]["id"]]), 0)
+
+    def test_isolate_creates_a_worktree(self):
+        import subprocess
+        from core.collide import choose, register
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "dingai@example.com"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "DingAI"], cwd=repo, check=True, capture_output=True)
+            with open(os.path.join(repo, "app.txt"), "w", encoding="utf-8") as fh:
+                fh.write("start\n")
+            subprocess.run(["git", "add", "app.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            opened = register(root, {"agent": "codex", "repo": repo, "branch": "main", "paths": ["app.txt"]})
+            isolated = choose(root, opened["session"]["id"], "isolate", actor="ada")
+            self.assertTrue(isolated["session"]["isolate"]["ok"])
+            self.assertTrue(os.path.isdir(isolated["session"]["isolate"]["path"]))
+            self.assertTrue(isolated["session"]["branch"].startswith("dingai/"))
 
 
 if __name__ == "__main__":

@@ -116,6 +116,32 @@ class ServerTests(unittest.TestCase):
         code, zipped = self.req("GET", "/api/releases/%s/export?format=zip" % rel_id)
         self.assertEqual(code, 200)
 
+    def test_session_collision_shows_a_banner(self):
+        code, first = self.req("POST", "/api/sessions", {
+            "agent": "codex", "repo": "/repos/erp", "branch": "main", "project": "erp",
+            "pins": ["note:1"], "paths": ["src/erp"], "ports": ["8080"], "head": "aaa",
+        })
+        self.assertEqual(code, 200)
+        self.assertEqual(first["warnings"], [])
+        code, second = self.req("POST", "/api/sessions", {
+            "agent": "claude", "repo": "/repos/erp", "branch": "main", "project": "portal",
+            "pins": ["note:1"], "paths": ["src/erp/app.py"], "ports": ["8080"],
+            "pin_projects": {"note:1": "erp"}, "head": "aaa",
+        })
+        self.assertEqual(code, 200)
+        kinds = {item["kind"] for item in second["warnings"]}
+        self.assertIn("same-branch", kinds)
+        self.assertIn("pin", kinds)
+        code, notices = self.req("GET", "/api/notices")
+        self.assertEqual(code, 200)
+        self.assertIn("Two sessions share", notices["banners"][0]["text"])
+        code, queued = self.req("POST", "/api/sessions/%s/choose" % second["id"], {"choice": "queue"})
+        self.assertEqual(code, 200)
+        self.assertEqual(queued["status"], "queued")
+        code, page = self.req("GET", "/")
+        self.assertEqual(code, 200)
+        self.assertIn(b"banner", page)
+
 
 if __name__ == "__main__":
     unittest.main()

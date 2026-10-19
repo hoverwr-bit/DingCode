@@ -266,6 +266,23 @@ class Session:
         return note
 
 
+def notice_banner(path=None):
+    file = Path(path) if path else Path.home() / "DingAI" / "notices.json"
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    parts = [item.get("text") or "" for item in data.get("banners") or []]
+    return " · ".join(part for part in parts if part)
+
+
+def toolbar_title(pins=None, banner=""):
+    base = "DingAI pins %d" % pins if pins is not None else "DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done"
+    if banner:
+        return (base + " | " + banner)[:240]
+    return base
+
+
 def run_toolbar():
     """X11 toolbar. p then click drops a pin. a, r, and s take two clicks for an arrow, box, or spotlight. Esc exports."""
     lib = _x11()
@@ -286,7 +303,10 @@ def run_toolbar():
     screen = lib.XDefaultScreen(display)
     root = lib.XRootWindow(display, screen)
     window = lib.XCreateSimpleWindow(display, root, 40, 40, 720, 36, 1, 0, 0xFFFFFF)
-    lib.XStoreName(display, window, b"DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done")
+    banner = notice_banner()
+    if banner:
+        print(banner, file=sys.stderr)
+    lib.XStoreName(display, window, toolbar_title(banner=banner).encode())
     lib.XSelectInput(display, window, (1 << 0) | (1 << 2))
     lib.XMapWindow(display, window)
     lib.XFlush(display)
@@ -315,7 +335,7 @@ def run_toolbar():
                     session.drag_from = None
                     lib.XUngrabPointer(display, 0)
                     armed = None
-                lib.XStoreName(display, window, ("DingAI pins %d" % len(session.pins)).encode())
+                lib.XStoreName(display, window, toolbar_title(len(session.pins), notice_banner()).encode())
                 lib.XFlush(display)
             elif 0 <= x <= 80:
                 armed = "pin"

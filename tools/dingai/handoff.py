@@ -17,6 +17,10 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py release export <id> zip|markdown <dest>
   python3 handoff.py release search <query>
   python3 handoff.py release rollback <id>
+  python3 handoff.py session start --agent NAME --repo PATH --branch NAME [--project P] [--pin id] [--paths a,b] [--port 8080]
+  python3 handoff.py session choose <id> queue|isolate|hand|continue
+  python3 handoff.py session end <id>
+  python3 handoff.py session list
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
 """
 
@@ -171,7 +175,9 @@ def mark_fixed(arguments):
             return {"ok": False, "error": "could not read verification screenshot: %s" % exc}
     cfg = load_settings()
     project = arguments.get("project") or cfg["project"]
-    return set_pin_status(project, note_id, str(pin_id), "ai-fixed", blob, arguments.get("comment") or "")
+    result = set_pin_status(project, note_id, str(pin_id), "ai-fixed", blob, arguments.get("comment") or "")
+    observe_fixed(note_id, pin_id)
+    return result
 
 
 def call_handoff(arguments):
@@ -181,6 +187,7 @@ def call_handoff(arguments):
     else:
         note = arguments.get("note") or ""
     record_baseline()
+    observe_note(note, arguments.get("agent") or "")
     text = prompt_for(note)
     return {"content": [{"type": "text", "text": text}]}
 
@@ -531,6 +538,189 @@ def open_from_note(path, version="", tag=""):
     )
 
 
+def sessions_enabled():
+    return os.environ.get("DINGAI_SESSIONS", "1") != "0"
+
+
+def _csv(argv, name):
+    text = _flag(argv, name)
+    return [part.strip() for part in text.split(",") if part.strip()] if text else []
+
+
+def mirror_notices():
+    home = os.path.join(os.path.expanduser("~"), "DingAI", "notices.json")
+    src = os.path.join(state_root(), "notices.json")
+    if os.path.abspath(src) == os.path.abspath(home) or not os.path.isfile(src):
+        return
+    os.makedirs(os.path.dirname(home), exist_ok=True)
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read()
+    with open(home, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def push_session(path, body):
+    from core.sync import load_settings
+    cfg = load_settings()
+    if cfg["mode"] != "server" or not cfg["server_url"]:
+        return None
+    import urllib.request
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("token"):
+        headers["Authorization"] = "Bearer " + cfg["token"]
+    req = urllib.request.Request(cfg["server_url"].rstrip("/") + path, data=json.dumps(body).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except Exception:
+        return None
+
+
+def register_observed(fields):
+    if not sessions_enabled():
+        return None
+    from core.collide import register, write_notices
+    local = register(state_root(), fields)
+    remote = push_session("/api/sessions", fields)
+    if remote and "warnings" in remote:
+        write_notices(state_root(), remote.get("warnings") or [])
+        local = remote
+    mirror_notices()
+    banner = (local or {}).get("banner") or ""
+    if banner:
+        sys.stderr.write(banner + "\n")
+    return local
+
+
+def observe_note(note_text, agent=""):
+    if not sessions_enabled():
+        return None
+    try:
+        note = json.loads(note_text or "")
+    except ValueError:
+        note = {}
+    if not isinstance(note, dict):
+        note = {}
+    pins = []
+    projects = {}
+    paths = []
+    for pin in note.get("pins") or []:
+        if not isinstance(pin, dict):
+            continue
+        key = "%s:%s" % (note.get("file") or note.get("id") or "note", pin.get("id"))
+        pins.append(key)
+        if pin.get("project"):
+            projects[key] = pin["project"]
+        for path in pin.get("paths") or []:
+            paths.append(path)
+    repo = project_dir()
+    if not repo and not pins:
+        return None
+    branch = ""
+    if repo:
+        branch = (git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]) or "").strip()
+    return register_observed({
+        "agent": agent or os.environ.get("DINGAI_AGENT") or "handoff",
+        "repo": repo,
+        "branch": branch,
+        "project": str(note.get("project") or ""),
+        "pins": pins,
+        "pin_projects": projects,
+        "paths": paths,
+    })
+
+
+def observe_fixed(note_id, pin_id):
+    if not sessions_enabled():
+        return None
+    from core.collide import list_sessions
+    repo = project_dir()
+    active = [
+        row for row in list_sessions(state_root())
+        if row.get("status") == "active" and (not repo or row.get("repo") == repo)
+    ]
+    if not active:
+        return None
+    session = active[-1]
+    pins = [str(pin) for pin in session.get("pins") or []]
+    key = "%s:%s" % (note_id, pin_id)
+    if key not in pins:
+        pins.append(key)
+    return register_observed({
+        "agent": session.get("agent") or "handoff",
+        "repo": session.get("repo") or "",
+        "branch": session.get("branch") or "",
+        "project": session.get("project") or "",
+        "pins": pins,
+        "pin_projects": session.get("pin_projects") or {},
+        "paths": session.get("paths") or [],
+        "ports": session.get("ports") or [],
+        "services": session.get("services") or [],
+        "databases": session.get("databases") or [],
+        "deploys": session.get("deploys") or [],
+        "head": session.get("head") or "",
+    })
+
+
+def session_fields(argv):
+    return {
+        "agent": _flag(argv, "--agent") or os.environ.get("DINGAI_AGENT") or "handoff",
+        "repo": _flag(argv, "--repo") or project_dir(),
+        "branch": _flag(argv, "--branch"),
+        "project": _flag(argv, "--project"),
+        "pins": _csv(argv, "--pin"),
+        "paths": _csv(argv, "--paths"),
+        "services": _csv(argv, "--services"),
+        "ports": _csv(argv, "--ports"),
+        "databases": _csv(argv, "--databases"),
+        "deploys": _csv(argv, "--deploys"),
+    }
+
+
+def session_main(argv):
+    from core import collide
+    if len(argv) < 3:
+        sys.stderr.write("usage: handoff.py session start|choose|end|list\n")
+        return 2
+    root = state_root()
+    sub = argv[2]
+    if sub == "list":
+        sys.stdout.write(json.dumps(collide.list_sessions(root), ensure_ascii=False) + "\n")
+        return 0
+    if sub == "start":
+        fields = session_fields(argv)
+        if not fields["branch"] and fields["repo"]:
+            fields["branch"] = (git(fields["repo"], ["rev-parse", "--abbrev-ref", "HEAD"]) or "").strip()
+        result = collide.register(root, fields)
+        push_session("/api/sessions", fields)
+        mirror_notices()
+        banner = result.get("banner") or ""
+        if banner:
+            sys.stderr.write(banner + "\n")
+        sys.stdout.write(json.dumps({"ok": True, "id": result["session"]["id"], "warnings": result.get("warnings") or []}, ensure_ascii=False) + "\n")
+        return 0
+    if sub == "choose":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py session choose <id> queue|isolate|hand|continue\n")
+            return 2
+        result = collide.choose(root, argv[3], argv[4], actor=_flag(argv, "--actor") or "local")
+        push_session("/api/sessions/%s/choose" % argv[3], {"choice": argv[4]})
+        mirror_notices()
+        sys.stdout.write(json.dumps({"ok": result.get("ok"), "error": result.get("error", ""), "status": (result.get("session") or {}).get("status", "")}) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "end":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py session end <id>\n")
+            return 2
+        result = collide.end_session(root, argv[3])
+        push_session("/api/sessions/%s/end" % argv[3], {})
+        mirror_notices()
+        sys.stdout.write(json.dumps({"ok": result.get("ok"), "overlaps": result.get("overlaps") or [], "error": result.get("error", "")}, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    sys.stderr.write("unknown session command\n")
+    return 2
+
+
 def release_main(argv):
     from core import release as rel
     if len(argv) < 3:
@@ -596,7 +786,9 @@ def main(argv):
     if cmd == "prompt":
         path = argv[2] if len(argv) > 2 else ""
         record_baseline()
-        sys.stdout.write(prompt_for(read_note(path)))
+        note = read_note(path)
+        observe_note(note, "")
+        sys.stdout.write(prompt_for(note))
         return 0
     if cmd == "baseline":
         saved = record_baseline(argv[2] if len(argv) > 2 else None)
@@ -629,6 +821,8 @@ def main(argv):
         return 0 if result.get("ok") else 1
     if cmd == "release":
         return release_main(argv)
+    if cmd == "session":
+        return session_main(argv)
     if cmd == "mcp":
         serve_mcp(sys.stdin.buffer, sys.stdout.buffer)
         return 0
