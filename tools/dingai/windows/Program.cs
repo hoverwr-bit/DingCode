@@ -299,7 +299,7 @@ internal class Controller
         File.WriteAllText(path, json);
         if (clipboard)
         {
-            try { System.Windows.Clipboard.SetText(json); } catch { }
+            try { System.Windows.Clipboard.SetText(HandoffPrompt(json)); } catch { }
         }
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
     }
@@ -355,9 +355,52 @@ internal class Controller
             ["pin_count"] = np, ["arrow_count"] = na, ["box_count"] = nb,
             ["screenshot"] = Path.GetFileName(ShotFile),
             ["screen_capture_ok"] = true,
+            ["handoff_rules"] = HandoffRules(),
         };
         return root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
     }
+
+    public const string DefaultHandoffRules =
+        "- Make the smallest change that fixes the pinned issue. Do not refactor or rewrite surrounding code.\n" +
+        "- Follow the project's ARCHITECTURE or conventions file before adding code.\n" +
+        "- Touch only code related to the pinned element.\n" +
+        "- Do not add dependencies or files unless you state why.\n" +
+        "- Explain the diff and how it was verified.";
+
+    public string ProjectDir()
+    {
+        var env = Environment.GetEnvironmentVariable("DINGAI_PROJECT");
+        if (!string.IsNullOrWhiteSpace(env)) return env;
+        var pointer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "project.txt");
+        try
+        {
+            var t = File.ReadAllText(pointer).Trim();
+            if (t.Length > 0) return t;
+        }
+        catch { }
+        return null;
+    }
+
+    public string HandoffRules()
+    {
+        var paths = new List<string>();
+        var project = ProjectDir();
+        if (!string.IsNullOrEmpty(project)) paths.Add(Path.Combine(project, ".dingai", "handoff-rules.md"));
+        paths.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "handoff-rules.md"));
+        foreach (var path in paths)
+        {
+            try
+            {
+                var t = File.ReadAllText(path).Trim();
+                if (t.Length > 0) return t;
+            }
+            catch { }
+        }
+        return DefaultHandoffRules;
+    }
+
+    public string HandoffPrompt(string json) =>
+        HandoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json;
 
     public string Stamp() => DateTime.Now.ToString("yyyyMMdd-HHmmss");
 }
@@ -746,7 +789,7 @@ internal class AnnoCanvas : Canvas
         {
             CommitNoteField();
             var json = C.BuildJson(Items);
-            try { System.Windows.Clipboard.SetText(json); } catch { }
+            try { System.Windows.Clipboard.SetText(C.HandoffPrompt(json)); } catch { }
         };
         Btn(bar, ref x, "完成 ✓", 70).Click += (s, e) => C.Finish(true);
 

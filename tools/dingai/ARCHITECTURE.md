@@ -49,6 +49,8 @@ Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_co
 
 New fields are optional and must not rename or remove these. The web export is a different object (`version: 7.9`, `annotations[]`) and stays that way.
 
+`handoff_rules` is an optional string on both exports. Clipboard text is that string, a one-line instruction, then the JSON. A project overrides it with `.dingai/handoff-rules.md` (`DINGAI_PROJECT`, or the path in `~/DingAI/project.txt`). Otherwise `~/DingAI/handoff-rules.md` is used. The page reads `window.DINGAI_HANDOFF_RULES` or `localStorage` key `dingai-handoff-rules`. `handoff.py` is the CLI and the stdio MCP server for the same prompt. It uses the Python standard library only, because nothing else in the toolbox speaks MCP.
+
 ## Conventions for changes
 
 - Edit the client that owns the behavior. A desktop pin bug goes in `DingAI.swift` (and `Program.cs` only when the same bug exists there). A page-scroll bug goes in `anno.js`.

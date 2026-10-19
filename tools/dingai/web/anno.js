@@ -335,8 +335,26 @@
   }
   function hideInfo() { info.style.display = 'none'; }
 
+  var DEFAULT_HANDOFF_RULES = [
+    '- Make the smallest change that fixes the pinned issue. Do not refactor or rewrite surrounding code.',
+    '- Follow the project\'s ARCHITECTURE or conventions file before adding code.',
+    '- Touch only code related to the pinned element.',
+    '- Do not add dependencies or files unless you state why.',
+    '- Explain the diff and how it was verified.'
+  ].join('\n');
+  function handoffRules() {
+    if (window.DINGAI_HANDOFF_RULES) return String(window.DINGAI_HANDOFF_RULES).trim() || DEFAULT_HANDOFF_RULES;
+    try {
+      var saved = localStorage.getItem('dingai-handoff-rules');
+      if (saved && saved.trim()) return saved.trim();
+    } catch (e) {}
+    return DEFAULT_HANDOFF_RULES;
+  }
+  function handoffPrompt(jsonText) {
+    return handoffRules() + '\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n' + jsonText;
+  }
   function exportV7() {
-    return { page: location.pathname || 'page', version: 7.9, exportedAt: new Date().toISOString(), count: annos.length, annotations: annos };
+    return { page: location.pathname || 'page', version: 7.9, exportedAt: new Date().toISOString(), count: annos.length, annotations: annos, handoff_rules: handoffRules() };
   }
   window.ANNO_V7_EXPORT = exportV7;
 
@@ -549,7 +567,7 @@
     if (confirm('确定清空本页全部批注？')) { annos = []; saveLocal(); render(); }
   });
   document.getElementById('av7copy').addEventListener('click', function () {
-    var text = JSON.stringify(exportV7(), null, 2);
+    var text = handoffPrompt(JSON.stringify(exportV7(), null, 2));
     var done = function (ok) {
       if (ok) { window.__av7Copied = true; alert('已复制 ' + annos.length + ' 条 ✓'); }
       else {

@@ -40,6 +40,17 @@ The macOS app listens on `127.0.0.1:8763` only. A page that has loaded `anno.js`
 | `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) | macOS, comma-separated team server URLs | empty = no upload |
 | `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT` (fallback `ANNO_TEAM_*`) | team server | `127.0.0.1` / `8050` |
 
+## Handoff rules
+
+Every clipboard export is a prompt: the handoff rules, then the JSON note. The note on disk keeps the same rules in `handoff_rules`. Edit them per project in `.dingai/handoff-rules.md` (set `DINGAI_PROJECT`, or put the project path in `~/DingAI/project.txt`). A user-wide file is `~/DingAI/handoff-rules.md`. On a page, set `window.DINGAI_HANDOFF_RULES` or `localStorage['dingai-handoff-rules']`.
+
+```
+python3 tools/dingai/handoff.py prompt notes/anno.json
+python3 tools/dingai/handoff.py mcp
+```
+
+The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Arrows use `from_px` / `to_px`. Boxes use `rect_px`.

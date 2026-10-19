@@ -977,8 +977,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                         .appendingPathComponent("anno-" + stamp() + ".json")
         try? data.write(to: url)
         if copyToPasteboard {
+            let text = String(data: data, encoding: .utf8) ?? ""
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(String(data: data, encoding: .utf8) ?? "", forType: .string)
+            NSPasteboard.general.setString(handoffPrompt(text), forType: .string)
         }
         let shotCopy = shotURL
         overlay?.orderOut(nil)
@@ -1114,8 +1115,46 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "screenshot": shotURL?.lastPathComponent ?? NSNull(),
             "screen_capture_ok": (shotCG != nil),
             "live": live,
+            "handoff_rules": handoffRules(),
         ]
         return json
+    }
+
+    static let defaultHandoffRules = """
+    - Make the smallest change that fixes the pinned issue. Do not refactor or rewrite surrounding code.
+    - Follow the project's ARCHITECTURE or conventions file before adding code.
+    - Touch only code related to the pinned element.
+    - Do not add dependencies or files unless you state why.
+    - Explain the diff and how it was verified.
+    """
+
+    func projectDir() -> String? {
+        if let p = ProcessInfo.processInfo.environment["DINGAI_PROJECT"], !p.isEmpty { return p }
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/project.txt")
+        if let s = try? String(contentsOfFile: path, encoding: .utf8) {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        return nil
+    }
+
+    func handoffRules() -> String {
+        var paths: [String] = []
+        if let project = projectDir() {
+            paths.append((project as NSString).appendingPathComponent(".dingai/handoff-rules.md"))
+        }
+        paths.append((NSHomeDirectory() as NSString).appendingPathComponent("DingAI/handoff-rules.md"))
+        for path in paths {
+            if let s = try? String(contentsOfFile: path, encoding: .utf8) {
+                let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { return t }
+            }
+        }
+        return Self.defaultHandoffRules
+    }
+
+    func handoffPrompt(_ json: String) -> String {
+        handoffRules() + "\n\nApply the rules above to this DingAI note. The pinned element is the only scope.\n\n" + json
     }
 
     func stamp() -> String {
@@ -2347,8 +2386,9 @@ final class AnnotationView: NSView {
         let json = c.buildJSON(items: items)
         let data = (try? JSONSerialization.data(withJSONObject: json,
                         options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        let text = String(data: data, encoding: .utf8) ?? ""
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(String(data: data, encoding: .utf8) ?? "", forType: .string)
+        NSPasteboard.general.setString(c.handoffPrompt(text), forType: .string)
         flashBubble("JSON 已复制(\(items.count) 笔)")
     }
     @objc func doneNow() { controller?.finish(copyToPasteboard: true) }
