@@ -71,6 +71,13 @@ def load_rules():
 
 def prompt_for(note_text, rules=None):
     body = note_text if note_text is not None else ""
+    try:
+        from core.sync import load_settings
+        if load_settings().get("redact"):
+            from core.redact import redact_text
+            body = redact_text(body)
+    except Exception:
+        pass
     return (rules if rules is not None else load_rules()).strip() + "\n\n" + PROMPT_LEAD + "\n\n" + body
 
 

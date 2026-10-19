@@ -36,7 +36,14 @@ def load_settings(path=None):
         mode = "folder"
     if mode == "local" and server:
         mode = "server"
-    return {"mode": mode, "share_dir": share, "server_url": server.rstrip("/"), "token": token, "project": project}
+    redact_env = os.environ.get("DINGAI_REDACT")
+    if redact_env == "1":
+        redact = True
+    elif redact_env == "0":
+        redact = False
+    else:
+        redact = bool(data.get("redact"))
+    return {"mode": mode, "share_dir": share, "server_url": server.rstrip("/"), "token": token, "project": project, "redact": redact}
 
 
 def _atomic_write(path, text):

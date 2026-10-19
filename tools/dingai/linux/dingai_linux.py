@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 import handoff
 from core.layout import layout_callouts
+from core.redact import hits, redact_note
 from core.schema import normalize_note
 from core.sync import load_settings, publish_note
 
@@ -113,6 +114,58 @@ def capture_wayland(dest):
         return False
     proc = subprocess.run(["grim", str(dest)], capture_output=True)
     return proc.returncode == 0 and Path(dest).exists()
+
+
+def ocr_boxes(png_bytes):
+    """Tesseract TSV boxes. Empty when the binary is missing."""
+    if not shutil.which("tesseract") or not png_bytes:
+        return []
+    proc = subprocess.run(["tesseract", "stdin", "stdout", "-l", "eng", "tsv"], input=png_bytes, capture_output=True)
+    if proc.returncode != 0:
+        return []
+    lines = proc.stdout.decode("utf-8", "replace").splitlines()
+    if len(lines) < 2:
+        return []
+    header = lines[0].split("\t")
+
+    def col(name):
+        return header.index(name) if name in header else -1
+
+    boxes = []
+    for line in lines[1:]:
+        parts = line.split("\t")
+        try:
+            text = parts[col("text")]
+            if not str(text).strip():
+                continue
+            boxes.append({
+                "x": int(float(parts[col("left")])),
+                "y": int(float(parts[col("top")])),
+                "w": int(float(parts[col("width")])),
+                "h": int(float(parts[col("height")])),
+                "text": text,
+            })
+        except (ValueError, IndexError):
+            continue
+    return boxes
+
+
+def face_boxes(png_path):
+    """Optional local command. Prints 'x y w h' lines. No network."""
+    cmd = os.environ.get("DINGAI_FACE_CMD", "").strip()
+    if not cmd or not png_path:
+        return []
+    proc = subprocess.run(cmd.split() + [str(png_path)], capture_output=True, text=True)
+    boxes = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            boxes.append({"x": int(float(parts[0])), "y": int(float(parts[1])), "w": int(float(parts[2])), "h": int(float(parts[3]))})
+        except ValueError:
+            continue
+    return boxes
 
 
 def ocr_png(png_bytes):
@@ -261,8 +314,17 @@ class Session:
         note["boxes"] = self.boxes
         note["arrow_count"] = len(self.arrows)
         note["box_count"] = len(self.boxes)
+        settings = load_settings()
+        if settings.get("redact"):
+            boxes = [box for box in ocr_boxes(png) if hits(box.get("text") or "")] if png else []
+            if png:
+                (out / "anno-linux.png").write_bytes(png)
+                boxes.extend(face_boxes(out / "anno-linux.png"))
+            note, png = redact_note(note, png or None, boxes)
+            if png:
+                (out / "anno-linux.png").write_bytes(png)
         (out / "anno-linux.json").write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding="utf-8")
-        publish_note(note, png or None, load_settings())
+        publish_note(note, png or None, settings)
         return note
 
 

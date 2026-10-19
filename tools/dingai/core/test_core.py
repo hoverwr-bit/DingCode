@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from core.layout import layout_callouts
+from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
 from core.schema import normalize_note, normalize_pin
 from core.sync import folder_set_status, list_folder_pins, publish_folder
 
@@ -65,6 +66,40 @@ class FolderSyncTests(unittest.TestCase):
             with open(os.path.join(root, "projects", "app", "pins", "note-a--1.json"), encoding="utf-8") as fh:
                 saved = json.loads(fh.read())
             self.assertEqual(saved["verification"], "verify-note-a-1.png")
+
+
+class RedactTests(unittest.TestCase):
+    def test_builtin_patterns_and_custom_names(self):
+        text = redact_text(
+            "a@b.co 13800138000 0901234567 (415) 555-0134 PO-4481 ¥12.50 Acme",
+            names=["Acme"],
+        )
+        for secret in ("a@b.co", "13800138000", "0901234567", "555-0134", "PO-4481", "¥12.50", "Acme"):
+            self.assertNotIn(secret, text)
+        self.assertIn("[redacted]", text)
+
+    def test_invalid_user_pattern_is_skipped(self):
+        self.assertEqual(redact_text("keep", patterns=["("], names=[]), "keep")
+
+    def test_note_and_pixels_are_redacted_locally(self):
+        rgb = bytearray()
+        for i in range(8 * 8):
+            rgb += bytes((255, 0, 0) if i % 2 == 0 else (0, 0, 255))
+        png = encode_png(8, 8, bytes(rgb))
+        note, out = redact_note(
+            {"pins": [{"id": 1, "ocr_nearby": "mail a@b.co", "note": "Acme"}], "labels": [{"text": "a@b.co"}]},
+            png,
+            [{"x": 0, "y": 0, "w": 8, "h": 8}],
+            names=["Acme"],
+        )
+        self.assertEqual(note["pins"][0]["ocr_nearby"], "mail [redacted]")
+        self.assertEqual(note["pins"][0]["note"], "[redacted]")
+        self.assertTrue(note["redacted"])
+        self.assertNotEqual(out, png)
+        width, height, rgb = decode_png(out)
+        self.assertEqual((width, height), (8, 8))
+        self.assertGreater(rgb[0], 0)
+        self.assertGreater(rgb[2], 0)
 
 
 if __name__ == "__main__":
