@@ -1148,7 +1148,10 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                     d["window_nx"] = (nx * 1000).rounded() / 1000
                     d["window_ny"] = (ny * 1000).rounded() / 1000
                 }
-                if let pg = p.pageInfo { d["page"] = pg }   // 页内桥结果(可选;桥命中才有)
+                if let pg = p.pageInfo {
+                    d["page"] = pg
+                    if let src = pg["source"] { d["source"] = src }
+                }
                 var anch: [String: Any] = ["kind": p.anchorKind, "dx": (p.anchorDX * 10).rounded() / 10,
                                            "dy": (p.anchorDY * 10).rounded() / 10]
                 if let key = p.anchorKey { anch["key"] = key }

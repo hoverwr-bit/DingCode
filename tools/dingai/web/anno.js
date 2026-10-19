@@ -511,6 +511,7 @@
       var it = document.createElement('div'); it.className = 'av7item';
       var ae = anchorElOf(a.key), state = ae && ae.getClientRects().length ? '已锚定' : '坐标回退';
       it.innerHTML = '<strong>A' + pad(i + 1) + '</strong> · ' + esc(a.pinType || 'bug') + ' · ' + esc(a.status || 'open') + ' · ' + esc(a.target)
+        + (a.source && a.source.file ? '<div><small>' + esc(a.source.file) + ':' + esc(a.source.line || 1) + '</small></div>' : '')
         + (a.field ? ' · <b>' + esc(a.field) + '</b>' : '')
         + '<div>' + esc(a.comment.slice(0, 120)) + '</div>'
         + '<small>' + esc(fmtXY(a.geometry)) + ' · 视口 ' + a.geometry.viewportW + ' · ' + state + '</small>'
@@ -554,6 +555,7 @@
       if (pending.existing) {
         pending.existing.comment = txt; /* 编辑既有条（钉子/列表进入） */
         pending.existing.pinType = kind;
+        if (pending.source) pending.existing.source = pending.source;
         if (!pending.existing.status) pending.existing.status = 'open';
         if (pending.mark) pending.existing.mark = pending.mark;
       } else {
@@ -563,6 +565,7 @@
           geometry: pending.geometry, mark: pending.mark || null, anchor: pending.anchor || null,
           field: pending.field || '', value: pending.value || '',
           pinType: kind, status: 'open',
+          source: pending.source || null,
           free: pending.key.indexOf('free:') === 0, ts: Date.now(), by: me
         });
       }
@@ -868,7 +871,7 @@
     var page = { x: Math.round((mk.x1 + mk.x2) / 2), y: Math.round((mk.y1 + mk.y2) / 2) };
     var key = keyOf(d.target) || ('free:' + page.x + ',' + page.y);
     var fi = fieldInfoOf(d.target);
-    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, mark: mk, anchor: mk.anchors.a1, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, mark: mk, anchor: mk.anchors.a1, field: fi.field, value: fi.value, source: sourceFromElement(d.target), existing: null }, false);
   }, true);
 
   document.addEventListener('click', function (e) {
@@ -889,7 +892,7 @@
     var ae = anchorElOf(key);
     var anchor = null;
     if (ae) { var r = ae.getBoundingClientRect(); anchor = { dx: page.x - (window.scrollX + r.left), dy: page.y - (window.scrollY + r.top) }; }
-    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, existing: null }, false);
+    openModal({ key: key, geometry: { client: client, page: page, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY }, anchor: anchor, field: fi.field, value: fi.value, source: sourceFromElement(e.target), existing: null }, false);
   }, true);
 
   /* 三级管理员门（260920 全站版）：①页面自定义 ANNO_ADMIN_CHECK() 回调 ②页面自定义 window.ANNO_V7_ADMIN / 门户 annoPortalAdmin ③?anno=1 会话级解锁（公开页管理员自救通道） */
@@ -939,6 +942,119 @@
   var AV7_BRIDGE = 'http://127.0.0.1:8763';
   var av7bridge = null;   // {client, token, since, pollTimer}
 
+  /* @source-start */
+  function decodeVLQ(str) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var i = 0, values = [];
+    while (i < str.length) {
+      var value = 0, shift = 0, digit = 0;
+      do {
+        digit = chars.indexOf(str.charAt(i++));
+        if (digit < 0) return values;
+        value += (digit & 31) * Math.pow(2, shift);
+        shift += 5;
+      } while (digit & 32);
+      values.push((value & 1) ? -(value >> 1) : (value >> 1));
+    }
+    return values;
+  }
+  function originalPosition(map, genLine, genColumn) {
+    if (!map || !map.mappings) return null;
+    var lines = String(map.mappings).split(';');
+    var srcIdx = 0, srcLine = 0, srcCol = 0;
+    var best = null;
+    for (var li = 0; li < lines.length && li < genLine; li++) {
+      var genCol = 0;
+      var segs = lines[li] ? lines[li].split(',') : [];
+      for (var s = 0; s < segs.length; s++) {
+        if (!segs[s]) continue;
+        var v = decodeVLQ(segs[s]);
+        if (!v.length) continue;
+        genCol += v[0] || 0;
+        if (v.length >= 4) {
+          srcIdx += v[1] || 0;
+          srcLine += v[2] || 0;
+          srcCol += v[3] || 0;
+          if (li === genLine - 1 && genCol <= genColumn) {
+            best = { file: (map.sources || [])[srcIdx] || '', line: srcLine + 1, column: srcCol + 1 };
+          }
+        }
+      }
+    }
+    return best;
+  }
+  function attrOf(el, name) {
+    if (!el) return '';
+    if (typeof el.getAttribute === 'function') return el.getAttribute(name) || '';
+    return (el.attrs && el.attrs[name]) || '';
+  }
+  function componentName(type) {
+    if (!type) return '';
+    if (typeof type === 'string') return type;
+    return type.displayName || type.name || type.__name || '';
+  }
+  function applySourceMap(source, map) {
+    if (!source || !map) return source;
+    var base = String(source.file || '').split('?')[0].split('/').pop();
+    var mapFile = String(map.file || '').split('/').pop();
+    if (!mapFile || mapFile !== base) return source;
+    var mapped = originalPosition(map, source.line || 1, Math.max(0, (source.column || 1) - 1));
+    if (!mapped || !mapped.file) return source;
+    return { framework: source.framework, component: source.component || '', file: mapped.file, line: mapped.line, column: mapped.column, mapped: true };
+  }
+  function sourceFromElement(el) {
+    var node = el, guard = 0, found = null;
+    while (node && guard++ < 12 && !found) {
+      var path = attrOf(node, 'data-insp-path') || attrOf(node, 'data-source');
+      if (path && path.indexOf(':') > 0) {
+        var bits = path.split(':');
+        found = { framework: 'inspector', component: '', file: bits.slice(0, -2).join(':') || bits[0], line: parseInt(bits[bits.length - 2], 10) || 0, column: parseInt(bits[bits.length - 1], 10) || 1 };
+        break;
+      }
+      var fileAttr = attrOf(node, 'data-source-file');
+      if (fileAttr) {
+        found = { framework: 'inspector', component: attrOf(node, 'data-source-component') || '', file: fileAttr, line: parseInt(attrOf(node, 'data-source-line'), 10) || 1, column: parseInt(attrOf(node, 'data-source-column'), 10) || 1 };
+        break;
+      }
+      var fiber = node.fiber || null;
+      if (!fiber) {
+        var keys = Object.keys(node);
+        for (var k = 0; k < keys.length; k++) {
+          if (keys[k].indexOf('__reactFiber') === 0 || keys[k].indexOf('__reactInternalInstance') === 0) { fiber = node[keys[k]]; break; }
+        }
+      }
+      var walked = 0;
+      while (fiber && walked++ < 25) {
+        var src = fiber._debugSource;
+        if (src && src.fileName) {
+          found = { framework: 'react', component: componentName(fiber.type), file: src.fileName, line: src.lineNumber || 1, column: src.columnNumber || 1 };
+          break;
+        }
+        fiber = fiber._debugOwner || fiber.return || null;
+      }
+      if (found) break;
+      var vue = node.__vueParentComponent || node.__vue__ || null;
+      if (vue) {
+        var vtype = vue.type || (vue.$options) || {};
+        var vfile = vtype.__file || (vue.$options && vue.$options.__file) || '';
+        if (vfile) {
+          found = { framework: node.__vue__ ? 'vue2' : 'vue', component: componentName(vtype) || (vue.$options && vue.$options.name) || '', file: vfile, line: vtype.__line || 1, column: 1 };
+          break;
+        }
+      }
+      var svelte = node.__svelte_meta;
+      if (svelte && svelte.loc) {
+        found = { framework: 'svelte', component: '', file: svelte.loc.file || svelte.loc.filename || '', line: svelte.loc.line || 1, column: svelte.loc.column || 1 };
+        break;
+      }
+      node = node.parentElement || node.parent || null;
+    }
+    if (!found) return null;
+    var maps = (typeof window !== 'undefined' && window.__DINGAI_SOURCE_MAPS) || [];
+    for (var m = 0; m < maps.length; m++) found = applySourceMap(found, maps[m]) || found;
+    return found;
+  }
+  /* @source-end */
   /* 视口坐标→元素描述（与批注点击同源：keyOf/fieldInfoOf/targetName 复用） */
   function describePoint(cx, cy) {
     var list = [];
@@ -955,7 +1071,8 @@
       key: key || ('free:' + Math.round(cx + window.scrollX) + ',' + Math.round(cy + window.scrollY)),
       target: key ? targetName(key) : '自由位置',
       field: fi.field, value: fi.value, text: txt,
-      anchorDx: cx - rect.left, anchorDy: cy - rect.top
+      anchorDx: cx - rect.left, anchorDy: cy - rect.top,
+      source: sourceFromElement(t)
     };
   }
   function av7Describe(req) {
@@ -977,6 +1094,7 @@
     o.scrollX = Math.round(window.scrollX); o.scrollY = Math.round(window.scrollY);
     o.viewportW = window.innerWidth; o.viewportH = window.innerHeight;
     o.key = d.key; o.target = d.target; o.field = d.field; o.value = d.value; o.text = d.text;
+    if (d.source) o.source = d.source;
     o.anchorKey = d.key; o.anchorDx = Math.round(d.anchorDx || 0); o.anchorDy = Math.round(d.anchorDy || 0);
     return o;
   }
