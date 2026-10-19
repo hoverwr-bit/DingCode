@@ -51,6 +51,8 @@ Hold V on a desktop client, or the page microphone button, records a short clip 
 
 Step recording (Linux key `g`, desktop key G, page button) numbers each new pin and keeps a screenshot beside it. Finishing writes `sop.md` and `repro.json` (`schema: dingai-steps-v1`) through `core/guide.py`. The markdown is the how-to. The JSON is the bug-repro bundle an agent reads. Both stay on disk.
 
+After a pin is marked ai-fixed, `handoff.py verify before.png after.png outdir` writes `side-by-side.png` and `overlay.png`. Changed pixels are red in the overlay. The team board shows the original screenshot, the verification screenshot, and that overlay, and the existing Confirm and Reopen buttons set `confirmed` or `open`. `dingai_linux.py recheck before.png x y outdir` captures that screen region again and runs the same comparison. The diff uses the PNG bytes already on disk. It does not upload them.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_compat` is `anno-desktop-v1`. Existing fields stay:

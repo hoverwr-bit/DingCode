@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from core.diff import compare_png, write_diff
 from core.guide import sop_markdown, write_bundle
 from core.layout import layout_callouts
 from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
@@ -103,6 +104,25 @@ class RedactTests(unittest.TestCase):
         self.assertEqual((width, height), (8, 8))
         self.assertGreater(rgb[0], 0)
         self.assertGreater(rgb[2], 0)
+
+
+class DiffTests(unittest.TestCase):
+    def test_identical_images_have_no_change_and_a_changed_pixel_is_marked(self):
+        png = encode_png(2, 1, bytes([10, 10, 10, 10, 10, 10]))
+        same = compare_png(png, png)
+        self.assertEqual(same["changed_ratio"], 0)
+        other = encode_png(2, 1, bytes([10, 10, 10, 250, 10, 10]))
+        changed = compare_png(png, other)
+        self.assertGreater(changed["changed_ratio"], 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            before = Path(tmp) / "before.png"
+            after = Path(tmp) / "after.png"
+            before.write_bytes(png)
+            after.write_bytes(other)
+            info = write_diff(before, after, Path(tmp) / "out")
+            self.assertTrue(info["ok"])
+            self.assertTrue((Path(tmp) / "out" / "side-by-side.png").is_file())
+            self.assertTrue((Path(tmp) / "out" / "overlay.png").is_file())
 
 
 class GuideTests(unittest.TestCase):
