@@ -11,22 +11,35 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 | Path | What |
 |---|---|
 | `tools/dingai/macos/` | DingAI menu-bar app (Swift, AppKit, ScreenCaptureKit, Vision). Live overlay: the app underneath stays usable; the screenshot is taken when you finish |
-| `tools/dingai/windows/` | DingAIWin, same JSON contract |
+| `tools/dingai/windows/` | DingAIWin. Live overlay by default, UI Automation anchors, same JSON contract |
+| `tools/dingai/linux/` | Linux session. X11 toolbar, optional grim / Tesseract / AT-SPI |
 | `tools/dingai/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
-| `tools/dingai/team-server/` | Optional self-hosted collector and board. No authentication — trusted network only |
+| `tools/dingai/core/` | Python standard library: note schema, label placement, folder and server sync. Used by Linux and `handoff.py` |
+| `tools/dingai/team-server/` | Optional self-hosted board. Accounts, SQLite, Docker. No telemetry |
 | `tools/dingai/probes/` | Diagnostic probes (display, capture, OCR, red-pixel scans) |
 
 ## Build / 构建
 
 - macOS 14+: `cd tools/dingai/macos && ./build.sh`  
   Signs with a local **DingAI Dev** identity if present, otherwise **AnnoOverlay Dev**, otherwise ad-hoc. Needs Screen Recording. Changing the bundle id to `io.github.dingai.mac` means granting that permission again.
-- Windows: `cd tools/dingai/windows && dotnet build`
-- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`.
-- Team server: `python3 tools/dingai/team-server/dingai_team_server.py`
+- Windows: `cd tools/dingai/windows && dotnet build`  
+  `Ctrl+Alt+A` starts a live session. Hold Alt to click the app underneath. `DINGAI_LIVE=0` freezes the screenshot first, as the older build did. B / C / Q set the next pin to bug, change, or question.
+- Linux: `python3 tools/dingai/linux/dingai_linux.py` on X11 or XWayland. `--check` prints which of X11, grim, Tesseract, and the AT-SPI bus are available. Focus the toolbar, press p then click to drop a pin, or a / r / s and two clicks for an arrow, box, or spotlight. B / C / Q set the pin type. Esc exports under `~/DingAI/linux`.
+- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. The note dialog has a pin type.
+- Team server: see [tools/dingai/team-server/DEPLOY.md](tools/dingai/team-server/DEPLOY.md).
+
+```
+export DINGAI_TEAM_ADMIN_TOKEN='choose-a-long-token'
+docker compose -f tools/dingai/team-server/compose.yaml up --build -d
+```
+
+Without Docker, from `tools/dingai/team-server`: `python3 dingai_team_server.py`. Put Caddy or nginx in front for HTTPS and leave the Python process on `127.0.0.1`. Do not commit the token or certificates.
+
+GitHub Actions (`.github/workflows/dingai.yml`) runs the Python and page checks and builds the server image on Ubuntu, `dotnet build` on Windows, and `swiftc` on macOS.
 
 ## Annotating
 
-`⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. Esc writes JSON and a PNG taken at that moment.
+`⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. B / C / Q set the selected pin to bug, change, or question. Esc writes JSON and a PNG taken at that moment. New pins start `open`. An agent can later mark one `ai-fixed`; a person confirms it on the team board.
 
 ## Desktop ↔ page bridge
 
@@ -34,11 +47,35 @@ The macOS app listens on `127.0.0.1:8763` only. A page that has loaded `anno.js`
 
 ## Configuration / 配置
 
+Clients stay local until you opt in. `~/DingAI/settings.json` is the switch:
+
+Local-only is the default, including when the file is missing. Folder mode:
+
+```json
+{ "mode": "folder", "share_dir": "/mnt/dingai", "project": "inbox" }
+```
+
+Server mode:
+
+```json
+{ "mode": "server", "server_url": "http://127.0.0.1:8050", "token": "paste-the-token", "project": "inbox" }
+```
+
+A shared folder is one directory on a NAS or a synced drive. Each pin is its own file under `projects/<project>/pins/`, written via a temp file and rename, so two people can add pins without clobbering each other. Screenshots sit in `shots/`. The page layer cannot read that file; publishing is done by the desktop clients.
+
 | Env var | Used by | Default |
 |---|---|---|
 | `DINGAI_OUTPUT_DIR` (fallback `ANNO_OUTPUT_DIR`) | macOS, path relative to home; Windows, under the user profile | `DingAI` |
-| `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) | macOS, comma-separated team server URLs | empty = no upload |
-| `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT` (fallback `ANNO_TEAM_*`) | team server | `127.0.0.1` / `8050` |
+| `DINGAI_MODE` | `local`, `folder`, or `server`. Overrides `settings.json` | `local` |
+| `DINGAI_SHARE_DIR` | shared-folder root | empty |
+| `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) | team server URL. A value selects server mode when `DINGAI_MODE` is unset | empty = no upload |
+| `DINGAI_TEAM_TOKEN` | bearer token for that server | empty |
+| `DINGAI_PROJECT_NAME` | board or folder project | `inbox` |
+| `DINGAI_LIVE` | Windows. `0` freezes the screenshot at the start | live |
+| `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT` (fallback `ANNO_TEAM_*`) | team server bind address | `127.0.0.1` / `8050` |
+| `DINGAI_TEAM_REQUIRE_AUTH` | `1` rejects anonymous upload. The Docker image sets this | off for a local process |
+| `DINGAI_TEAM_ADMIN_TOKEN` | first admin token. If unset, the process prints one random token once | unset |
+| `DINGAI_TEAM_ROOT` | SQLite, notes, and screenshots | `~/anno-team` |
 
 ## Handoff rules
 
@@ -46,8 +83,12 @@ Every clipboard export is a prompt: the handoff rules, then the JSON note. The n
 
 ```
 python3 tools/dingai/handoff.py prompt notes/anno.json
+python3 tools/dingai/handoff.py pins
+python3 tools/dingai/handoff.py mark-fixed <note_id> <pin_id> verify.png
 python3 tools/dingai/handoff.py mcp
 ```
+
+`pins` and `mark-fixed` are also MCP tools (`dingai_list_pins`, `dingai_mark_fixed`). They read the shared folder or the team server from the settings above. Marking a pin fixed stores the PNG next to the pin. The handoff prompt stays the first MCP tool.
 
 The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
 
@@ -61,7 +102,7 @@ The macOS and Windows menus have the same check (“检查本次改动”). Put 
 
 ## JSON contract
 
-Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Arrows use `from_px` / `to_px`. Boxes use `rect_px`.
+Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Optional `pin_type` is `bug` (the default), `change`, or `question`. Optional `status` is `open` (the default), `ai-fixed`, or `confirmed`. Arrows use `from_px` / `to_px`. Boxes use `rect_px` and an optional `shape`. Page export stays `version: 7.9` and stores `pinType` and `status` on each annotation.
 
 ## License
 
