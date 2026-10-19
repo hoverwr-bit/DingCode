@@ -75,10 +75,21 @@ struct BoxRecord {
     var note: String?     // 框选备注(261014 用户令:框选后直接弹输入框对框选内容批注)
 }
 
+struct TextRecord {
+    var id: Int
+    var x: Int
+    var y: Int
+    var w: Int
+    var h: Int
+    var text: String
+    var color: String
+}
+
 enum ActionItem {
     case pin(PinRecord)
     case arrow(ArrowRecord)
     case box(BoxRecord)
+    case text(TextRecord)
 }
 
 struct OcrTextItem {
@@ -1030,6 +1041,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         var pins: [[String: Any]] = []
         var arrows: [[String: Any]] = []
         var boxes: [[String: Any]] = []
+        var labels: [[String: Any]] = []
         for it in items {
             switch it {
             case .pin(let p):
@@ -1069,6 +1081,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                               "color": b.color, "width": b.width, "shape": b.shape]
                 if let note = b.note { bd["note"] = note }
                 boxes.append(bd)
+            case .text(let t):
+                labels.append(["id": t.id, "x_px": t.x, "y_px": t.y, "w_px": t.w, "h_px": t.h,
+                               "text": t.text, "color": t.color])
             }
         }
         let json: [String: Any] = [
@@ -1091,9 +1106,11 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "pins": pins,
             "arrows": arrows,
             "boxes": boxes,
+            "labels": labels,
             "pin_count": pins.count,
             "arrow_count": arrows.count,
             "box_count": boxes.count,
+            "label_count": labels.count,
             "screenshot": shotURL?.lastPathComponent ?? NSNull(),
             "screen_capture_ok": (shotCG != nil),
             "live": live,
@@ -1182,9 +1199,12 @@ final class AnnotationView: NSView {
     var hoverPoint: NSPoint?
     var curColor = "red"
     var curWidth = 4
-    var drawMode = 1        // 1=箭头 2=方框 3=椭圆(工具条可切)
-
-    let guideColor = NSColor.systemRed.withAlphaComponent(0.75)
+    var drawMode = 1        // 0选择 1箭头 2方框 3椭圆 4聚光 5文字
+    var selectedIndex: Int?
+    var movingOrig: ActionItem?
+    var movingStart: NSPoint?
+    var resizeHandle: String?
+    var textAnchor: NSPoint?
 
     // MARK: 坐标换算:AppKit 点(左下原点) ↔ 截图像素(左上原点)
 
@@ -1210,20 +1230,64 @@ final class AnnotationView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
         endNoteEditing()
-        draftFrom = convert(event.locationInWindow, from: nil)
-        draftTo = draftFrom
+        let p = convert(event.locationInWindow, from: nil)
+        if drawMode == 0 {
+            if let sel = selectedIndex, let handle = hitHandle(sel, p) {
+                resizeHandle = handle
+                movingOrig = items[sel]
+                movingStart = p
+            } else if let hit = hitItem(p) {
+                selectedIndex = hit
+                movingOrig = items[hit]
+                movingStart = p
+                resizeHandle = nil
+                if event.clickCount == 2, case .text = items[hit] {
+                    beginNoteEditing(pinIndex: hit, at: p)
+                }
+            } else {
+                selectedIndex = nil
+                movingOrig = nil
+            }
+            needsDisplay = true
+            return
+        }
+        if drawMode == 5 {
+            beginTextEditing(at: p)
+            return
+        }
+        movingOrig = nil
+        resizeHandle = nil
+        draftFrom = p
+        draftTo = p
     }
     override func mouseDragged(with event: NSEvent) {
-        draftTo = convert(event.locationInWindow, from: nil)
+        let p = convert(event.locationInWindow, from: nil)
+        if let orig = movingOrig, let start = movingStart, let idx = selectedIndex, items.indices.contains(idx) {
+            if let handle = resizeHandle { applyResize(idx, orig, handle, p) }
+            else { applyMove(idx, orig, p.x - start.x, p.y - start.y) }
+            needsDisplay = true
+            return
+        }
+        draftTo = p
         needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {
+        if movingOrig != nil {
+            movingOrig = nil
+            movingStart = nil
+            resizeHandle = nil
+            needsDisplay = true
+            return
+        }
         defer { draftFrom = nil; draftTo = nil; needsDisplay = true }
         guard let from = draftFrom, let to = draftTo else { return }
         let dist = hypot(to.x - from.x, to.y - from.y) * CGFloat(controller?.scale ?? 1)
         if dist < 7 { addPin(at: from) }
         else if drawMode == 1 { addArrow(from: from, to: to) }
-        else { addBox(from: from, to: to, shape: drawMode == 3 ? "ellipse" : "rect") }
+        else {
+            let shape = drawMode == 3 ? "ellipse" : (drawMode == 4 ? "spotlight" : "rect")
+            addBox(from: from, to: to, shape: shape)
+        }
     }
     override func mouseMoved(with event: NSEvent) {
         hoverPoint = convert(event.locationInWindow, from: nil)
@@ -1258,6 +1322,7 @@ final class AnnotationView: NSView {
                                     windowFrame: win?.frame, pageInfo: nil)))
         let idx = items.count - 1
         nextId += 1
+        selectedIndex = idx
         needsDisplay = true
         bridgeBackfill(idx: idx, pinId: pinId, win: win, xPx: x, yPx: y)
         rememberAnchor(pinId: pinId, xPx: x, yPx: y, win: win)
@@ -1324,14 +1389,28 @@ final class AnnotationView: NSView {
     func noteFieldCommit(text: String) {
         guard let f = noteField else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // tag=items 下标:钉与框选图形共用同一备注框(261014 框选直接批注)
-        if case .pin(var pin) = items[f.tag] {
-            pin.note = t.isEmpty ? nil : t
-            items[f.tag] = .pin(pin)
-        } else if case .box(var b) = items[f.tag] {
-            b.note = t.isEmpty ? nil : t
-            items[f.tag] = .box(b)
+        // tag=items 下标:钉与框选图形共用同一备注框(261014 框选直接批注);负数=新建文字标签
+        if f.tag >= 0 && f.tag < items.count {
+            if case .pin(var pin) = items[f.tag] {
+                pin.note = t.isEmpty ? nil : t
+                items[f.tag] = .pin(pin)
+            } else if case .box(var b) = items[f.tag] {
+                b.note = t.isEmpty ? nil : t
+                items[f.tag] = .box(b)
+            } else if case .text(var label) = items[f.tag] {
+                if !t.isEmpty { label.text = t; items[f.tag] = .text(label) }
+            }
+        } else if f.tag < 0, !t.isEmpty, let anchor = textAnchor {
+            let (x, y) = ptToPx(anchor)
+            let sx = controller?.scale ?? 1
+            let sy = controller?.scaleY ?? sx
+            let width = Int((Double(max(48, min(320, t.count * 9 + 16))) * sx).rounded())
+            let height = Int((26.0 * sy).rounded())
+            items.append(.text(TextRecord(id: nextId, x: x, y: y, w: width, h: height, text: t, color: curColor)))
+            nextId += 1
+            selectedIndex = items.count - 1
         }
+        textAnchor = nil
         let field = f
         noteField = nil
         field.removeFromSuperview()
@@ -1345,6 +1424,7 @@ final class AnnotationView: NSView {
                             color: curColor, width: curWidth)
         items.append(.arrow(a))
         nextId += 1
+        selectedIndex = items.count - 1
         needsDisplay = true
     }
 
@@ -1358,6 +1438,7 @@ final class AnnotationView: NSView {
         items.append(.box(b))
         let idx = items.count - 1
         nextId += 1
+        selectedIndex = idx
         needsDisplay = true
         beginNoteEditing(pinIndex: idx, at: to)   // 框选后直接弹备注框(对齐钉子交互)
     }
@@ -1415,8 +1496,157 @@ final class AnnotationView: NSView {
         switch event.keyCode {
         case UInt16(kVK_Escape): controller?.finish(copyToPasteboard: true)
         case UInt16(kVK_ANSI_Z) where event.modifierFlags.contains(.command): undo()
+        case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete): deleteSelection()
         default: super.keyDown(with: event)
         }
+    }
+
+    func beginTextEditing(at p: NSPoint) {
+        textAnchor = p
+        beginNoteEditing(pinIndex: -1, at: p)
+        noteField?.placeholderString = "文字:回车确认"
+    }
+
+    func deleteSelection() {
+        guard let idx = selectedIndex, items.indices.contains(idx) else { return }
+        endNoteEditing()
+        items.remove(at: idx)
+        selectedIndex = nil
+        needsDisplay = true
+    }
+
+    func pxRect(_ x: Int, _ y: Int, _ w: Int, _ h: Int) -> NSRect {
+        let tl = pxToPt(x, y + h)
+        let sy = controller?.scaleY ?? controller?.scale ?? 1
+        let sx = controller?.scale ?? 1
+        return NSRect(origin: tl, size: NSSize(width: CGFloat(w) / CGFloat(sx),
+                                                height: CGFloat(h) / CGFloat(sy)))
+    }
+
+    func pinNumber(_ id: Int) -> Int {
+        var n = 0
+        for it in items {
+            if case .pin(let p) = it {
+                n += 1
+                if p.id == id { return n }
+            }
+        }
+        return id
+    }
+
+    func distToSeg(_ p: NSPoint, _ a: NSPoint, _ b: NSPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let len2 = dx * dx + dy * dy
+        if len2 < 0.01 { return hypot(p.x - a.x, p.y - a.y) }
+        var t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2
+        t = min(1, max(0, t))
+        return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+    }
+
+    func hitItem(_ p: NSPoint) -> Int? {
+        for i in items.indices.reversed() {
+            switch items[i] {
+            case .pin(let pin):
+                let pt = pxToPt(pin.x, pin.y)
+                if hypot(p.x - pt.x, p.y - pt.y) <= 14 { return i }
+            case .arrow(let a):
+                let f = pxToPt(a.fromX, a.fromY), t = pxToPt(a.toX, a.toY)
+                if distToSeg(p, f, t) <= CGFloat(a.width) + 6 { return i }
+            case .box(let b):
+                if pxRect(b.x, b.y, b.w, b.h).insetBy(dx: -6, dy: -6).contains(p) { return i }
+            case .text(let label):
+                if pxRect(label.x, label.y, label.w, label.h).insetBy(dx: -4, dy: -4).contains(p) { return i }
+            }
+        }
+        return nil
+    }
+
+    func hitHandle(_ idx: Int, _ p: NSPoint) -> String? {
+        guard items.indices.contains(idx) else { return nil }
+        func near(_ q: NSPoint, _ name: String) -> String? {
+            hypot(p.x - q.x, p.y - q.y) <= 8 ? name : nil
+        }
+        switch items[idx] {
+        case .arrow(let a):
+            if let n = near(pxToPt(a.fromX, a.fromY), "start") { return n }
+            return near(pxToPt(a.toX, a.toY), "end")
+        case .box(let b):
+            return nearCorner(pxRect(b.x, b.y, b.w, b.h), p)
+        case .text(let label):
+            return nearCorner(pxRect(label.x, label.y, label.w, label.h), p)
+        default:
+            return nil
+        }
+    }
+
+    func nearCorner(_ r: NSRect, _ p: NSPoint) -> String? {
+        let corners: [(NSPoint, String)] = [
+            (NSPoint(x: r.minX, y: r.maxY), "nw"),
+            (NSPoint(x: r.maxX, y: r.maxY), "ne"),
+            (NSPoint(x: r.minX, y: r.minY), "sw"),
+            (NSPoint(x: r.maxX, y: r.minY), "se")]
+        for (q, name) in corners where hypot(p.x - q.x, p.y - q.y) <= 8 { return name }
+        return nil
+    }
+
+    func applyMove(_ idx: Int, _ orig: ActionItem, _ dxView: CGFloat, _ dyView: CGFloat) {
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let dpx = Int((Double(dxView) * sx).rounded())
+        let dpy = Int((-Double(dyView) * sy).rounded())
+        switch orig {
+        case .pin(var p):
+            p.x += dpx; p.y += dpy
+            p.anchorDX += Double(dxView)
+            p.anchorDY += -Double(dyView)
+            items[idx] = .pin(p)
+        case .arrow(var a):
+            a.fromX += dpx; a.fromY += dpy; a.toX += dpx; a.toY += dpy
+            items[idx] = .arrow(a)
+        case .box(var b):
+            b.x += dpx; b.y += dpy
+            items[idx] = .box(b)
+        case .text(var label):
+            label.x += dpx; label.y += dpy
+            items[idx] = .text(label)
+        }
+    }
+
+    func applyResize(_ idx: Int, _ orig: ActionItem, _ handle: String, _ p: NSPoint) {
+        switch orig {
+        case .arrow(var a):
+            let (x, y) = ptToPx(p)
+            if handle == "start" { a.fromX = x; a.fromY = y } else { a.toX = x; a.toY = y }
+            items[idx] = .arrow(a)
+        case .box(var b):
+            let nr = resizedRect(pxRect(b.x, b.y, b.w, b.h), handle, p)
+            let (x1, y1) = ptToPx(NSPoint(x: nr.minX, y: nr.maxY))
+            let (x2, y2) = ptToPx(NSPoint(x: nr.maxX, y: nr.minY))
+            b.x = min(x1, x2); b.y = min(y1, y2)
+            b.w = max(4, abs(x2 - x1)); b.h = max(4, abs(y2 - y1))
+            items[idx] = .box(b)
+        case .text(var label):
+            let nr = resizedRect(pxRect(label.x, label.y, label.w, label.h), handle, p)
+            let (x1, y1) = ptToPx(NSPoint(x: nr.minX, y: nr.maxY))
+            let (x2, y2) = ptToPx(NSPoint(x: nr.maxX, y: nr.minY))
+            label.x = min(x1, x2); label.y = min(y1, y2)
+            label.w = max(4, abs(x2 - x1)); label.h = max(4, abs(y2 - y1))
+            items[idx] = .text(label)
+        default:
+            break
+        }
+    }
+
+    func resizedRect(_ r: NSRect, _ handle: String, _ p: NSPoint) -> NSRect {
+        let anchor: NSPoint
+        switch handle {
+        case "nw": anchor = NSPoint(x: r.maxX, y: r.minY)
+        case "ne": anchor = NSPoint(x: r.minX, y: r.minY)
+        case "sw": anchor = NSPoint(x: r.maxX, y: r.maxY)
+        default: anchor = NSPoint(x: r.minX, y: r.maxY)
+        }
+        return NSRect(x: min(p.x, anchor.x), y: min(p.y, anchor.y),
+                      width: max(4, abs(p.x - anchor.x)), height: max(4, abs(p.y - anchor.y)))
     }
 
     // MARK: 绘制
@@ -1437,30 +1667,42 @@ final class AnnotationView: NSView {
                                     withAttributes: attr)
         }
 
-        // 拖拽预览(箭头/方框/椭圆,按当前模式)
+        // 拖拽预览(箭头/方框/椭圆/聚光,按当前模式)
         if let f = draftFrom, let t = draftTo, f != t {
+            let preview = NSRect(x: min(f.x, t.x), y: min(f.y, t.y),
+                                 width: abs(t.x - f.x), height: abs(t.y - f.y))
             if drawMode == 1 {
                 drawArrow(from: f, to: t, color: colorNamed(curColor), width: curWidth)
+            } else if drawMode == 4 {
+                drawSpotlight(rect: preview, color: colorNamed(curColor), width: curWidth, dim: false)
             } else {
-                drawBox(rect: NSRect(x: min(f.x, t.x), y: min(f.y, t.y),
-                                     width: abs(t.x - f.x), height: abs(t.y - f.y)),
-                        color: colorNamed(curColor), width: curWidth,
+                drawBox(rect: preview, color: colorNamed(curColor), width: curWidth,
                         shape: drawMode == 3 ? "ellipse" : "rect")
             }
         }
 
         for it in items {
+            if case .box(let b) = it, b.shape == "spotlight" {
+                drawSpotlight(rect: pxRect(b.x, b.y, b.w, b.h), color: colorNamed(b.color), width: b.width, dim: true)
+                break
+            }
+        }
+        for (i, it) in items.enumerated() {
             switch it {
             case .pin(let p): drawPin(p)
             case .arrow(let a): drawArrow(from: pxToPt(a.fromX, a.fromY), to: pxToPt(a.toX, a.toY),
                                           color: colorNamed(a.color), width: a.width)
             case .box(let b):
-                let tl = pxToPt(b.x, b.y + b.h)
-                let sy = controller?.scaleY ?? controller?.scale ?? 1
-                drawBox(rect: NSRect(origin: tl, size: NSSize(width: CGFloat(b.w) / CGFloat(controller?.scale ?? 1),
-                                                              height: CGFloat(b.h) / CGFloat(sy))),
-                        color: colorNamed(b.color), width: b.width, shape: b.shape)
+                let rect = pxRect(b.x, b.y, b.w, b.h)
+                if b.shape == "spotlight" {
+                    drawSpotlight(rect: rect, color: colorNamed(b.color), width: b.width, dim: false)
+                } else {
+                    drawBox(rect: rect, color: colorNamed(b.color), width: b.width, shape: b.shape)
+                }
+            case .text(let label):
+                drawTextLabel(label)
             }
+            if selectedIndex == i { drawSelection(i) }
         }
 
         // 悬停十字光标提示
@@ -1493,26 +1735,21 @@ final class AnnotationView: NSView {
         }
     }
 
-    /// 钉子:XY 辅助线 + 圆钉 + 坐标气泡 + 信息签(app/窗口/OCR)
+    /// 钉子:编号圆钉 + 坐标气泡 + 信息签(app/窗口/OCR)。辅助线只在悬停时画一小段。
     func drawPin(_ p: PinRecord) {
         let pt = pxToPt(p.x, p.y)
-
-        // XY 辅助线
-        guideColor.setStroke()
-        let g = NSBezierPath()
-        g.setLineDash([6, 5], count: 2, phase: 0)
-        g.lineWidth = 1
-        g.move(to: NSPoint(x: 0, y: pt.y)); g.line(to: NSPoint(x: bounds.width, y: pt.y))
-        g.move(to: NSPoint(x: pt.x, y: 0)); g.line(to: NSPoint(x: pt.x, y: bounds.height))
-        g.stroke()
-
-        // 钉体
-        let r: CGFloat = 7
+        let r: CGFloat = 11
         let dot = NSBezierPath(ovalIn: NSRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
         NSColor.white.setFill(); dot.fill()
         let inner = NSBezierPath(ovalIn: NSRect(x: pt.x - r + 2, y: pt.y - r + 2,
                                                 width: (r - 2) * 2, height: (r - 2) * 2))
         NSColor.systemRed.setFill(); inner.fill()
+        let n = "\(pinNumber(p.id))"
+        let nf = NSFont.systemFont(ofSize: 11, weight: .bold)
+        let nattr: [NSAttributedString.Key: Any] = [.font: nf, .foregroundColor: NSColor.white]
+        let nsize = (n as NSString).size(withAttributes: nattr)
+        (n as NSString).draw(at: NSPoint(x: pt.x - nsize.width / 2, y: pt.y - nsize.height / 2),
+                             withAttributes: nattr)
 
         // 坐标气泡
         drawBubble(text: "⌗\(p.id)  \(p.x),\(p.y)", at: NSPoint(x: pt.x + 12, y: pt.y + 10))
@@ -1537,12 +1774,19 @@ final class AnnotationView: NSView {
         }
     }
 
-    /// 箭头:线 + 三角头(sharp 风格)
+    /// 箭头:深色描边托底 + 线 + 三角头
     func drawArrow(from: NSPoint, to: NSPoint, color: NSColor, width: Int) {
+        NSColor.black.withAlphaComponent(0.55).setStroke()
+        let halo = NSBezierPath()
+        halo.lineWidth = CGFloat(width) + 3
+        halo.lineCapStyle = .round
+        halo.move(to: from); halo.line(to: to)
+        halo.stroke()
         color.setStroke()
         let path = NSBezierPath()
         path.lineWidth = CGFloat(width)
         path.lineCapStyle = .round
+        path.lineJoinStyle = .round
         path.move(to: from); path.line(to: to)
         path.stroke()
 
@@ -1564,7 +1808,69 @@ final class AnnotationView: NSView {
             ? NSBezierPath(ovalIn: rect)
             : NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
         p.lineWidth = CGFloat(width)
+        p.lineJoinStyle = .round
         p.stroke()
+    }
+
+    /// 聚光:第一块用奇偶填充压暗选区外,其余只描边。
+    func drawSpotlight(rect: NSRect, color: NSColor, width: Int, dim: Bool) {
+        if dim {
+            let path = NSBezierPath(rect: bounds)
+            path.append(NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8))
+            path.windingRule = .evenOdd
+            NSColor.black.withAlphaComponent(0.45).setFill()
+            path.fill()
+        }
+        color.setStroke()
+        let p = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        p.lineWidth = CGFloat(max(width, 2))
+        p.stroke()
+    }
+
+    func drawTextLabel(_ t: TextRecord) {
+        let rect = pxRect(t.x, t.y, t.w, t.h)
+        NSColor.black.withAlphaComponent(0.62).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+        let f = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let attr: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: colorNamed(t.color)]
+        (t.text as NSString).draw(in: rect.insetBy(dx: 6, dy: 3), withAttributes: attr)
+    }
+
+    func drawSelection(_ idx: Int) {
+        guard items.indices.contains(idx) else { return }
+        NSColor.white.setStroke()
+        var handles: [NSPoint] = []
+        switch items[idx] {
+        case .pin(let p):
+            let pt = pxToPt(p.x, p.y)
+            let ring = NSBezierPath(ovalIn: NSRect(x: pt.x - 15, y: pt.y - 15, width: 30, height: 30))
+            ring.lineWidth = 1.5
+            ring.stroke()
+            return
+        case .arrow(let a):
+            handles = [pxToPt(a.fromX, a.fromY), pxToPt(a.toX, a.toY)]
+        case .box(let b):
+            let r = pxRect(b.x, b.y, b.w, b.h)
+            let outline = NSBezierPath(rect: r.insetBy(dx: -2, dy: -2))
+            outline.lineWidth = 1
+            outline.setLineDash([3, 3], count: 2, phase: 0)
+            outline.stroke()
+            handles = [NSPoint(x: r.minX, y: r.maxY), NSPoint(x: r.maxX, y: r.maxY),
+                       NSPoint(x: r.minX, y: r.minY), NSPoint(x: r.maxX, y: r.minY)]
+        case .text(let label):
+            let r = pxRect(label.x, label.y, label.w, label.h)
+            let outline = NSBezierPath(rect: r.insetBy(dx: -2, dy: -2))
+            outline.lineWidth = 1
+            outline.stroke()
+            handles = [NSPoint(x: r.minX, y: r.maxY), NSPoint(x: r.maxX, y: r.maxY),
+                       NSPoint(x: r.minX, y: r.minY), NSPoint(x: r.maxX, y: r.minY)]
+        }
+        for h in handles {
+            NSColor.white.setFill()
+            NSColor.black.setStroke()
+            let sq = NSBezierPath(rect: NSRect(x: h.x - 4, y: h.y - 4, width: 8, height: 8))
+            sq.fill(); sq.lineWidth = 1; sq.stroke()
+        }
     }
 
     func drawBubble(text: String, at origin: NSPoint) {
@@ -1613,6 +1919,10 @@ final class AnnotationView: NSView {
                 b.x = Int((Double(b.x) * mx).rounded()); b.y = Int((Double(b.y) * my).rounded())
                 b.w = Int((Double(b.w) * mx).rounded()); b.h = Int((Double(b.h) * my).rounded())
                 items[i] = .box(b)
+            case .text(var t):
+                t.x = Int((Double(t.x) * mx).rounded()); t.y = Int((Double(t.y) * my).rounded())
+                t.w = Int((Double(t.w) * mx).rounded()); t.h = Int((Double(t.h) * my).rounded())
+                items[i] = .text(t)
             }
         }
     }
@@ -1816,12 +2126,15 @@ final class AnnotationView: NSView {
         }
     }
     var toolBarAdded = false
+    var modeSelectBtn: NSButton?
     var modeArrowBtn: NSButton?
     var modeBoxBtn: NSButton?
     var modeEllipseBtn: NSButton?
+    var modeSpotBtn: NSButton?
+    var modeTextBtn: NSButton?
 
     func installToolBar() {
-        let bar = DragBar(frame: NSRect(x: bounds.midX - 450, y: 16, width: 900, height: 44))
+        let bar = DragBar(frame: NSRect(x: bounds.midX - 560, y: 16, width: 1120, height: 44))
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
         bar.layer?.cornerRadius = 10
@@ -1829,7 +2142,10 @@ final class AnnotationView: NSView {
         bar.layer?.borderWidth = 1
 
         var x: CGFloat = 12
-        // 模式:箭头 / 方框 / 椭圆(方框·椭圆模式拖拽画区域图形;单击始终落钉)
+        // 0选择 1箭头 2方框 3椭圆 4聚光 5文字。单击(非选择/文字)仍落钉。
+        let sel = textBtn("选择", frame: NSRect(x: x, y: 8, width: 52, height: 28))
+        sel.tag = 20; sel.action = #selector(pickMode(_:)); sel.target = self
+        bar.addSubview(sel); modeSelectBtn = sel; x += 56
         let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
         a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
         bar.addSubview(a); modeArrowBtn = a; x += 74
@@ -1838,7 +2154,13 @@ final class AnnotationView: NSView {
         bar.addSubview(b); modeBoxBtn = b; x += 74
         let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
         e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
-        bar.addSubview(e); modeEllipseBtn = e; x += 78
+        bar.addSubview(e); modeEllipseBtn = e; x += 74
+        let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+        spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
+        bar.addSubview(spot); modeSpotBtn = spot; x += 74
+        let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
+        tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
+        bar.addSubview(tx); modeTextBtn = tx; x += 72
         refreshModeButtons()
 
         for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
@@ -1868,7 +2190,8 @@ final class AnnotationView: NSView {
     }
 
     func refreshModeButtons() {
-        for (btn, mode) in [(modeArrowBtn, 1), (modeBoxBtn, 2), (modeEllipseBtn, 3)] {
+        for (btn, mode) in [(modeSelectBtn, 0), (modeArrowBtn, 1), (modeBoxBtn, 2),
+                            (modeEllipseBtn, 3), (modeSpotBtn, 4), (modeTextBtn, 5)] {
             btn?.layer?.borderColor = NSColor.white.cgColor
             btn?.layer?.borderWidth = (drawMode == mode) ? 2 : 0
             btn?.layer?.cornerRadius = 6

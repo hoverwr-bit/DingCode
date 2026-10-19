@@ -17,7 +17,7 @@ DingAI is one tool inside AI-toolbox. Each client is a single self-contained pro
 
 `DingAI.swift` is an AppKit app (`NSApplication` + `AnnoController` as delegate). A Carbon hotkey (`⌥⌘A`) calls `begin` / `finish`. `begin` records the previous frontmost app, the screen under the cursor, and on-screen windows. In the default live session it opens a clear `AnnotationWindow` immediately and captures with ScreenCaptureKit only in `finish`, so the JSON image matches the pin coordinates at export. `⌥⌘P` or holding ⌥ sets `ignoresMouseEvents`; `scrollWheel` posts the event through to the app underneath. Pins remember an AX element, a scroll-bar sample, or a web-bridge key and are updated from the existing timer/`BridgeServer` path. `shotArrived` still builds the overlay; `AnnotationView` draws the marks.
 
-Interaction stays on the view: `mouseDown` / `mouseDragged` / `mouseUp`, `keyDown` for Esc and ⌘Z, and a `DragBar` of `NSButton`s built in `installToolBar`. Coordinates are converted only in `ptToPx` / `pxToPt` (view points, bottom-left, to image pixels, top-left). Marks are an `ActionItem` enum (`.pin`, `.arrow`, `.box`) held in an array. Undo removes the last item.
+Interaction stays on the view: `mouseDown` / `mouseDragged` / `mouseUp`, `keyDown` for Esc, ⌘Z, and Delete, and a `DragBar` of `NSButton`s built in `installToolBar`. Toolbar tags are modes: 20 select, 21 arrow, 22 box, 23 ellipse, 24 spotlight, 25 text. Select hit-tests in `hitItem` / `hitHandle` and moves or resizes the existing record. Coordinates are converted only in `ptToPx` / `pxToPt` (view points, bottom-left, to image pixels, top-left). Marks are an `ActionItem` enum (`.pin`, `.arrow`, `.box`, `.text`) held in an array. Undo removes the last item.
 
 The page bridge is `BridgeServer`, a hand-written HTTP/1.1 listener on `127.0.0.1:8763` (`NWListener`). Pages `GET /ping`, `GET /pending` or `GET /events`, and `POST /answer`. Failures are logged and ignored; a dead bridge does not block pinning. Team upload reads `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) and skips quietly when that is empty. There is no other network.
 
@@ -29,7 +29,7 @@ Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinnin
 
 ## Web
 
-`anno.js` is a single IIFE. It bails out if `window.ANNO_V7` is set or `?qa=1`. UI nodes are marked `data-annotation-ui` and created with the local `el()` helper. Styles are one injected stylesheet. State is the `annos` array, persisted under `localStorage` key `anno-v7:` + path. Pins store an element key (`sec:`, `id:`, or `free:`) plus `anchor.dx/dy` and are redrawn on scroll (capture phase) and resize. The bridge client polls `127.0.0.1:8763` and subscribes with `EventSource`. Copy uses `navigator.clipboard` and falls back to a textarea.
+`anno.js` is a single IIFE. It bails out if `window.ANNO_V7` is set or `?qa=1`. UI nodes are marked `data-annotation-ui` and created with the local `el()` helper. Styles are one injected stylesheet. State is the `annos` array, persisted under `localStorage` key `anno-v7:` + path. Pins store an element key (`sec:`, `id:`, `ding:`, or `free:`) plus `anchor.dx/dy` and are redrawn on scroll (capture phase) and resize. Toolbar tools are `select`, `point`, `arrow`, `box`, `ellipse`, `spot`, and `text`, stored on each annotation's `mark`. The bridge client polls `127.0.0.1:8763` and subscribes with `EventSource`. Copy uses `navigator.clipboard` and falls back to a textarea.
 
 ## Team server
 
@@ -41,7 +41,8 @@ Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_co
 
 - `pins[]`: `id`, `x_px`, `y_px` (screenshot pixels, top-left origin), `ocr_nearby`, optional `note`, optional `window` `{owner, title}`, optional `window_nx` / `window_ny`, optional `page` from the bridge.
 - `arrows[]`: `id`, `from_px`, `to_px`, `color`, `width`.
-- `boxes[]`: `id`, `rect_px` `[x, y, w, h]`, `color`, `width`, optional `shape` (`rect` or `ellipse`), optional `note`.
+- `boxes[]`: `id`, `rect_px` `[x, y, w, h]`, `color`, `width`, optional `shape` (`rect`, `ellipse`, or `spotlight`), optional `note`.
+- `labels[]` (optional): `id`, `x_px`, `y_px`, `w_px`, `h_px`, `text`, `color`. Web text is a `mark.type` of `text` on the existing annotation, not this array.
 - Counts, `screen`, `window`, `app`, `screenshot`, `screen_capture_ok`.
 
 `window.frame_px` is in **points**, top-left, local to the annotated screen, despite the name. `window_nx` / `window_ny` divide pixel pin positions by that frame scaled into pixels.

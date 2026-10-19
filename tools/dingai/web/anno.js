@@ -20,8 +20,8 @@
   css.textContent = [
     '#av7chip{position:fixed;top:10px;right:14px;z-index:99997;background:#101828;color:#fff;border:1px solid #3b4a63;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer}',
     '#av7chip.on{background:#b91c1c;border-color:#b91c1c}',
-    '#av7gx,#av7gy{display:none;position:fixed;z-index:99994;pointer-events:none;background:rgba(37,99,235,.45)}',
-    '#av7gx{top:0;bottom:0;width:1px}#av7gy{left:0;right:0;height:1px}',
+    '#av7gx,#av7gy{display:none;position:fixed;z-index:99994;pointer-events:none;background:rgba(255,255,255,.75)}',
+    '#av7gx{width:28px;height:1px;margin-left:-14px}#av7gy{width:1px;height:28px;margin-top:-14px}',
     '#av7bubble{display:none;position:fixed;z-index:99995;pointer-events:none;background:#1e293b;color:#e2e8f0;font:11px/1.5 monospace;padding:3px 7px;border-radius:4px;white-space:nowrap}',
     '.av7pin{position:absolute;z-index:99993;width:22px;height:22px;border-radius:50%;background:#dc2626;color:#fff;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);font:bold 11px/18px sans-serif;text-align:center;cursor:pointer;padding:0}',
     '#av7panel{display:none;position:fixed;top:44px;right:14px;bottom:14px;width:380px;z-index:99996;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.18);flex-direction:column;font-size:13px}',
@@ -61,6 +61,9 @@
     '.av7arrow{stroke-width:5.5;pointer-events:auto;cursor:pointer}',
     '.av7arrow:hover{stroke:#f59e0b}',
     '.av7shape{position:absolute;pointer-events:auto;cursor:pointer;border-radius:8px}.av7spot{position:absolute;border:2.5px solid #f59e0b;border-radius:10px;box-shadow:0 0 0 9999px rgba(3,7,18,.58), 0 0 26px 4px rgba(245,158,11,.35);pointer-events:auto;cursor:pointer}',
+    '.av7text{position:absolute;z-index:99993;pointer-events:auto;cursor:move;background:rgba(15,23,42,.72);color:#fff;border-radius:4px;padding:2px 6px;font:13px/20px sans-serif;white-space:nowrap}',
+    '.av7handle{position:absolute;width:8px;height:8px;margin:-4px 0 0 -4px;background:#fff;border:1px solid #0f172a;z-index:99995;pointer-events:none}',
+    '.av7sel{outline:1px dashed #fff;outline-offset:2px}',
     '#av7draw-preview{position:absolute;border:2px dashed #dc2626;pointer-events:none}',
     '#av7info{display:none;position:absolute;z-index:99994;background:#0f172a;color:#e2e8f0;font:12px/1.6 sans-serif;padding:8px 11px;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.35);pointer-events:none;max-width:380px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
   ].join('\n');
@@ -84,6 +87,7 @@
     dot:      { name: '线+圆点',       kind: 'dot',    hw: 3.0, hl: 1.00 }
   };
   var curTool = 'point', curColor = AV_COLORS[0], curWidth = AV_WIDTHS[1], curStyle = 'sharp';
+  var selected = -1, dragSel = null, textInput = null;
   /* 一体成型箭头路径（260922d v7.9）：身+头单路径连续轮廓，圆角靠同色 stroke+round join；
      sharp=macOS 风（头宽 3.2×身宽、头长≈头宽、燕尾凹深 0.55 头长） */
   function buildArrowD(style, x1, y1, x2, y2, w) {
@@ -142,11 +146,13 @@
   function buildTools(hostPanel) {
     var row = document.createElement('div');
     row.className = 'av7tools-row';
-    row.innerHTML = '<button type="button" data-tool="point" class="on" title="点选批注">📍</button>'
+    row.innerHTML = '<button type="button" data-tool="select" title="选择、移动、缩放">↖</button>'
+      + '<button type="button" data-tool="point" class="on" title="点选批注">📍</button>'
       + '<button type="button" data-tool="arrow" title="箭头（按住拖拽）">➷</button>'
       + '<button type="button" data-tool="box" title="方框（按住拖框，纯边框不暗化）">▭</button>'
       + '<button type="button" data-tool="ellipse" title="椭圆（按住拖框，纯边框不暗化）">◯</button>'
       + '<button type="button" data-tool="spot" title="聚光灯（按住拖框，选区外压暗）">◉</button>'
+      + '<button type="button" data-tool="text" title="文字标签（单击后回车）">T</button>'
       + '<span class="sep"></span>'
       + AV_COLORS.map(function (c, i) { return '<button type="button" data-color="' + c + '" title="颜色" ' + (i === 0 ? 'class="on"' : '') + '><span class="dot" style="background:' + c + '"></span></button>'; }).join('')
       + '<span class="sep"></span>'
@@ -296,15 +302,16 @@
     svg.setAttribute('width', document.documentElement.scrollWidth); svg.setAttribute('height', H);
     svg.style.pointerEvents = 'none';
     markLayer.appendChild(svg);
-    annos.forEach(function (a) {
+    annos.forEach(function (a, i) {
       if (!a.mark) return;
       var mark = placedMark(a.mark);
+      var selClass = i === selected ? ' av7sel' : '';
       if (mark.type === 'arrow') {
         var mc = mark.color || '#dc2626', ms = mark.style || 'sharp';
         var mw = mark.width || 5.5;
         var ln = document.createElementNS(NS, 'path');
         ln.setAttribute('d', buildArrowD(ms, mark.x1, mark.y1, mark.x2, mark.y2, mw));
-        ln.setAttribute('class', 'av7arrow');
+        ln.setAttribute('class', 'av7arrow' + selClass);
         if (AV_STYLES[ms] && (AV_STYLES[ms].kind === 'open' || AV_STYLES[ms].kind === 'dot')) { ln.setAttribute('fill', 'none'); ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', mw); ln.setAttribute('stroke-linecap', 'round'); }
         else { ln.setAttribute('fill', mc); ln.setAttribute('stroke', mc); ln.setAttribute('stroke-width', Math.max(1.5, mw * 0.32)); }
         ln.setAttribute('stroke-linejoin', 'round'); ln.setAttribute('stroke-linecap', 'round');
@@ -314,7 +321,7 @@
       } else if (a.mark.type === 'box' || a.mark.type === 'ellipse') {
         var sc = a.mark.color || '#f59e0b';
         var box = document.createElement('div');
-        box.className = 'av7shape';
+        box.className = 'av7shape' + selClass;
         box.setAttribute('data-annotation-ui', 'true');
         box.style.borderColor = sc; box.style.borderWidth = (mark.width || 5.5) + 'px';
         if (mark.type === 'ellipse') { box.style.borderRadius = '50%'; }
@@ -324,10 +331,21 @@
         box.title = (a.field ? a.field + '：' + (a.value || '') + ' | ' : '') + (a.comment || '').slice(0, 60);
         box.addEventListener('click', function (ev) { ev.stopPropagation(); openModal({ key: a.key, geometry: a.geometry, anchor: a.anchor, mark: a.mark, field: a.field, value: a.value, existing: a }, true); });
         markLayer.appendChild(box);
+      } else if (mark.type === 'text') {
+        var lab = document.createElement('div');
+        lab.className = 'av7text' + selClass;
+        lab.setAttribute('data-annotation-ui', 'true');
+        lab.textContent = mark.text || a.comment || '';
+        lab.style.color = mark.color || '#fff';
+        lab.style.left = mark.x1 + 'px';
+        lab.style.top = mark.y1 + 'px';
+        lab.style.minWidth = Math.max(24, mark.x2 - mark.x1) + 'px';
+        lab.style.minHeight = Math.max(20, mark.y2 - mark.y1) + 'px';
+        markLayer.appendChild(lab);
       } else {
         var sc = a.mark.color || '#f59e0b';
         var box = document.createElement('div');
-        box.className = 'av7spot';
+        box.className = 'av7spot' + selClass;
         box.setAttribute('data-annotation-ui', 'true');
         box.style.borderColor = sc; box.style.borderWidth = (mark.width || 5.5) + 'px';
         /* 261014c:遮罩只挂第一个 spot——多聚光灯 box-shadow 9999px 叠加会让页面其余区域逐层变暗(用户报) */
@@ -340,6 +358,16 @@
         markLayer.appendChild(box);
       }
     });
+    if (selected >= 0 && annos[selected]) {
+      handlesOf(annos[selected]).forEach(function (h) {
+        var d = document.createElement('div');
+        d.className = 'av7handle';
+        d.setAttribute('data-annotation-ui', 'true');
+        d.style.left = h.x + 'px';
+        d.style.top = h.y + 'px';
+        markLayer.appendChild(d);
+      });
+    }
   }
 
 
@@ -481,6 +509,16 @@
     setMode(false);
   }
   document.addEventListener('keydown', function (e) {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && mode && selected >= 0 && !modal.classList.contains('on')) {
+      var tag = e.target && e.target.tagName;
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA') {
+        annos.splice(selected, 1);
+        selected = -1;
+        saveLocal(); render();
+        e.preventDefault();
+        return;
+      }
+    }
     if (e.key !== 'Escape' || !mode) return;
     if (modal.classList.contains('on')) { closeModal(); return; }
     requestExit();
@@ -489,21 +527,179 @@
   document.addEventListener('mousemove', function (e) {
     if (!mode) return;
     gx.style.display = gy.style.display = bubble.style.display = 'block';
-    gx.style.left = e.clientX + 'px'; gy.style.top = e.clientY + 'px';
+    gx.style.left = e.clientX + 'px'; gx.style.top = e.clientY + 'px';
+    gy.style.left = e.clientX + 'px'; gy.style.top = e.clientY + 'px';
     bubble.textContent = 'client(' + e.clientX + ',' + e.clientY + ') page(' + (e.clientX + window.scrollX) + ',' + (e.clientY + window.scrollY) + ')';
     bubble.style.left = (e.clientX + 14 + 160 > window.innerWidth ? e.clientX - 174 : e.clientX + 14) + 'px';
     bubble.style.top = (e.clientY + 18 + 30 > window.innerHeight ? e.clientY - 34 : e.clientY + 18) + 'px';
   }, true);
 
+  function distToSeg(px, py, x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1, len2 = dx * dx + dy * dy;
+    if (len2 < 0.01) return Math.hypot(px - x1, py - y1);
+    var t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+  }
+  function placedPin(a) {
+    var x = a.geometry.page.x, y = a.geometry.page.y;
+    var ae = anchorElOf(a.key);
+    if (ae && ae.getClientRects().length && a.anchor) {
+      var r = ae.getBoundingClientRect();
+      x = window.scrollX + r.left + a.anchor.dx;
+      y = window.scrollY + r.top + a.anchor.dy;
+    }
+    return { x: x, y: y };
+  }
+  function handlesOf(a) {
+    if (!a || !a.mark) return [];
+    var m = placedMark(a.mark);
+    if (m.type === 'arrow') return [{ name: 'start', x: m.x1, y: m.y1 }, { name: 'end', x: m.x2, y: m.y2 }];
+    var x1 = Math.min(m.x1, m.x2), y1 = Math.min(m.y1, m.y2);
+    var x2 = Math.max(m.x1, m.x2), y2 = Math.max(m.y1, m.y2);
+    return [{ name: 'nw', x: x1, y: y1 }, { name: 'ne', x: x2, y: y1 }, { name: 'sw', x: x1, y: y2 }, { name: 'se', x: x2, y: y2 }];
+  }
+  function hitHandleAt(a, px, py) {
+    var hs = handlesOf(a);
+    for (var i = 0; i < hs.length; i++) if (Math.hypot(px - hs[i].x, py - hs[i].y) <= 8) return hs[i].name;
+    return null;
+  }
+  function hitAnno(px, py) {
+    for (var i = annos.length - 1; i >= 0; i--) {
+      var a = annos[i];
+      if (a.mark) {
+        var m = placedMark(a.mark);
+        if (m.type === 'arrow') {
+          if (distToSeg(px, py, m.x1, m.y1, m.x2, m.y2) <= (m.width || 6) + 6) return i;
+        } else {
+          var l = Math.min(m.x1, m.x2) - 4, t = Math.min(m.y1, m.y2) - 4;
+          var r = Math.max(m.x1, m.x2) + 4, b = Math.max(m.y1, m.y2) + 4;
+          if (px >= l && px <= r && py >= t && py <= b) return i;
+        }
+      } else if (a.geometry && a.geometry.page) {
+        var p = placedPin(a);
+        if (Math.hypot(px - p.x, py - p.y) <= 14) return i;
+      }
+    }
+    return -1;
+  }
+  function syncAnchors(mark) {
+    if (!mark.anchors) return;
+    function fix(an, x, y) {
+      if (!an) return;
+      var el = anchorElOf(an.key);
+      if (!el || !el.getClientRects().length) return;
+      var rc = el.getBoundingClientRect();
+      an.dx = x - (window.scrollX + rc.left);
+      an.dy = y - (window.scrollY + rc.top);
+    }
+    fix(mark.anchors.a1, mark.x1, mark.y1);
+    fix(mark.anchors.a2, mark.x2, mark.y2);
+  }
+  function moveAnno(a, dx, dy) {
+    if (a.mark) {
+      a.mark.x1 = Math.round(a.mark.x1 + dx); a.mark.y1 = Math.round(a.mark.y1 + dy);
+      a.mark.x2 = Math.round(a.mark.x2 + dx); a.mark.y2 = Math.round(a.mark.y2 + dy);
+      if (a.mark.anchors) {
+        if (a.mark.anchors.a1) { a.mark.anchors.a1.dx += dx; a.mark.anchors.a1.dy += dy; }
+        if (a.mark.anchors.a2) { a.mark.anchors.a2.dx += dx; a.mark.anchors.a2.dy += dy; }
+      }
+      if (a.anchor) { a.anchor.dx += dx; a.anchor.dy += dy; }
+    } else if (a.anchor) { a.anchor.dx += dx; a.anchor.dy += dy; }
+    if (a.geometry && a.geometry.page) {
+      a.geometry.page.x = Math.round(a.geometry.page.x + dx);
+      a.geometry.page.y = Math.round(a.geometry.page.y + dy);
+    }
+  }
+  function resizeAnno(a, handle, px, py) {
+    var mark = a.mark; if (!mark) return;
+    var m = placedMark(mark);
+    if (mark.type === 'arrow') {
+      if (handle === 'start') { mark.x1 = Math.round(px); mark.y1 = Math.round(py); mark.x2 = Math.round(m.x2); mark.y2 = Math.round(m.y2); }
+      else { mark.x1 = Math.round(m.x1); mark.y1 = Math.round(m.y1); mark.x2 = Math.round(px); mark.y2 = Math.round(py); }
+    } else {
+      var l = Math.min(m.x1, m.x2), t = Math.min(m.y1, m.y2), r = Math.max(m.x1, m.x2), b = Math.max(m.y1, m.y2);
+      if (handle === 'nw') { l = px; t = py; }
+      else if (handle === 'ne') { r = px; t = py; }
+      else if (handle === 'sw') { l = px; b = py; }
+      else { r = px; b = py; }
+      mark.x1 = Math.round(Math.min(l, r)); mark.y1 = Math.round(Math.min(t, b));
+      mark.x2 = Math.round(Math.max(l, r)); mark.y2 = Math.round(Math.max(t, b));
+    }
+    syncAnchors(mark);
+  }
+  function commitWebText() {
+    if (!textInput) return;
+    var t = textInput.value.trim();
+    var page = textInput._page, target = textInput._target;
+    textInput.remove(); textInput = null;
+    if (!t) return;
+    var w = Math.max(48, Math.min(320, t.length * 9 + 16));
+    var mk = { type: 'text', x1: Math.round(page.x), y1: Math.round(page.y), x2: Math.round(page.x + w), y2: Math.round(page.y + 26), text: t, color: curColor };
+    mk.anchors = { a1: anchorForPage(mk.x1, mk.y1, target) };
+    var key = keyOf(target) || ('free:' + mk.x1 + ',' + mk.y1);
+    annos.push({
+      id: 'A' + pad(++seq), key: key, target: targetName(key), comment: t,
+      geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: { x: mk.x1, y: mk.y1 }, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
+      mark: mk, anchor: mk.anchors.a1, field: '', value: '',
+      free: key.indexOf('free:') === 0, ts: Date.now(), by: me
+    });
+    selected = annos.length - 1;
+    saveLocal(); render();
+  }
+
   /* 标记绘制（260922 v7.6）：箭头/聚光灯拖拽；完成后弹批注表单；误触（<8px）丢弃 */
   var drawing = null, preview = null, suppressClick = false;
   document.addEventListener('mousedown', function (e) {
-    if (!mode || curTool === 'point' || drawing) return;
-    if (e.target.closest && (e.target.closest('#av7chip,#av7tools,#av7panel,#av7modal,#av7bar,.av7pin,#av7info') || e.target.closest('.av7arrow') || e.target.closest('.av7spot') || e.target.closest('.av7shape'))) return;
+    if (!mode || drawing) return;
+    if (e.target.closest && e.target.closest('#av7chip,#av7tools,#av7panel,#av7modal,#av7bar,#av7info')) return;
+    var page = { x: e.clientX + window.scrollX, y: e.clientY + window.scrollY };
+    if (curTool === 'select') {
+      var handle = selected >= 0 && annos[selected] ? hitHandleAt(annos[selected], page.x, page.y) : null;
+      if (handle) dragSel = { handle: handle, x: page.x, y: page.y };
+      else {
+        selected = hitAnno(page.x, page.y);
+        dragSel = selected >= 0 ? { handle: null, x: page.x, y: page.y } : null;
+      }
+      suppressClick = true;
+      render();
+      e.preventDefault(); e.stopImmediatePropagation();
+      return;
+    }
+    if (curTool === 'text') {
+      if (textInput) { textInput.remove(); textInput = null; }
+      textInput = document.createElement('input');
+      textInput.type = 'text';
+      textInput.setAttribute('data-annotation-ui', 'true');
+      textInput.placeholder = '文字，回车确认';
+      textInput.style.cssText = 'position:absolute;z-index:99998;width:180px;height:26px;font:13px sans-serif;border:1px solid #cbd5e1;border-radius:4px;padding:2px 6px';
+      textInput.style.left = page.x + 'px'; textInput.style.top = page.y + 'px';
+      textInput._page = page; textInput._target = e.target;
+      textInput.addEventListener('keydown', function (ev) {
+        ev.stopPropagation();
+        if (ev.key === 'Enter') { commitWebText(); ev.preventDefault(); }
+        else if (ev.key === 'Escape') { textInput.remove(); textInput = null; ev.preventDefault(); }
+      });
+      document.body.appendChild(textInput);
+      textInput.focus();
+      suppressClick = true;
+      e.preventDefault(); e.stopImmediatePropagation();
+      return;
+    }
+    if (curTool === 'point') return;
+    if (e.target.closest && (e.target.closest('.av7pin') || e.target.closest('.av7arrow') || e.target.closest('.av7spot') || e.target.closest('.av7shape') || e.target.closest('.av7text'))) return;
     drawing = { x1: e.clientX + window.scrollX, y1: e.clientY + window.scrollY, target: e.target, moved: false };
     e.preventDefault(); e.stopImmediatePropagation();
   }, true);
   document.addEventListener('mousemove', function (e) {
+    if (dragSel && selected >= 0 && annos[selected]) {
+      var p = { x: e.clientX + window.scrollX, y: e.clientY + window.scrollY };
+      if (dragSel.handle) resizeAnno(annos[selected], dragSel.handle, p.x, p.y);
+      else moveAnno(annos[selected], p.x - dragSel.x, p.y - dragSel.y);
+      dragSel.x = p.x; dragSel.y = p.y;
+      render();
+      return;
+    }
     if (!drawing) return;
     var x2 = e.clientX + window.scrollX, y2 = e.clientY + window.scrollY;
     drawing.x2 = x2; drawing.y2 = y2; drawing.moved = true;
@@ -536,6 +732,7 @@
     }
   }, true);
   document.addEventListener('mouseup', function (e) {
+    if (dragSel) { dragSel = null; saveLocal(); return; }
     if (!drawing) return;
     var d = drawing; drawing = null;
     if (preview) { preview.remove(); preview = null; }
@@ -555,7 +752,12 @@
   document.addEventListener('click', function (e) {
     if (!mode) return;
     if (suppressClick) { suppressClick = false; return; }
-    if (e.target.closest && e.target.closest('#av7chip,#av7tools,#av7bar,#av7panel,#av7modal,.av7pin,#av7info,.av7arrow,.av7spot,.av7shape')) return;
+    if ((curTool === 'select' || curTool === 'text') && e.target.closest && e.target.closest('.av7pin,.av7arrow,.av7spot,.av7shape,.av7text')) {
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      return;
+    }
+    if (curTool !== 'point') return;
+    if (e.target.closest && e.target.closest('#av7chip,#av7tools,#av7bar,#av7panel,#av7modal,.av7pin,#av7info,.av7arrow,.av7spot,.av7shape,.av7text')) return;
     /* stopImmediatePropagation：拦掉后注册的 outside-close 委托（MO 下钻等），标注点击不得折叠页面状态 */
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
     var client = { x: e.clientX, y: e.clientY };
