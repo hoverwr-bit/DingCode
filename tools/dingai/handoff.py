@@ -11,6 +11,8 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py reject [project]
   python3 handoff.py pins [project]
   python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
+  python3 handoff.py export markdown <note.json> <dest>
+  python3 handoff.py export github <note.json> <dest>
   python3 handoff.py verify <before.png> <after.png> <outdir>
   python3 handoff.py confirm <note_id> <pin_id>
   python3 handoff.py reopen <note_id> <pin_id>
@@ -491,6 +493,18 @@ def main(argv):
     if cmd == "pins":
         sys.stdout.write(json.dumps(list_agent_pins(argv[2] if len(argv) > 2 else None), ensure_ascii=False, indent=2) + "\n")
         return 0
+    if cmd == "export":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py export <markdown|github|name> <note.json> <dest>\n")
+            return 2
+        from core.export import export_note
+        try:
+            note = json.loads(read_note(argv[3]) or "{}")
+        except ValueError:
+            note = {}
+        result = export_note(argv[2], note, argv[4])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "verify":
         if len(argv) < 5:
             sys.stderr.write("usage: handoff.py verify <before.png> <after.png> <outdir>\n")

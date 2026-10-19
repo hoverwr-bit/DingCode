@@ -168,7 +168,8 @@
       + '<span class="sep"></span>'
       + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>'
       + '<button type="button" data-voice="1" title="按住说话，本地转写到备注">🎤</button>'
-      + '<button type="button" data-steps="1" title="逐步记录，导出 SOP">#</button>';
+      + '<button type="button" data-steps="1" title="逐步记录，导出 SOP">#</button>'
+      + '<button type="button" data-export="1" title="导出 Markdown 清单">☑</button>';
     var head = hostPanel.querySelector('.av7head');
     head.insertAdjacentElement('afterend', row);
     var voiceBtn = row.querySelector('[data-voice]');
@@ -207,7 +208,18 @@
   panelToolsClick = function (e) {
     var b = e.target.closest('button'); if (!b) return;
     e.stopPropagation();
-    if (b.dataset.steps) {
+    if (b.dataset.export) {
+      var lines = ['# DingAI checklist', ''];
+      annos.forEach(function (a) {
+        var loc = a.source && a.source.file ? ' (' + a.source.file + ':' + (a.source.line || 1) + ')' : '';
+        lines.push('- [' + (a.status === 'confirmed' ? 'x' : ' ') + '] ' + (a.pinType || 'bug') + ': ' + (a.comment || '') + loc);
+      });
+      var blob = new Blob([lines.join('\n') + '\n'], { type: 'text/markdown' });
+      var link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = 'dingai-checklist.md';
+      link.click();
+    } else if (b.dataset.steps) {
       stepMode = !stepMode;
       b.classList.toggle('on', stepMode);
       if (!stepMode) downloadSop();
