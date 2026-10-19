@@ -25,7 +25,7 @@ DingAI drops pins on any app or web page and exports JSON: app, window, pixel co
 - Windows: `cd tools/dingai/windows && dotnet build`  
   `Ctrl+Alt+A` starts a live session. Hold Alt to click the app underneath. `DINGAI_LIVE=0` freezes the screenshot first, as the older build did. B / C / Q set the next pin to bug, change, or question.
 - Linux: `python3 tools/dingai/linux/dingai_linux.py` on X11 or XWayland. `--check` prints which of X11, grim, Tesseract, and the AT-SPI bus are available. Focus the toolbar, press p then click to drop a pin, or a / r / s and two clicks for an arrow, box, or spotlight. B / C / Q set the pin type. Esc exports under `~/DingAI/linux`.
-- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. The note dialog has a pin type.
+- Web: load `tools/dingai/web/anno.js`, or install the Chrome/Edge extension. `bash tools/dingai/extension/pack.sh` writes `tools/dingai/extension/dist`. In `chrome://extensions` or `edge://extensions`, turn on Developer mode and choose Load unpacked. The extension injects the same page script and talks to the desktop app at `127.0.0.1:8763`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. The note dialog has a pin type.
 - Team server: see [tools/dingai/team-server/DEPLOY.md](tools/dingai/team-server/DEPLOY.md).
 
 ```
