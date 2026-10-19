@@ -64,6 +64,7 @@
     '.av7text{position:absolute;z-index:99993;pointer-events:auto;cursor:move;background:rgba(15,23,42,.72);color:#fff;border-radius:4px;padding:2px 6px;font:13px/20px sans-serif;white-space:nowrap}',
     '.av7handle{position:absolute;width:8px;height:8px;margin:-4px 0 0 -4px;background:#fff;border:1px solid #0f172a;z-index:99995;pointer-events:none}',
     '.av7sel{outline:1px dashed #fff;outline-offset:2px}',
+    '.av7callout{position:absolute;box-sizing:border-box;background:rgba(15,23,42,.82);color:#e2e8f0;font:12px/20px sans-serif;border-radius:6px;padding:0 6px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}',
     '#av7draw-preview{position:absolute;border:2px dashed #dc2626;pointer-events:none}',
     '#av7info{display:none;position:absolute;z-index:99994;background:#0f172a;color:#e2e8f0;font:12px/1.6 sans-serif;padding:8px 11px;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.35);pointer-events:none;max-width:380px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
   ].join('\n');
@@ -277,13 +278,60 @@
     }
     return { field: name || ('第' + (idx + 1) + '列'), value: (td.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60) };
   }
+  /* @layout-start */
+  function layoutCallouts(callouts, obstacles, bounds) {
+    var dirs = [[1, 0, 0], [1, -1, 6], [0, -1, 6], [-1, -1, 6], [-1, 0, 6], [-1, 1, 6], [0, 1, 6], [1, 1, 6]];
+    var dists = [18, 32, 48, 68, 96, 132, 176];
+    var gap = 4;
+    var placed = (obstacles || []).map(function (o) { return { x: o.x, y: o.y, w: o.w, h: o.h }; });
+    function overlap(a, b) {
+      var x1 = Math.max(a.x, b.x - gap), y1 = Math.max(a.y, b.y - gap);
+      var x2 = Math.min(a.x + a.w, b.x + b.w + gap), y2 = Math.min(a.y + a.h, b.y + b.h + gap);
+      return (x2 > x1 && y2 > y1) ? (x2 - x1) * (y2 - y1) : 0;
+    }
+    function pointDist(px, py, r) {
+      var cx = Math.max(r.x, Math.min(px, r.x + r.w));
+      var cy = Math.max(r.y, Math.min(py, r.y + r.h));
+      return Math.hypot(px - cx, py - cy);
+    }
+    return (callouts || []).map(function (c, k) {
+      var best = null;
+      dirs.forEach(function (d) {
+        dists.forEach(function (dist) {
+          var len = Math.hypot(d[0], d[1]) || 1;
+          var ox = d[0] / len * dist, oy = d[1] / len * dist;
+          var x = c.ax + ox + (d[0] < 0 ? -c.w : (d[0] === 0 ? -c.w / 2 : 0));
+          var y = c.ay + oy + (d[1] < 0 ? -c.h : (d[1] === 0 ? -c.h / 2 : 0));
+          x = Math.max(bounds.x, Math.min(x, bounds.x + bounds.w - c.w));
+          y = Math.max(bounds.y, Math.min(y, bounds.y + bounds.h - c.h));
+          var rect = { x: x, y: y, w: c.w, h: c.h };
+          var hit = 0;
+          for (var i = 0; i < placed.length; i++) hit += overlap(rect, placed[i]);
+          var cost = hit * 10000 + dist + d[2] + k * 0.01;
+          if (!best || cost < best.cost) best = { cost: cost, x: x, y: y, leader: pointDist(c.ax, c.ay, rect) > 14 };
+        });
+      });
+      placed.push({ x: best.x, y: best.y, w: c.w, h: c.h });
+      return { id: c.id, x: best.x, y: best.y, w: c.w, h: c.h, leader: best.leader };
+    });
+  }
+  /* @layout-end */
   function showInfo(at, field, value, extra) {
     info.innerHTML = '<b style="color:#93c5fd">' + esc(field) + '</b>：' + esc(value || '—')
       + (extra ? '<br><span style="color:#94a3b8">' + esc(extra) + '</span>' : '');
     info.style.display = 'block';
     var w = 300, h = 46;
-    info.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, at.client.x + 14 + window.scrollX)) + 'px';
-    info.style.top = Math.max(8 + window.scrollY, at.client.y - h - 10 < window.scrollY ? at.client.y + 16 + window.scrollY : at.client.y - h - 10 + window.scrollY) + 'px';
+    var obstacles = [];
+    document.querySelectorAll('.av7pin').forEach(function (p) {
+      obstacles.push({ x: p.offsetLeft, y: p.offsetTop, w: 22, h: 22 });
+    });
+    var placed = layoutCallouts(
+      [{ id: 0, ax: at.page.x, ay: at.page.y, w: w, h: h }],
+      obstacles,
+      { x: window.scrollX + 8, y: window.scrollY + 8, w: Math.max(w, window.innerWidth - 16), h: Math.max(h, window.innerHeight - 16) }
+    )[0];
+    info.style.left = placed.x + 'px';
+    info.style.top = placed.y + 'px';
   }
   function hideInfo() { info.style.display = 'none'; }
 
@@ -372,10 +420,54 @@
 
 
   /* 钉子渲染：锚定元素（点击点=元素内偏移 dx/dy）优先；元素失联才回退点击时页面坐标 */
+  function renderCallouts(pinPos) {
+    var old = document.getElementById('av7callouts');
+    if (old) old.remove();
+    if (!mode) return;
+    var H = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+    var bounds = { x: 0, y: 0, w: document.documentElement.scrollWidth, h: H };
+    var obstacles = [];
+    var specs = [];
+    pinPos.forEach(function (p, i) {
+      if (!p) return;
+      obstacles.push({ x: p.x - 11, y: p.y - 11, w: 22, h: 22 });
+      var a = annos[i];
+      if (!a || !a.comment || (a.mark && a.mark.type === 'text')) return;
+      var text = a.comment.length > 42 ? a.comment.slice(0, 42) + '…' : a.comment;
+      specs.push({ id: i, ax: p.x, ay: p.y, w: Math.min(240, 18 + text.length * 7), h: 22, text: text });
+    });
+    var placed = layoutCallouts(specs, obstacles, bounds);
+    var host = document.createElement('div');
+    host.id = 'av7callouts';
+    host.setAttribute('data-annotation-ui', 'true');
+    host.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;z-index:99994';
+    var NS = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('width', bounds.w); svg.setAttribute('height', bounds.h);
+    svg.style.cssText = 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none';
+    host.appendChild(svg);
+    placed.forEach(function (box, n) {
+      if (box.leader) {
+        var ln = document.createElementNS(NS, 'line');
+        ln.setAttribute('x1', specs[n].ax); ln.setAttribute('y1', specs[n].ay);
+        ln.setAttribute('x2', box.x); ln.setAttribute('y2', box.y + box.h / 2);
+        ln.setAttribute('stroke', 'rgba(226,232,240,.9)'); ln.setAttribute('stroke-width', '1');
+        svg.appendChild(ln);
+      }
+      var d = document.createElement('div');
+      d.className = 'av7callout';
+      d.textContent = specs[n].text;
+      d.style.left = box.x + 'px'; d.style.top = box.y + 'px';
+      d.style.width = specs[n].w + 'px'; d.style.height = specs[n].h + 'px';
+      host.appendChild(d);
+    });
+    document.body.appendChild(host);
+  }
   function render() {
     document.querySelectorAll('.av7pin').forEach(function (p) { p.remove(); });
     renderMarks();
     var seen = {};
+    var pinPos = [];
     annos.forEach(function (a, i) {
       var off = (seen[a.key] = seen[a.key] || 0) * 6; seen[a.key]++;
       var pin = document.createElement('button');
@@ -388,10 +480,12 @@
         x = window.scrollX + r.left + a.anchor.dx; y = window.scrollY + r.top + a.anchor.dy; anchored = true;
       }
       pin.style.left = (x - 11 + off) + 'px'; pin.style.top = (y - 11 - off) + 'px';
+      pinPos[i] = { x: x + off, y: y - off };
       pin.title = (a.field ? a.field + '：' + (a.value || '') + '\n' : '') + a.comment.slice(0, 60);
       pin.addEventListener('click', function (ev) { ev.stopPropagation(); openModal({ key: a.key, geometry: a.geometry, anchor: a.anchor, field: a.field, value: a.value, existing: a }, true); });
       document.body.appendChild(pin);
     });
+    renderCallouts(pinPos);
     var list = document.getElementById('av7list');
     list.innerHTML = annos.length ? '' : '<div style="color:#94a3b8;padding:12px 0">暂无批注。开启批注模式后点击页面任意位置。</div>';
     annos.forEach(function (a, i) {

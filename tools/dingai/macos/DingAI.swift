@@ -1146,6 +1146,78 @@ private func area(_ b: [String: Any]?) -> Int {
     return w * h
 }
 
+struct LayoutCallout {
+    var id: Int
+    var ax: Double
+    var ay: Double
+    var w: Double
+    var h: Double
+}
+struct LayoutRect {
+    var x: Double
+    var y: Double
+    var w: Double
+    var h: Double
+}
+struct LayoutPlaced {
+    var id: Int
+    var x: Double
+    var y: Double
+    var w: Double
+    var h: Double
+    var leader: Bool
+}
+
+/// 与 web/anno.js 里 layoutCallouts 同一规则:优先放在锚点右侧,躲开已占矩形,超出 14px 画引线。
+private func layoutCallouts(_ callouts: [LayoutCallout], obstacles: [LayoutRect], bounds: LayoutRect) -> [LayoutPlaced] {
+    let dirs: [(Double, Double, Double)] = [
+        (1, 0, 0), (1, -1, 6), (0, -1, 6), (-1, -1, 6),
+        (-1, 0, 6), (-1, 1, 6), (0, 1, 6), (1, 1, 6)]
+    let dists = [18.0, 32, 48, 68, 96, 132, 176]
+    let gap = 4.0
+    var placed = obstacles
+    var out: [LayoutPlaced] = []
+    for (k, c) in callouts.enumerated() {
+        var bestCost = Double.greatestFiniteMagnitude
+        var best = LayoutPlaced(id: c.id, x: bounds.x, y: bounds.y, w: c.w, h: c.h, leader: true)
+        for d in dirs {
+            for dist in dists {
+                let len = max(1, hypot(d.0, d.1))
+                let ox = d.0 / len * dist
+                let oy = d.1 / len * dist
+                var x = c.ax + ox + (d.0 < 0 ? -c.w : (d.0 == 0 ? -c.w / 2 : 0))
+                var y = c.ay + oy + (d.1 < 0 ? -c.h : (d.1 == 0 ? -c.h / 2 : 0))
+                x = min(max(x, bounds.x), bounds.x + bounds.w - c.w)
+                y = min(max(y, bounds.y), bounds.y + bounds.h - c.h)
+                let rect = LayoutRect(x: x, y: y, w: c.w, h: c.h)
+                var overlap = 0.0
+                for p in placed { overlap += layoutOverlap(rect, p, gap: gap) }
+                let cost = overlap * 10000 + dist + d.2 + Double(k) * 0.01
+                if cost < bestCost {
+                    bestCost = cost
+                    best = LayoutPlaced(id: c.id, x: x, y: y, w: c.w, h: c.h,
+                                       leader: layoutPointDist(c.ax, c.ay, rect) > 14)
+                }
+            }
+        }
+        placed.append(LayoutRect(x: best.x, y: best.y, w: best.w, h: best.h))
+        out.append(best)
+    }
+    return out
+}
+
+private func layoutOverlap(_ a: LayoutRect, _ b: LayoutRect, gap: Double) -> Double {
+    let x1 = max(a.x, b.x - gap), y1 = max(a.y, b.y - gap)
+    let x2 = min(a.x + a.w, b.x + b.w + gap), y2 = min(a.y + a.h, b.y + b.h + gap)
+    return (x2 > x1 && y2 > y1) ? (x2 - x1) * (y2 - y1) : 0
+}
+
+private func layoutPointDist(_ px: Double, _ py: Double, _ r: LayoutRect) -> Double {
+    let cx = min(max(px, r.x), r.x + r.w)
+    let cy = min(max(py, r.y), r.y + r.h)
+    return hypot(px - cx, py - cy)
+}
+
 
 // MARK: - 批注窗口
 
@@ -1681,6 +1753,12 @@ final class AnnotationView: NSView {
             }
         }
 
+        labelObstacles = []
+        for it in items {
+            if case .pin(let p) = it {
+                labelObstacles.append(LayoutRect(x: Double(p.x) - 12, y: Double(p.y) - 12, w: 24, h: 24))
+            }
+        }
         for it in items {
             if case .box(let b) = it, b.shape == "spotlight" {
                 drawSpotlight(rect: pxRect(b.x, b.y, b.w, b.h), color: colorNamed(b.color), width: b.width, dim: true)
@@ -1751,10 +1829,6 @@ final class AnnotationView: NSView {
         (n as NSString).draw(at: NSPoint(x: pt.x - nsize.width / 2, y: pt.y - nsize.height / 2),
                              withAttributes: nattr)
 
-        // 坐标气泡
-        drawBubble(text: "⌗\(p.id)  \(p.x),\(p.y)", at: NSPoint(x: pt.x + 12, y: pt.y + 10))
-
-        // 信息签:备注 / 钉所在窗口(按坐标定位,可能≠前台主窗) / 前台应用 / OCR 近邻首行
         var lines: [String] = []
         if let n = p.note {
             lines.append("✎ " + (n.count > 34 ? String(n.prefix(34)) + "…" : n))
@@ -1768,10 +1842,46 @@ final class AnnotationView: NSView {
             let first = p.ocrNearby.components(separatedBy: " | ").first ?? ""
             lines.append("ocr: " + (first.count > 34 ? String(first.prefix(34)) + "…" : first))
         }
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let bubbleText = "⌗\(p.id)  \(p.x),\(p.y)"
+        let bf = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let bsize = (bubbleText as NSString).size(withAttributes: [.font: bf])
+        var specs = [LayoutCallout(id: 0, ax: Double(p.x), ay: Double(p.y),
+                                   w: Double(bsize.width + 12) * sx, h: Double(bsize.height + 4) * sy)]
         if !lines.isEmpty {
-            let h = CGFloat(lines.count) * 18 + 8
-            drawSign(lines: lines, at: NSPoint(x: pt.x + 12, y: pt.y - 8 - h))
+            let sf = NSFont.systemFont(ofSize: 12)
+            let wid = lines.map { ($0 as NSString).size(withAttributes: [.font: sf]).width }.max() ?? 0
+            specs.append(LayoutCallout(id: 1, ax: Double(p.x), ay: Double(p.y),
+                                       w: Double(wid + 16) * sx,
+                                       h: Double(18 * lines.count + 8) * sy))
         }
+        let boundsPx = LayoutRect(x: 0, y: 0, w: Double(bounds.width) * sx, h: Double(bounds.height) * sy)
+        for box in layoutCallouts(specs, obstacles: labelObstacles, bounds: boundsPx) {
+            labelObstacles.append(LayoutRect(x: box.x, y: box.y, w: box.w, h: box.h))
+            let vr = viewRectFromPx(box.x, box.y, box.w, box.h)
+            if box.leader { drawLeader(from: pt, to: vr) }
+            if box.id == 0 { drawBubble(text: bubbleText, at: vr.origin) }
+            else { drawSign(lines: lines, at: vr.origin) }
+        }
+    }
+
+    func viewRectFromPx(_ x: Double, _ y: Double, _ w: Double, _ h: Double) -> NSRect {
+        let sx = controller?.scale ?? 1
+        let sy = controller?.scaleY ?? sx
+        let origin = pxToPt(Int(x.rounded()), Int((y + h).rounded()))
+        return NSRect(x: origin.x, y: origin.y, width: CGFloat(w / sx), height: CGFloat(h / sy))
+    }
+
+    func drawLeader(from pt: NSPoint, to rect: NSRect) {
+        let x = min(max(pt.x, rect.minX), rect.maxX)
+        let y = min(max(pt.y, rect.minY), rect.maxY)
+        NSColor.white.withAlphaComponent(0.85).setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1
+        path.move(to: pt)
+        path.line(to: NSPoint(x: x, y: y))
+        path.stroke()
     }
 
     /// 箭头:深色描边托底 + 线 + 三角头
@@ -2242,6 +2352,8 @@ final class AnnotationView: NSView {
         flashBubble("JSON 已复制(\(items.count) 笔)")
     }
     @objc func doneNow() { controller?.finish(copyToPasteboard: true) }
+
+    var labelObstacles: [LayoutRect] = []
 
     var flashText: String?
     var flashUntil = Date.distantPast
