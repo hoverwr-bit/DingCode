@@ -9,6 +9,7 @@
 //
 
 import AppKit
+import AVFoundation
 import Carbon
 import Carbon.HIToolbox
 import Vision
@@ -440,9 +441,56 @@ final class BridgeServer {
             let copy = positions
             RunLoop.main.perform { [weak self] in self?.onTrack?(copy) }
             return (json(["ok": 1]), false)
+        case ("POST", "/voice"):
+            lock.lock()
+            let voiceOk = req.query["token"].map { clients.values.contains($0) } ?? false
+            lock.unlock()
+            guard voiceOk else {
+                return (plain(403, "bad token"), false)
+            }
+            let text = BridgeServer.transcribe(body: req.body)
+            return (plain(200, text), false)
         default:
             return (plain(404, "not found"), false)
         }
+    }
+
+    static func transcribe(body: Data) -> String {
+        let dir = FileManager.default.temporaryDirectory
+        let raw = dir.appendingPathComponent("dingai-voice-in")
+        try? body.write(to: raw)
+        var wav = raw
+        if body.prefix(4) != Data("RIFF".utf8), let ffmpeg = ProcessInfo.processInfo.environment["DINGAI_FFMPEG"]
+            ?? (FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/ffmpeg") ? "/opt/homebrew/bin/ffmpeg" : nil)
+            ?? (FileManager.default.isExecutableFile(atPath: "/usr/local/bin/ffmpeg") ? "/usr/local/bin/ffmpeg" : nil) {
+            wav = dir.appendingPathComponent("dingai-voice.wav")
+            let ff = Process()
+            ff.executableURL = URL(fileURLWithPath: ffmpeg)
+            ff.arguments = ["-y", "-i", raw.path, "-ar", "16000", "-ac", "1", wav.path]
+            ff.standardOutput = Pipe(); ff.standardError = Pipe()
+            try? ff.run(); ff.waitUntilExit()
+        }
+        return BridgeServer.transcribeFile(wav)
+    }
+
+    static func transcribeFile(_ url: URL) -> String {
+        let env = ProcessInfo.processInfo.environment
+        let bin = env["DINGAI_WHISPER"] ?? ""
+        let model = env["DINGAI_WHISPER_MODEL"] ?? ""
+        var lang = env["DINGAI_WHISPER_LANG"] ?? "zh"
+        if !["zh", "en", "vi"].contains(lang) { lang = "zh" }
+        guard !bin.isEmpty, !model.isEmpty, FileManager.default.isExecutableFile(atPath: bin) else { return "" }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: bin)
+        proc.arguments = ["-m", model, "-f", url.path, "-l", lang, "-nt"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return "" }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     private func clientValid(_ id: Int, _ token: String) -> Bool {
@@ -1966,8 +2014,54 @@ final class AnnotationView: NSView {
         case UInt16(kVK_ANSI_B): setPinKind("bug")
         case UInt16(kVK_ANSI_C): setPinKind("change")
         case UInt16(kVK_ANSI_Q): setPinKind("question")
+        case UInt16(kVK_ANSI_V) where !event.isARepeat: startVoice()
         default: super.keyDown(with: event)
         }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_ANSI_V) {
+            appendVoice(stopVoice())
+            return
+        }
+        super.keyUp(with: event)
+    }
+
+    var voiceRecorder: AVAudioRecorder?
+    var voiceURL: URL?
+
+    func startVoice() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("dingai-hold.wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+        ]
+        voiceURL = url
+        voiceRecorder = try? AVAudioRecorder(url: url, settings: settings)
+        voiceRecorder?.record()
+    }
+
+    func stopVoice() -> String {
+        voiceRecorder?.stop()
+        voiceRecorder = nil
+        guard let url = voiceURL else { return "" }
+        return BridgeServer.transcribeFile(url)
+    }
+
+    func appendVoice(_ text: String) {
+        guard !text.isEmpty else { return }
+        var idx = selectedIndex
+        if idx == nil {
+            idx = items.lastIndex { if case .pin = $0 { return true }; return false }
+        }
+        guard let idx, items.indices.contains(idx), case .pin(var pin) = items[idx] else { return }
+        let note = pin.note ?? ""
+        pin.note = note.isEmpty ? text : note + " " + text
+        items[idx] = .pin(pin)
+        needsDisplay = true
     }
 
     func beginTextEditing(at p: NSPoint) {

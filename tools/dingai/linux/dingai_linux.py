@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ from core.layout import layout_callouts
 from core.redact import hits, redact_note
 from core.schema import normalize_note
 from core.sync import load_settings, publish_note
+from core.voice import transcribe
 
 PIN_TYPES = ("bug", "change", "question")
 
@@ -270,6 +272,34 @@ class Session:
         self.pin_type = "bug"
         self.next_id = 1
         self.drag_from = None
+        self.voice = None
+        self.voice_wav = ""
+
+    def start_voice(self):
+        if self.voice is not None or not shutil.which("arecord"):
+            return
+        handle = tempfile.NamedTemporaryFile(prefix="dingai-voice-", suffix=".wav", delete=False)
+        self.voice_wav = handle.name
+        handle.close()
+        self.voice = subprocess.Popen(
+            ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", self.voice_wav],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def stop_voice(self):
+        proc = self.voice
+        self.voice = None
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        text = transcribe(self.voice_wav) if self.voice_wav else ""
+        if text and self.pins:
+            note = self.pins[-1].get("note") or ""
+            self.pins[-1]["note"] = (note + " " + text).strip()
+        return text
 
     def add_pin(self, x, y, note=""):
         anchor = atspi_at_point(x, y) or {"kind": "viewport", "dx": 0, "dy": 0}
@@ -339,7 +369,7 @@ def notice_banner(path=None):
 
 
 def toolbar_title(pins=None, banner=""):
-    base = "DingAI pins %d" % pins if pins is not None else "DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done"
+    base = "DingAI pins %d" % pins if pins is not None else "DingAI  p pin  b/c/q type  a arrow  r box  s spot  hold v  Esc done"
     if banner:
         return (base + " | " + banner)[:240]
     return base
@@ -369,7 +399,7 @@ def run_toolbar():
     if banner:
         print(banner, file=sys.stderr)
     lib.XStoreName(display, window, toolbar_title(banner=banner).encode())
-    lib.XSelectInput(display, window, (1 << 0) | (1 << 2))
+    lib.XSelectInput(display, window, (1 << 0) | (1 << 1) | (1 << 2))
     lib.XMapWindow(display, window)
     lib.XFlush(display)
     session = Session()
@@ -417,6 +447,12 @@ def run_toolbar():
                 session.pin_type = "change"
             elif keysym in (ord("q"),):
                 session.pin_type = "question"
+            elif keysym in (ord("v"), ord("V")):
+                session.start_voice()
+        if kind == 3:  # KeyRelease
+            keysym = _keysym(lib, display, event)
+            if keysym in (ord("v"), ord("V")):
+                session.stop_voice()
             elif keysym in (ord("a"),):
                 armed = "arrow"
                 session.drag_from = None

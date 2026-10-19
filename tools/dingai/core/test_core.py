@@ -5,6 +5,7 @@ import unittest
 
 from core.layout import layout_callouts
 from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
+from core.voice import transcribe
 from core.schema import normalize_note, normalize_pin
 from core.sync import folder_set_status, list_folder_pins, publish_folder
 
@@ -232,6 +233,34 @@ class RedactTests(unittest.TestCase):
         self.assertEqual((width, height), (8, 8))
         self.assertGreater(rgb[0], 0)
         self.assertGreater(rgb[2], 0)
+
+
+class VoiceTests(unittest.TestCase):
+    def test_transcribe_uses_a_local_binary_for_zh_en_vi(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, "whisper-cli")
+            with open(binary, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nprintf '%s' \"$6\"\n")
+            os.chmod(binary, 0o755)
+            wav = os.path.join(tmp, "in.wav")
+            with open(wav, "wb") as fh:
+                fh.write(b"RIFF")
+            old = {key: os.environ.get(key) for key in ("DINGAI_WHISPER", "DINGAI_WHISPER_MODEL", "DINGAI_WHISPER_LANG")}
+            os.environ["DINGAI_WHISPER"] = binary
+            os.environ["DINGAI_WHISPER_MODEL"] = wav
+            os.environ["DINGAI_WHISPER_LANG"] = "vi"
+            try:
+                self.assertEqual(transcribe(wav), "vi")
+                self.assertEqual(transcribe(wav, lang="en"), "en")
+                self.assertEqual(transcribe(wav, lang="zh"), "zh")
+                self.assertEqual(transcribe(wav, lang="fr"), "zh")
+                self.assertEqual(transcribe(os.path.join(tmp, "missing.wav")), "")
+            finally:
+                for key, value in old.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
 
 if __name__ == "__main__":

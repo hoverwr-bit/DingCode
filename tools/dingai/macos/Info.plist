@@ -22,5 +22,7 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>DingAI records a short note on this Mac and transcribes it locally.</string>
 </dict>
 </plist>

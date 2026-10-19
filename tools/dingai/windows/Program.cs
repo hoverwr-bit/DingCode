@@ -50,6 +50,7 @@ namespace DingAIWin;
 
 internal static class Win32
 {
+    [DllImport("winmm.dll", CharSet = CharSet.Unicode)] public static extern int mciSendString(string command, StringBuilder ret, int retLen, IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -125,6 +126,7 @@ internal class Controller
     public System.Drawing.Bitmap Shot;
     public string ShotFile;
     public List<OcrText> Ocr = new();
+    string VoiceWav = "";
     public volatile bool OcrDone;
     public List<WinCand> WinCands = new();
     public int ScreenW, ScreenH;   // 物理像素
@@ -360,6 +362,56 @@ internal class Controller
                 return c;
         }
         return null;
+    }
+
+    public void StartVoice()
+    {
+        try
+        {
+            VoiceWav = Path.Combine(Path.GetTempPath(), "dingai-hold.wav");
+            var sink = new StringBuilder(8);
+            Native.mciSendString("close dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("open new type waveaudio alias dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("record dingai", sink, sink.Capacity, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    public string StopVoice()
+    {
+        try
+        {
+            var sink = new StringBuilder(8);
+            Native.mciSendString("stop dingai", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("save dingai \"" + VoiceWav + "\"", sink, sink.Capacity, IntPtr.Zero);
+            Native.mciSendString("close dingai", sink, sink.Capacity, IntPtr.Zero);
+        }
+        catch { return ""; }
+        return TranscribeWav(VoiceWav);
+    }
+
+    static string TranscribeWav(string wav)
+    {
+        var bin = Environment.GetEnvironmentVariable("DINGAI_WHISPER");
+        var model = Environment.GetEnvironmentVariable("DINGAI_WHISPER_MODEL");
+        var lang = Environment.GetEnvironmentVariable("DINGAI_WHISPER_LANG") ?? "zh";
+        if (lang != "zh" && lang != "en" && lang != "vi") lang = "zh";
+        if (string.IsNullOrEmpty(bin) || string.IsNullOrEmpty(model) || !File.Exists(wav)) return "";
+        try
+        {
+            var info = new ProcessStartInfo(bin, "-m \"" + model + "\" -f \"" + wav + "\" -l " + lang + " -nt")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var proc = Process.Start(info);
+            if (proc == null) return "";
+            var text = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(20000);
+            return proc.ExitCode == 0 ? text.Trim() : "";
+        }
+        catch { return ""; }
     }
 
     public void Finish(bool clipboard)
@@ -978,6 +1030,7 @@ internal class AnnoCanvas : Canvas
         MouseMove += OnMove;
         MouseLeftButtonUp += OnUp;
         KeyDown += OnKey;
+        KeyUp += OnKeyUp;
         MouseEnter += (s, e) => Keyboard.Focus(this);
         Loaded += (s, e) => { InstallToolbar(); Keyboard.Focus(this); };
         SizeChanged += (s, e) => { if (Bg != null) { Bg.Width = e.NewSize.Width; Bg.Height = e.NewSize.Height; } };
@@ -1029,6 +1082,17 @@ internal class AnnoCanvas : Canvas
         else if (e.Key == Key.B) NextPinType = "bug";
         else if (e.Key == Key.C) NextPinType = "change";
         else if (e.Key == Key.Q) NextPinType = "question";
+        else if (e.Key == Key.V && !e.IsRepeat) C.StartVoice();
+    }
+
+    void OnKeyUp(object s, KeyEventArgs e)
+    {
+        if (e.Key != Key.V) return;
+        var text = C.StopVoice();
+        if (string.IsNullOrEmpty(text)) return;
+        var pin = Items.LastOrDefault(it => it is PinItem) as PinItem;
+        if (pin == null) return;
+        pin.Pin.Note = string.IsNullOrEmpty(pin.Pin.Note) ? text : pin.Pin.Note + " " + text;
     }
 
     public void AddPin(Point p)
