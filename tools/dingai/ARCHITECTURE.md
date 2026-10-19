@@ -12,7 +12,7 @@ DingAI is one tool inside AI-toolbox. Each desktop client is still one program w
 | `macos/build.sh`, `macos/Info.plist` | Build and bundle. Bundle id `io.github.dingai.mac`. Minimum macOS 14. |
 | `windows/Program.cs`, `windows/DingAIWin.csproj` | Same desktop contract on WPF. One source file, namespace `DingAIWin`. |
 | `web/anno.js` | One IIFE injected into a page. No build step. |
-| `linux/dingai_linux.py` | Linux session. X11 overlay, Wayland still capture when `grim` exists, AT-SPI anchors, Tesseract OCR. Imports `core/`. |
+| `linux/dingai_linux.py` | Linux session. X11 toolbar, Wayland still capture when `grim` exists, AT-SPI anchors, Tesseract OCR. Imports `core/`. |
 | `core/` | Schema, label placement, folder sync, team HTTP client. Standard library only. |
 | `team-server/dingai_team_server.py` | Opt-in team server. Standard library and SQLite. Same process serves the old note API and the account API. |
 | `probes/*.swift` | One-off diagnostics. Not part of the app. |
@@ -33,7 +33,7 @@ Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinnin
 
 ## Linux
 
-`dingai_linux.py` is one Python program. It opens an X11 toolbar window and records pins from the pointer without keeping a frozen frame. Anchors come from AT-SPI over the session bus (`busctl`) when that bus is up. OCR shells out to the `tesseract` binary. On Wayland, a still capture uses `grim` when it is installed; the interactive overlay needs X11 or XWayland. Export, placement, and sync go through `core/`. Failures in capture, OCR, or AT-SPI are skipped and written into the note as empty fields.
+`dingai_linux.py` is one Python program. A small X11 toolbar grabs the pointer to drop a pin, so the app underneath keeps working, and the screenshot is taken when the session ends. Anchors come from AT-SPI over the session bus (`busctl`) when that bus is up. OCR shells out to the `tesseract` binary. On Wayland, a still capture uses `grim` when it is installed; the interactive toolbar needs X11 or XWayland. Export, placement, and sync go through `core/`. Failures in capture, OCR, or AT-SPI are skipped and written into the note as empty fields.
 
 ## Web
 
