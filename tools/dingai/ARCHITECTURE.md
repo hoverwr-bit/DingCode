@@ -1,6 +1,8 @@
 # DingAI architecture
 
-DingAI is one tool inside AI-toolbox. Each client is a single self-contained program. They share a JSON contract, not a library, framework, or runtime. Change a client by editing that client's existing file and following its patterns. Do not add a shared module, a new app framework, or a dependency unless the feature cannot be done any other way; say why in the pull request.
+DingAI is one tool inside AI-toolbox. Each desktop client is still one program with its own UI toolkit. They share the JSON contract in this file.
+
+`core/` is a Python standard-library package for the pieces that would otherwise be copied into a third language with nothing to test: the note schema (including pin type and status), label placement, and team sync (HTTP and a shared folder). The Linux client and `handoff.py` import it. The macOS and Windows apps do not embed Python; they write the same field names in their existing JSON builders. That split is deliberate: a Swift or C# rewrite onto a new runtime would be a second architecture. Do not add a package, framework, or UI toolkit beyond this.
 
 ## Layout
 
@@ -10,7 +12,9 @@ DingAI is one tool inside AI-toolbox. Each client is a single self-contained pro
 | `macos/build.sh`, `macos/Info.plist` | Build and bundle. Bundle id `io.github.dingai.mac`. Minimum macOS 14. |
 | `windows/Program.cs`, `windows/DingAIWin.csproj` | Same desktop contract on WPF. One source file, namespace `DingAIWin`. |
 | `web/anno.js` | One IIFE injected into a page. No build step. |
-| `team-server/dingai_team_server.py` | Optional opt-in collector. Python standard library only. |
+| `linux/dingai_linux.py` | Linux session. X11 overlay, Wayland still capture when `grim` exists, AT-SPI anchors, Tesseract OCR. Imports `core/`. |
+| `core/` | Schema, label placement, folder sync, team HTTP client. Standard library only. |
+| `team-server/dingai_team_server.py` | Opt-in team server. Standard library and SQLite. Same process serves the old note API and the account API. |
 | `probes/*.swift` | One-off diagnostics. Not part of the app. |
 
 ## macOS
@@ -25,7 +29,11 @@ Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinnin
 
 ## Windows
 
-`Program.cs` mirrors the macOS session: tray icon, `Ctrl+Alt+A`, frozen screenshot, `AnnoCanvas` mouse handlers, the same JSON fields. Window hit-testing walks `WinCands` front to back. OCR uses the Windows.Media.Ocr API. There is no page bridge on Windows.
+`Program.cs` mirrors the macOS session: tray icon, `Ctrl+Alt+A`, `AnnoCanvas` mouse handlers, the same JSON fields. The default session is live: the overlay is clear, the screenshot is taken in `Finish` after the window hides, and UI Automation supplies the pin anchor when that assembly is present. `DINGAI_LIVE=0` keeps the frozen screenshot. Window hit-testing walks `WinCands` front to back. OCR uses the Windows.Media.Ocr API. There is no page bridge on Windows. Team upload uses `DINGAI_TEAM_URLS` and `DINGAI_TEAM_TOKEN`, the same names as macOS. A shared folder uses `DINGAI_SHARE_DIR`.
+
+## Linux
+
+`dingai_linux.py` is one Python program. It opens an X11 toolbar window and records pins from the pointer without keeping a frozen frame. Anchors come from AT-SPI over the session bus (`busctl`) when that bus is up. OCR shells out to the `tesseract` binary. On Wayland, a still capture uses `grim` when it is installed; the interactive overlay needs X11 or XWayland. Export, placement, and sync go through `core/`. Failures in capture, OCR, or AT-SPI are skipped and written into the note as empty fields.
 
 ## Web
 
@@ -33,13 +41,15 @@ Errors use `try?`, empty results, and `NSLog`. The app does not crash the pinnin
 
 ## Team server
 
-`dingai_team_server.py` serves `ThreadingHTTPServer`. `POST /api/note` stores a JSON body, `POST /api/shot/<file>` stores a PNG, and `GET /` is the board. Paths are sanitized with `os.path.basename`. There is no authentication; bind it to a trusted network. Host and port come from `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT`, falling back to `ANNO_TEAM_*`, then `127.0.0.1:8050`.
+`dingai_team_server.py` serves `ThreadingHTTPServer`. `POST /api/note` still stores a JSON body, `POST /api/shot/<file>` stores a PNG, and `GET /` is the board. Paths are sanitized with `os.path.basename`. SQLite (`sqlite3`) holds users, projects, pins, and comments under `DINGAI_TEAM_ROOT` (default `~/anno-team`). Tokens are random bearer tokens, stored only as SHA-256. Roles are `admin`, `member`, and `viewer`. The first launch creates an admin and prints the token once, unless `DINGAI_TEAM_ADMIN_TOKEN` is already set. `DINGAI_TEAM_REQUIRE_AUTH=1` rejects anonymous note upload; the default stays open so older clients keep working. Host and port come from `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT`, falling back to `ANNO_TEAM_*`, then `127.0.0.1:8050`. The process speaks HTTP. TLS belongs in a reverse proxy; see `team-server/DEPLOY.md`. There is no telemetry.
+
+Shared-folder sync, used when there is no server, writes one JSON file per pin under `<dir>/projects/<project>/pins/` with a temp file and `os.replace`. Screenshots sit next to the note id. Clients choose `local`, `folder`, or `server` in `~/DingAI/settings.json` (`mode`, `share_dir`, `server_url`, `project`). Environment variables override the file. Missing settings mean local-only.
 
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_compat` is `anno-desktop-v1`. Existing fields stay:
 
-- `pins[]`: `id`, `x_px`, `y_px` (screenshot pixels, top-left origin), `ocr_nearby`, optional `note`, optional `window` `{owner, title}`, optional `window_nx` / `window_ny`, optional `page` from the bridge.
+- `pins[]`: `id`, `x_px`, `y_px` (screenshot pixels, top-left origin), `ocr_nearby`, optional `note`, optional `window` `{owner, title}`, optional `window_nx` / `window_ny`, optional `page` from the bridge. Optional `pin_type` is `bug` (default), `change`, or `question`. Optional `status` is `open` (default), `ai-fixed`, or `confirmed`. Optional `assignee`.
 - `arrows[]`: `id`, `from_px`, `to_px`, `color`, `width`.
 - `boxes[]`: `id`, `rect_px` `[x, y, w, h]`, `color`, `width`, optional `shape` (`rect`, `ellipse`, or `spotlight`), optional `note`.
 - `labels[]` (optional): `id`, `x_px`, `y_px`, `w_px`, `h_px`, `text`, `color`. Web text is a `mark.type` of `text` on the existing annotation, not this array.
@@ -57,5 +67,5 @@ New fields are optional and must not rename or remove these. The web export is a
 - Keep the file's naming and control flow: new overlay behavior is another branch in the existing mouse and draw methods, not a new view hierarchy.
 - Prefer `try?` and a skipped feature over a new error type.
 - Clipboard and disk output stay local. Network remains the opt-in team upload and the loopback bridge.
-- Do not add Swift packages, NuGet packages, npm packages, or Python dependencies.
-- Tests that can run without AppKit belong next to the client they exercise and call that client's functions. Do not introduce a shared core for that.
+- Do not add Swift packages, NuGet packages, npm packages, or Python dependencies. UI Automation on Windows is the framework assembly, not a NuGet package.
+- Tests that can run without AppKit live in `core/test_core.py`, `handoff_test.py`, and `team-server/test_server.py`. The Linux client imports `core` instead of copying those functions.
