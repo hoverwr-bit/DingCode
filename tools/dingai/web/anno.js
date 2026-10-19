@@ -197,6 +197,7 @@
   tools.addEventListener('click', panelToolsClick);
   var modal = el('div', 'av7modal');
   modal.innerHTML = '<div id="av7card"><h3 id="av7title">添加批注</h3><div id="av7ctx"></div>'
+    + '<label>类型 <select id="av7type"><option value="bug">bug</option><option value="change">change</option><option value="question">question</option></select></label>'
     + '<label>问题描述（含期望结果）<textarea id="av7comment" placeholder="例：此列改为常驻左侧，并增加筛选条件"></textarea></label>'
     + '<div id="av7acts"><button type="button" id="av7cancel">取消</button><button type="button" id="av7save">保存位置批注</button></div></div>';
 
@@ -509,7 +510,7 @@
     annos.forEach(function (a, i) {
       var it = document.createElement('div'); it.className = 'av7item';
       var ae = anchorElOf(a.key), state = ae && ae.getClientRects().length ? '已锚定' : '坐标回退';
-      it.innerHTML = '<strong>A' + pad(i + 1) + '</strong> · ' + esc(a.target)
+      it.innerHTML = '<strong>A' + pad(i + 1) + '</strong> · ' + esc(a.pinType || 'bug') + ' · ' + esc(a.status || 'open') + ' · ' + esc(a.target)
         + (a.field ? ' · <b>' + esc(a.field) + '</b>' : '')
         + '<div>' + esc(a.comment.slice(0, 120)) + '</div>'
         + '<small>' + esc(fmtXY(a.geometry)) + ' · 视口 ' + a.geometry.viewportW + ' · ' + state + '</small>'
@@ -535,6 +536,9 @@
     document.getElementById('av7title').textContent = editing ? '编辑批注' : '添加批注';
     document.getElementById('av7ctx').textContent = targetName(p.key) + '｜' + (p.field ? p.field + '：' + (p.value || '—') + '｜' : '') + fmtXY(p.geometry) + (p.existing ? ('｜更新 ' + p.existing.id) : '');
     document.getElementById('av7comment').value = p.existing ? p.existing.comment : '';
+    var typeEl = document.getElementById('av7type');
+    var current = p.existing && p.existing.pinType;
+    typeEl.value = (current === 'change' || current === 'question' || current === 'bug') ? current : 'bug';
     modal.classList.add('on');
     if (p.field !== undefined) showInfo(p.geometry, p.field, p.value, targetName(p.key));
     setTimeout(function () { document.getElementById('av7comment').focus(); }, 0);
@@ -544,9 +548,13 @@
   document.getElementById('av7save').addEventListener('click', function () {
     var txt = document.getElementById('av7comment').value.trim();
     if (!txt) { alert('问题描述（含期望结果）必填'); return; }
+    var kind = document.getElementById('av7type').value;
+    if (kind !== 'change' && kind !== 'question') kind = 'bug';
     if (pending) {
       if (pending.existing) {
         pending.existing.comment = txt; /* 编辑既有条（钉子/列表进入） */
+        pending.existing.pinType = kind;
+        if (!pending.existing.status) pending.existing.status = 'open';
         if (pending.mark) pending.existing.mark = pending.mark;
       } else {
         /* 契约 v7.1：总是新建，不再按 key 合并 */
@@ -554,6 +562,7 @@
           id: 'A' + pad(++seq), key: pending.key, target: targetName(pending.key), comment: txt,
           geometry: pending.geometry, mark: pending.mark || null, anchor: pending.anchor || null,
           field: pending.field || '', value: pending.value || '',
+          pinType: kind, status: 'open',
           free: pending.key.indexOf('free:') === 0, ts: Date.now(), by: me
         });
       }
@@ -754,6 +763,7 @@
       id: 'A' + pad(++seq), key: key, target: targetName(key), comment: t,
       geometry: { client: { x: page.x - window.scrollX, y: page.y - window.scrollY }, page: { x: mk.x1, y: mk.y1 }, viewportW: window.innerWidth, viewportH: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
       mark: mk, anchor: mk.anchors.a1, field: '', value: '',
+      pinType: 'bug', status: 'open',
       free: key.indexOf('free:') === 0, ts: Date.now(), by: me
     });
     selected = annos.length - 1;
