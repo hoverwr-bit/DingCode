@@ -47,6 +47,8 @@ On a dev build, a pin records `source` `{framework, component, file, line, colum
 
 Shared-folder sync, used when there is no server, writes one JSON file per pin under `<dir>/projects/<project>/pins/` with a temp file and `os.replace`. Screenshots sit next to the note id. Clients choose `local`, `folder`, or `server` in `~/DingAI/settings.json` (`mode`, `share_dir`, `server_url`, `project`). Environment variables override the file. Missing settings mean local-only. `redact` in that file, or `DINGAI_REDACT=1`, blurs screenshots and rewrites OCR text before the note is saved or uploaded. It is off when unset. Patterns live in `core/redact.py` (email, phone, order or PO numbers, prices, plus `~/DingAI/redact-patterns.txt` and `~/DingAI/redact-names.txt`). macOS uses Vision face rectangles. Windows uses `FaceDetector` when that WinRT call succeeds. Linux blurs OCR boxes from Tesseract and, if set, rectangles printed by the local command `DINGAI_FACE_CMD`. Nothing is sent out to detect a face.
 
+Hold V on a desktop client, or the page microphone button, records a short clip and appends local speech-to-text to the pin note. The binary is whisper.cpp (`DINGAI_WHISPER`, `DINGAI_WHISPER_MODEL`). `DINGAI_WHISPER_LANG` is `zh`, `en`, or `vi`. The page posts the clip to `POST /voice` on the existing `127.0.0.1:8763` bridge; it does not call a cloud speech API. If the binary or model is missing, the note is unchanged.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_compat` is `anno-desktop-v1`. Existing fields stay:

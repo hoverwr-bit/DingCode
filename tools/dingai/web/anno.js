@@ -166,9 +166,41 @@
           return '<button type="button" data-style="' + k + '" title="' + AV_STYLES[k].name + '" ' + (i === 0 ? 'class="on"' : '') + '><svg width="30" height="14" viewBox="0 0 30 14">' + ic + '</svg></button>';
         }).join('')
       + '<span class="sep"></span>'
-      + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>';
+      + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>'
+      + '<button type="button" data-voice="1" title="按住说话，本地转写到备注">🎤</button>';
     var head = hostPanel.querySelector('.av7head');
     head.insertAdjacentElement('afterend', row);
+    var voiceBtn = row.querySelector('[data-voice]');
+    var voiceRec = null, voiceChunks = [];
+    if (voiceBtn) {
+      voiceBtn.addEventListener('mousedown', function (ev) {
+        ev.stopPropagation();
+        voiceChunks = [];
+        if (!navigator.mediaDevices) return;
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+          var mime = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/wav')) ? 'audio/wav' : '';
+          voiceRec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+          voiceRec.ondataavailable = function (e) { if (e.data && e.data.size) voiceChunks.push(e.data); };
+          voiceRec.start();
+        }).catch(function () {});
+      });
+      voiceBtn.addEventListener('mouseup', function () {
+        if (!voiceRec) return;
+        var rec = voiceRec; voiceRec = null;
+        rec.onstop = function () {
+          try { rec.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+          var token = (av7bridge && av7bridge.token) || '';
+          fetch('http://127.0.0.1:8763/voice?token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
+            .then(function (r) { return r.text(); })
+            .then(function (text) {
+              text = (text || '').trim();
+              var box = document.getElementById('av7comment');
+              if (box && text) box.value = box.value ? (box.value + ' ' + text) : text;
+            }).catch(function () {});
+        };
+        try { rec.stop(); } catch (e2) {}
+      });
+    }
     return row;
   }
   panelToolsClick = function (e) {
