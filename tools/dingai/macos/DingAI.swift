@@ -51,6 +51,8 @@ struct PinRecord {
     var anchorKey: String?
     var anchorNote: String?
     var scroll: ScrollSample?
+    var pinType: String = "bug"     // bug | change | question
+    var status: String = "open"     // open | ai-fixed | confirmed
 }
 
 struct ArrowRecord {
@@ -987,31 +989,105 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         overlay?.orderOut(nil)
         overlay = nil
         shotCG = nil
-        if let shotCopy { reportToTeam(jsonData: data, shotFile: shotCopy) }
+        reportToTeam(json: json, jsonData: data, noteFile: url, shotFile: shotCopy)
         done?()
     }
 
-    // MARK: 团队账本上报(configurable team server via ANNO_TEAM_URLS,失败静默跳过)
+    // MARK: 团队同步(环境变量或 ~/DingAI/settings.json;失败静默跳过)
 
-    static let teamHosts: [String] = (ProcessInfo.processInfo.environment["DINGAI_TEAM_URLS"] ?? ProcessInfo.processInfo.environment["ANNO_TEAM_URLS"] ?? "").split(separator: ",").map { String($0) }.filter { !$0.isEmpty }   // e.g. DINGAI_TEAM_URLS=http://team-host:8050
+    struct SyncChoice {
+        var mode: String
+        var share: String
+        var hosts: [String]
+        var token: String
+        var project: String
+    }
 
-    func reportToTeam(jsonData: Data, shotFile: URL) {
+    func syncChoice() -> SyncChoice {
+        var mode = "local"
+        var share = ""
+        var server = ""
+        var token = ""
+        var project = "inbox"
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/settings.json")
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let m = obj["mode"] as? String, !m.isEmpty { mode = m }
+            if let s = obj["share_dir"] as? String { share = s }
+            if let s = obj["server_url"] as? String { server = s }
+            if let s = obj["token"] as? String { token = s }
+            if let s = obj["project"] as? String, !s.isEmpty { project = s }
+        }
+        let env = ProcessInfo.processInfo.environment
+        if let m = env["DINGAI_MODE"], !m.isEmpty { mode = m }
+        if let s = env["DINGAI_SHARE_DIR"], !s.isEmpty { share = s }
+        if let s = env["DINGAI_TEAM_URLS"] ?? env["ANNO_TEAM_URLS"], !s.isEmpty { server = s }
+        if let s = env["DINGAI_TEAM_TOKEN"], !s.isEmpty { token = s }
+        if let s = env["DINGAI_PROJECT_NAME"], !s.isEmpty { project = s }
+        if mode == "local" && !share.isEmpty { mode = "folder" }
+        if mode == "local" && !server.isEmpty { mode = "server" }
+        if mode != "folder" && mode != "server" { mode = "local" }
+        let hosts = server.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let safe = project.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: "\\", with: "-")
+        return SyncChoice(mode: mode, share: share, hosts: hosts, token: token, project: safe.isEmpty ? "inbox" : safe)
+    }
+
+    func reportToTeam(json: [String: Any], jsonData: Data, noteFile: URL, shotFile: URL?) {
+        let choice = syncChoice()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            for host in Self.teamHosts {
-                guard let shotName = self.postJson(host, data: jsonData) else { continue }
-                self.postShot(host, name: shotName, file: shotFile)
-                return
+            if choice.mode == "folder", !choice.share.isEmpty {
+                self.publishFolder(choice, json: json, jsonData: jsonData, noteFile: noteFile, shotFile: shotFile)
+            }
+            if choice.mode == "server" {
+                for host in choice.hosts {
+                    guard let shotName = self.postJson(host, data: jsonData, token: choice.token) else { continue }
+                    if let shotFile { self.postShot(host, name: shotName, file: shotFile, token: choice.token) }
+                    return
+                }
             }
         }
     }
 
+    func publishFolder(_ choice: SyncChoice, json: [String: Any], jsonData: Data, noteFile: URL, shotFile: URL?) {
+        let noteId = noteFile.deletingPathExtension().lastPathComponent
+        let base = URL(fileURLWithPath: choice.share).appendingPathComponent("projects").appendingPathComponent(choice.project)
+        atomicWrite(jsonData, to: base.appendingPathComponent("notes").appendingPathComponent(noteId + ".json"))
+        let shotName = shotFile?.lastPathComponent ?? ""
+        if let shotFile, let png = try? Data(contentsOf: shotFile), !shotName.isEmpty {
+            atomicWrite(png, to: base.appendingPathComponent("shots").appendingPathComponent(shotName))
+        }
+        for pin in json["pins"] as? [[String: Any]] ?? [] {
+            var row = pin
+            row["note_id"] = noteId
+            row["project"] = choice.project
+            row["screenshot"] = shotName
+            let pinId = row["id"] ?? 0
+            guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.prettyPrinted, .sortedKeys]) else { continue }
+            atomicWrite(data, to: base.appendingPathComponent("pins").appendingPathComponent("\(noteId)--\(pinId).json"))
+        }
+    }
+
+    func atomicWrite(_ data: Data, to url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let tmp = url.appendingPathExtension("tmp")
+        do {
+            try data.write(to: tmp)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+        } catch { }
+    }
+
     @discardableResult
-    func postJson(_ host: String, data: Data) -> String? {
+    func postJson(_ host: String, data: Data, token: String) -> String? {
         guard let url = URL(string: host + "/api/note") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 6
         req.httpBody = data
         var shotName: String?
@@ -1027,12 +1103,13 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         return shotName
     }
 
-    func postShot(_ host: String, name: String, file: URL) {
+    func postShot(_ host: String, name: String, file: URL, token: String) {
         guard let png = try? Data(contentsOf: file),
               let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: host + "/api/shot/" + enc) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 20
         req.httpBody = png
         let sem = DispatchSemaphore(value: 0)
@@ -1050,7 +1127,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             case .pin(let p):
                 var near = p.ocrNearby
                 if near == "OCR…" { near = ocrNear(x: p.x, y: p.y) }
-                var d: [String: Any] = ["id": p.id, "x_px": p.x, "y_px": p.y, "ocr_nearby": near]
+                var d: [String: Any] = ["id": p.id, "x_px": p.x, "y_px": p.y, "ocr_nearby": near,
+                                        "pin_type": p.pinType, "status": p.status]
                 if let note = p.note { d["note"] = note }
                 if let o = p.windowOwner {
                     d["window"] = ["owner": o, "title": p.windowTitle ?? ""] as [String: Any]
@@ -1117,6 +1195,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "screenshot": shotURL?.lastPathComponent ?? NSNull(),
             "screen_capture_ok": (shotCG != nil),
             "live": live,
+            "project": syncChoice().project,
             "handoff_rules": handoffRules(),
         ]
         return json
@@ -1446,6 +1525,7 @@ final class AnnotationView: NSView {
     var draftTo: NSPoint?
     var hoverPoint: NSPoint?
     var curColor = "red"
+    var pinType = "bug"
     var curWidth = 4
     var drawMode = 1        // 0选择 1箭头 2方框 3椭圆 4聚光 5文字
     var selectedIndex: Int?
@@ -1567,7 +1647,7 @@ final class AnnotationView: NSView {
         let pinId = nextId
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
-                                    windowFrame: win?.frame, pageInfo: nil)))
+                                    windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
         let idx = items.count - 1
         nextId += 1
         selectedIndex = idx
@@ -1699,7 +1779,7 @@ final class AnnotationView: NSView {
         let pinId = nextId
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
-                                    windowFrame: win?.frame, pageInfo: nil)))
+                                    windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
         let idx = items.count - 1
         nextId += 1
         needsDisplay = true
@@ -1745,6 +1825,9 @@ final class AnnotationView: NSView {
         case UInt16(kVK_Escape): controller?.finish(copyToPasteboard: true)
         case UInt16(kVK_ANSI_Z) where event.modifierFlags.contains(.command): undo()
         case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete): deleteSelection()
+        case UInt16(kVK_ANSI_B): setPinKind("bug")
+        case UInt16(kVK_ANSI_C): setPinKind("change")
+        case UInt16(kVK_ANSI_Q): setPinKind("question")
         default: super.keyDown(with: event)
         }
     }
@@ -1753,6 +1836,14 @@ final class AnnotationView: NSView {
         textAnchor = p
         beginNoteEditing(pinIndex: -1, at: p)
         noteField?.placeholderString = "文字:回车确认"
+    }
+
+    func setPinKind(_ kind: String) {
+        pinType = kind
+        guard let idx = selectedIndex, items.indices.contains(idx), case .pin(var p) = items[idx] else { return }
+        p.pinType = kind
+        items[idx] = .pin(p)
+        needsDisplay = true
     }
 
     func deleteSelection() {
