@@ -8,3 +8,5 @@ shots/
 *.p12
 *.pem
 *.cer
+__pycache__/
+*.pyc
