@@ -56,6 +56,10 @@ After a pin is marked ai-fixed, `handoff.py verify before.png after.png outdir` 
 
 `core/export.py` is the exporter registry. `markdown` writes a checklist. `github` posts one GitHub issue only when `GITHUB_TOKEN` (or `GH_TOKEN`) and `DINGAI_GITHUB_REPO` are set; otherwise it writes `github-issue.md` and does not open a connection. Another system (Jira, Feishu) is a `register_exporter(name, fn)` call. `handoff.py export <name> note.json dest` is the command. The page has a checklist download of the same shape.
 
+UI strings for `zh`, `en`, and `vi` live in `i18n/strings.json`. `DINGAI_LANG` selects one. The page also reads `localStorage['dingai-lang']`. macOS copies the catalog into the app bundle. Windows copies it next to the executable.
+
+`VERSION` is the release version. `handoff.py update` and the Linux client check GitHub releases only when `DINGAI_UPDATE=1`. That request sends no machine id and does not download a build. Signing and notarization are in `RELEASE.md`. The release workflow uses GitHub Actions secrets and skips signing when those secrets are absent. No certificate is stored in the tree.
+
 ## JSON contract
 
 Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. `schema_compat` is `anno-desktop-v1`. Existing fields stay:

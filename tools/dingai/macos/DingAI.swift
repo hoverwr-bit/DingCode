@@ -10,6 +10,17 @@
 
 import AppKit
 import AVFoundation
+
+func dingaiText(_ key: String) -> String {
+    let env = ProcessInfo.processInfo.environment["DINGAI_LANG"] ?? "zh"
+    let lang = (env == "en" || env == "vi") ? env : "zh"
+    let url = Bundle.main.url(forResource: "strings", withExtension: "json")
+        ?? URL(fileURLWithPath: "strings.json")
+    guard let data = try? Data(contentsOf: url),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]],
+          let row = obj[key] else { return key }
+    return row[lang] ?? row["zh"] ?? key
+}
 import Carbon
 import Carbon.HIToolbox
 import Vision
@@ -1902,7 +1913,7 @@ final class AnnotationView: NSView {
         let fx = min(p.x + 14, bounds.width - 240)
         let fy = min(max(p.y - 30, 8), bounds.height - 34)
         let f = NSTextField(frame: NSRect(x: fx, y: fy, width: 226, height: 26))
-        f.placeholderString = "备注:回车确认,Esc 跳过"
+        f.placeholderString = dingaiText("note")
         f.bezelStyle = .roundedBezel
         f.font = .systemFont(ofSize: 13)
         f.backgroundColor = .white

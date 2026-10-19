@@ -16,6 +16,7 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py verify <before.png> <after.png> <outdir>
   python3 handoff.py confirm <note_id> <pin_id>
   python3 handoff.py reopen <note_id> <pin_id>
+  python3 handoff.py update                 # only contacts GitHub when DINGAI_UPDATE=1
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
 """
 
@@ -467,6 +468,14 @@ def main(argv):
     if cmd in ("-h", "--help", "help"):
         sys.stdout.write(__doc__ or "")
         return 0
+    if cmd == "update":
+        from core.update import check_update
+        try:
+            result = check_update()
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
     if cmd == "rules":
         sys.stdout.write(load_rules() + "\n")
         return 0

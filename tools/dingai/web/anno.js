@@ -13,6 +13,42 @@
   if (new URLSearchParams(location.search).get('qa') === '1') return;
   var LS_KEY = 'anno-v7:' + location.pathname;
   var mode = false, annos = [], seq = 0, me = 'admin', stepMode = false;
+  /* @i18n-start */
+  var STRINGS = {"unlock":{"zh":"开启 DingAI","en":"Enable DingAI","vi":"Bật DingAI"},"add":{"zh":"添加批注","en":"Add pin","vi":"Thêm ghim"},"edit":{"zh":"编辑批注","en":"Edit pin","vi":"Sửa ghim"},"save":{"zh":"保存","en":"Save","vi":"Lưu"},"cancel":{"zh":"取消","en":"Cancel","vi":"Hủy"},"clear":{"zh":"清空","en":"Clear","vi":"Xóa hết"},"copy":{"zh":"复制 JSON","en":"Copy JSON","vi":"Sao chép JSON"},"needComment":{"zh":"问题描述（含期望结果）必填","en":"A description is required","vi":"Cần mô tả vấn đề"},"confirmClear":{"zh":"确定清空本页全部批注？","en":"Clear every pin on this page?","vi":"Xóa mọi ghim trên trang này?"},"select":{"zh":"选择、移动、缩放","en":"Select, move, resize","vi":"Chọn, di chuyển, đổi cỡ"},"pin":{"zh":"点选批注","en":"Drop a pin","vi":"Ghim một điểm"},"arrow":{"zh":"箭头","en":"Arrow","vi":"Mũi tên"},"box":{"zh":"方框","en":"Box","vi":"Khung"},"ellipse":{"zh":"椭圆","en":"Ellipse","vi":"Elip"},"spot":{"zh":"聚光灯","en":"Spotlight","vi":"Đèn chiếu"},"text":{"zh":"文字标签","en":"Text","vi":"Chữ"},"undo":{"zh":"撤销","en":"Undo","vi":"Hoàn tác"},"voice":{"zh":"按住说话","en":"Hold to speak","vi":"Giữ để nói"},"steps":{"zh":"逐步记录","en":"Record steps","vi":"Ghi các bước"},"export":{"zh":"导出清单","en":"Export checklist","vi":"Xuất danh sách"},"note":{"zh":"备注:回车确认,Esc 跳过","en":"Note: Return confirms, Esc skips","vi":"Ghi chú: Enter xác nhận, Esc bỏ qua"},"toolbar":{"zh":"DingAI  p 钉  g 步骤  按住 v 说话  Esc 完成","en":"DingAI  p pin  g steps  hold v to speak  Esc done","vi":"DingAI  p ghim  g các bước  giữ v để nói  Esc xong"}};
+  function uiLang() {
+    var value = (typeof window !== 'undefined' && window.DINGAI_LANG) || '';
+    try { value = value || localStorage.getItem('dingai-lang') || ''; } catch (e) {}
+    if (!value && typeof navigator !== 'undefined') value = navigator.language || '';
+    value = String(value || 'zh').toLowerCase().slice(0, 2);
+    return (value === 'en' || value === 'vi') ? value : 'zh';
+  }
+  function t(key) {
+    var row = STRINGS[key] || {};
+    return row[uiLang()] || row.zh || key;
+  }
+  /* @i18n-end */
+  function applyChrome() {
+    var titles = { select: 'select', point: 'pin', arrow: 'arrow', box: 'box', ellipse: 'ellipse', spot: 'spot', text: 'text' };
+    Object.keys(titles).forEach(function (tool) {
+      var btn = document.querySelector('[data-tool="' + tool + '"]');
+      if (btn) btn.title = t(titles[tool]);
+    });
+    var extra = { undo: 'undo', voice: 'voice', steps: 'steps', export: 'export' };
+    Object.keys(extra).forEach(function (name) {
+      var btn = document.querySelector('[data-' + name + ']') || document.querySelector('[data-voice]');
+      if (name === 'undo') btn = document.querySelector('[data-undo]');
+      if (name === 'voice') btn = document.querySelector('[data-voice]');
+      if (name === 'steps') btn = document.querySelector('[data-steps]');
+      if (name === 'export') btn = document.querySelector('[data-export]');
+      if (btn) btn.title = t(extra[name]);
+    });
+    var copy = document.getElementById('av7copy'); if (copy) copy.textContent = t('copy');
+    var clear = document.getElementById('av7clear'); if (clear) clear.textContent = t('clear');
+    var save = document.getElementById('av7save'); if (save) save.textContent = t('save');
+    var cancel = document.getElementById('av7cancel'); if (cancel) cancel.textContent = t('cancel');
+    var unlock = document.getElementById('av7unlock');
+    if (unlock) { unlock.title = t('unlock'); unlock.textContent = '✎ ' + t('unlock'); }
+  }
   var oldBtn = document.getElementById('annotationLaunch');
   if (oldBtn) oldBtn.style.display = 'none';
 
@@ -243,6 +279,7 @@
   panel.innerHTML = '<div class="av7head">DingAI（页面）<button type="button" id="av7exit">退出批注</button><button type="button" id="av7hide">收起</button></div><div id="av7list"></div>'
     + '<div id="av7foot"><button type="button" id="av7copy">复制 JSON</button><button type="button" id="av7clear">清空</button></div>';
   tools = buildTools(panel);
+  applyChrome();
   tools.addEventListener('click', panelToolsClick);
   var modal = el('div', 'av7modal');
   modal.innerHTML = '<div id="av7card"><h3 id="av7title">添加批注</h3><div id="av7ctx"></div>'
@@ -611,7 +648,7 @@
 
   function openModal(p, editing) {
     pending = p;
-    document.getElementById('av7title').textContent = editing ? '编辑批注' : '添加批注';
+    document.getElementById('av7title').textContent = editing ? t('edit') : t('add');
     document.getElementById('av7ctx').textContent = targetName(p.key) + '｜' + (p.field ? p.field + '：' + (p.value || '—') + '｜' : '') + fmtXY(p.geometry) + (p.existing ? ('｜更新 ' + p.existing.id) : '');
     document.getElementById('av7comment').value = p.existing ? p.existing.comment : '';
     var typeEl = document.getElementById('av7type');
@@ -625,7 +662,7 @@
 
   document.getElementById('av7save').addEventListener('click', function () {
     var txt = document.getElementById('av7comment').value.trim();
-    if (!txt) { alert('问题描述（含期望结果）必填'); return; }
+    if (!txt) { alert(t('needComment')); return; }
     var kind = document.getElementById('av7type').value;
     if (kind !== 'change' && kind !== 'question') kind = 'bug';
     if (pending) {
@@ -654,7 +691,7 @@
   document.getElementById('av7cancel').addEventListener('click', closeModal);
   document.getElementById('av7clear').addEventListener('click', function () {
     if (!annos.length) { alert('本页暂无批注'); return; }
-    if (confirm('确定清空本页全部批注？')) { annos = []; saveLocal(); render(); }
+    if (confirm(t('confirmClear'))) { annos = []; saveLocal(); render(); }
   });
   document.getElementById('av7copy').addEventListener('click', function () {
     var text = handoffPrompt(JSON.stringify(exportV7(), null, 2));
@@ -994,8 +1031,8 @@
     var ub = document.createElement('button');
     ub.type = 'button'; ub.id = 'av7unlock';
     ub.setAttribute('data-annotation-ui', 'true');
-    ub.title = '开启 DingAI（管理员）';
-    ub.textContent = '✎ DingAI';
+    ub.title = t('unlock');
+    ub.textContent = '✎ ' + t('unlock');
     ub.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99992;background:#0f172acc;color:#cbd5e1;border:1px solid #334155;border-radius:8px;padding:5px 11px;font:12px sans-serif;cursor:pointer;opacity:.55';
     ub.addEventListener('mouseenter', function () { ub.style.opacity = '1'; });
     ub.addEventListener('mouseleave', function () { ub.style.opacity = '.55'; });

@@ -97,6 +97,22 @@ record BoxRec(int Id, int X, int Y, int W, int H, string Color, int Width)
     public string Shape { get; set; } = "rect";
 }
 record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project, bool Redact);
+
+static class UiText
+{
+    public static string T(string key)
+    {
+        var lang = Environment.GetEnvironmentVariable("DINGAI_LANG") ?? "zh";
+        if (lang != "en" && lang != "vi") lang = "zh";
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "strings.json");
+            var row = (JsonNode.Parse(File.ReadAllText(path)) as JsonObject)?[key] as JsonObject;
+            return row?[lang]?.ToString() ?? row?["zh"]?.ToString() ?? key;
+        }
+        catch { return key; }
+    }
+}
 abstract record Item { public int Id = 0; }
 record PinItem(PinRec Pin) : Item;
 record ArrowItem(ArrowRec A) : Item;
@@ -1159,7 +1175,7 @@ internal class AnnoCanvas : Canvas
         var tb = new TextBox
         {
             Width = 226, FontSize = 13,
-            ToolTip = "回车确认,Esc 跳过",
+            ToolTip = UiText.T("note"),
         };
         double fx = Math.Min(p.X + 14, ActualWidth - 240);
         double fy = Math.Min(Math.Max(p.Y - 30, 8), ActualHeight - 36);

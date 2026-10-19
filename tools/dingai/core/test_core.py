@@ -7,6 +7,8 @@ from pathlib import Path
 from core.diff import compare_png, write_diff
 from core.export import EXPORTERS, export_note, register_exporter
 from core.guide import sop_markdown, write_bundle
+from core.i18n import t
+from core.update import check_update, current_version
 from core.layout import layout_callouts
 from core.redact import decode_png, encode_png, pixelate_png, redact_note, redact_text
 from core.voice import transcribe
@@ -105,6 +107,26 @@ class RedactTests(unittest.TestCase):
         self.assertEqual((width, height), (8, 8))
         self.assertGreater(rgb[0], 0)
         self.assertGreater(rgb[2], 0)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_catalog_has_three_languages_and_update_stays_offline(self):
+        self.assertEqual(current_version(), "0.1.0")
+        old = os.environ.pop("DINGAI_UPDATE", None)
+        lang = os.environ.get("DINGAI_LANG")
+        os.environ["DINGAI_LANG"] = "vi"
+        try:
+            self.assertEqual(t("save"), "Lưu")
+            self.assertFalse(check_update()["checked"])
+        finally:
+            if old is None:
+                os.environ.pop("DINGAI_UPDATE", None)
+            else:
+                os.environ["DINGAI_UPDATE"] = old
+            if lang is None:
+                os.environ.pop("DINGAI_LANG", None)
+            else:
+                os.environ["DINGAI_LANG"] = lang
 
 
 class ExportTests(unittest.TestCase):

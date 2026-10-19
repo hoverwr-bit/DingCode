@@ -20,6 +20,7 @@ jobs:
           node --check web/anno.js
           node web/anno-layout.test.js
           node web/anno-source.test.js
+          node web/anno-i18n.test.js
           node --check extension/background.js
           node --check extension/content.js
       - name: Team server image

@@ -4,6 +4,8 @@ A toolbox of local helpers for AI coding agents. The first tool is **DingAI** (f
 
 **给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingAI**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
 
+Languages are Chinese, English, and Vietnamese (`DINGAI_LANG=zh|en|vi`). Signing, notarization, and packaged releases are described in `tools/dingai/RELEASE.md`. An update check runs only when `DINGAI_UPDATE=1`.
+
 DingAI drops pins on any app or web page and exports JSON: app, window, pixel coordinates, nearby OCR text and, inside a browser, the DOM element and field under the pin. Paste that into Claude Code, Codex or any other agent.
 
 ## Layout / 目录
