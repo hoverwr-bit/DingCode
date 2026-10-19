@@ -1,0 +1,10 @@
+.DS_Store
+*.app
+tools/dingai/macos/DingAI
+bin/
+obj/
+notes/
+shots/
+*.p12
+*.pem
+*.cer

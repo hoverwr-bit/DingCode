@@ -1,0 +1,1553 @@
+//
+//  DingAI.swift — screen-pin annotations for coding agents (macOS)
+//  交互语言对齐网页批注层 web/anno.js:单击落钉(XY辅助线+坐标气泡+信息签)/拖拽画箭头/⌘Z撤销/Esc完成
+//  产出:JSON(截图像素坐标、左上原点)+ 底图截图,复制进剪贴板并落盘
+//
+//  编译:  swiftc -O -swift-version 5 -o DingAI DingAI.swift
+//          -framework AppKit -framework Carbon -framework Vision -framework ScreenCaptureKit
+//  权限:  屏幕录制(截图/OCR/窗口标题需要);热键与绘制不需要任何权限
+//
+
+import AppKit
+import Carbon
+import Carbon.HIToolbox
+import Vision
+import ScreenCaptureKit
+import Network
+
+// MARK: - 数据模型(截图像素坐标,左上原点)
+
+struct AppInfo {
+    var bundleId: String?
+    var name: String?
+    var path: String?
+    var pid: Int
+}
+
+struct WindowInfo {
+    var title: String?
+    var framePx: [Int]?   // 全局顶左原点点数 [x, y, w, h]
+}
+
+struct PinRecord {
+    var id: Int
+    var x: Int            // 截图像素 x
+    var y: Int            // 截图像素 y
+    var ocrNearby: String
+    var note: String?     // 人工备注(落钉后弹输入框)
+    var windowOwner: String?   // 钉子真正落在的窗口(按坐标定位,可能≠前台主窗)
+    var windowTitle: String?
+    var windowFrame: [Int]?    // 钉所在窗口 frame(本屏局部,点)——归一化坐标的基准
+    var pageInfo: [String: Any]?  // 页内桥结果(anno-bridge;桌面钉落在网页时=页面坐标+元素描述,与 anno-v7 同语义)
+}
+
+struct ArrowRecord {
+    var id: Int
+    var fromX: Int
+    var fromY: Int
+    var toX: Int
+    var toY: Int
+    var color: String     // red / yellow / cyan
+    var width: Int        // 2 / 4 / 6
+}
+
+struct BoxRecord {
+    var id: Int
+    var x: Int            // 左上角,截图像素
+    var y: Int
+    var w: Int
+    var h: Int
+    var color: String
+    var width: Int
+    var shape: String     // "rect" | "ellipse"(261014 区域标注;默认 rect 向后兼容)
+    var note: String?     // 框选备注(261014 用户令:框选后直接弹输入框对框选内容批注)
+}
+
+enum ActionItem {
+    case pin(PinRecord)
+    case arrow(ArrowRecord)
+    case box(BoxRecord)
+}
+
+struct OcrTextItem {
+    var text: String
+    var cx: Double        // 截图像素
+    var cy: Double
+}
+
+// MARK: - 页内桥服务(anno-bridge v1) anno-bridge
+// 桌面钉↔页面钉同步:127.0.0.1:8763 回环 HTTP,页面(anno-v7.js 桥模式,管理员态)
+// ping 注册取 token → 轮询 /pending 取 resolve 请求 → elementFromPoint 反查 → POST /answer;
+// App 侧择优(窗矩形跨源校验+windowAt 窗匹配,不依赖 hasFocus——落钉瞬间浏览器必失焦)
+// 写入 pin.page。全本机回环;启动失败→桥禁用,钉钉主流程不受影响(SPEC F5)。
+
+final class BridgeServer {
+    static let shared = BridgeServer()
+    static let port: UInt16 = 8763
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "anno-bridge")
+    private var listener: NWListener?
+    private(set) var running = false
+    private var sessionToken = ""
+    private var nextClientId = 1
+    private var clients: [Int: String] = [:]        // client id → token
+
+    struct ResolveReq {
+        let id: Int
+        let xPx: Int, yPx: Int
+        let scale: Double
+        let gx: Int, gy: Int                        // 钉点全局点(主屏左上原点,JS screenX 同系)
+        let createdAt = Date()
+        var answers: [[String: Any]] = []
+    }
+    private var requests: [ResolveReq] = []
+    private var nextReqId = 1
+    private var pendingCompletions = 0     // 未回调完成的 resolve 数(drain 用)
+    private var sseClients: [NWConnection] = []
+    private var hbTimer: Timer?
+
+    func start() {
+        lock.lock(); defer { lock.unlock() }
+        guard !running else { return }
+        sessionToken = randomToken()
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback),
+                                                           port: NWEndpoint.Port(rawValue: Self.port)!)
+        guard let l = try? NWListener(using: params) else {
+            NSLog("anno-bridge: port \(Self.port) unavailable, bridge disabled")
+            return
+        }
+        l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        l.stateUpdateHandler = { st in
+            if case .failed(let e) = st { NSLog("anno-bridge listener failed: \(e)") }
+        }
+        l.start(queue: queue)
+        listener = l
+        running = true
+        // SSE 心跳(15s):防中间层断连;主线程 Timer(runloop 由 App 事件循环驱动)
+        hbTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.broadcastRaw(Data(": hb\n\n".utf8))
+        }
+        NSLog("anno-bridge: listening 127.0.0.1:\(Self.port)")
+    }
+
+    /// SSE 广播原始帧(心跳用)
+    private func broadcastRaw(_ frame: Data) {
+        lock.lock(); let conns = sseClients; lock.unlock()
+        conns.forEach { $0.send(content: frame, completion: .contentProcessed { _ in }) }
+    }
+
+    /// resolve 请求广播给所有 SSE 订阅页(后台标签的轮询被浏览器节流到 ~1 次/分钟,
+    /// 网络推送不受节流——SSE 是桌面钉时浏览器必在后台场景下的唯一可靠通道)
+    private func broadcastResolve(_ r: ResolveReq) {
+        let obj: [String: Any] = ["id": r.id, "x_px": r.xPx, "y_px": r.yPx,
+                                  "scale": r.scale, "gx": r.gx, "gy": r.gy]
+        let body = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+        broadcastRaw(Data("data: ".utf8) + body + Data("\n\n".utf8))
+    }
+
+    private func addSSE(_ conn: NWConnection) {
+        lock.lock(); sseClients.append(conn); lock.unlock()
+    }
+
+    private func dropSSE(_ conn: NWConnection) {
+        lock.lock(); sseClients.removeAll { $0 === conn }; lock.unlock()
+    }
+
+    // MARK: App 侧:发起解析(异步,≤2.5s 回调;桥未运行/无合格 answer→nil 回退)
+
+    func resolve(xPx: Int, yPx: Int, scale: Double, gx: Int, gy: Int,
+                 windowFrame: [Int]?, cgX: Int, cgY: Int,
+                 completion: @escaping ([String: Any]?) -> Void) {
+        lock.lock()
+        guard running else { lock.unlock(); completion(nil); return }
+        let id = nextReqId; nextReqId += 1
+        let req = ResolveReq(id: id, xPx: xPx, yPx: yPx, scale: scale, gx: gx, gy: gy)
+        requests.append(req)
+        pendingCompletions += 1
+        lock.unlock()
+        broadcastResolve(req)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self else { completion(nil); return }
+            self.lock.lock()
+            self.pruneLocked()
+            let answers: [[String: Any]]
+            if let i = self.requests.firstIndex(where: { $0.id == id }) {
+                answers = self.requests.remove(at: i).answers
+            } else {
+                answers = []
+            }
+            self.pendingCompletions -= 1
+            self.lock.unlock()
+            NSLog("anno-bridge: req %d answers=%d hit=%d", id, answers.count,
+                  answers.filter { ($0["hit"] as? Bool) == true }.count)
+            completion(Self.pickBest(answers: answers, pinGx: gx, pinGy: gy,
+                                     windowFrame: windowFrame, cgX: cgX, cgY: cgY))
+        }
+    }
+
+    /// finish 前排空未决请求。主线程调用:用 RunLoop 驱动等待(而非 usleep),
+    /// 否则回填的 DispatchQueue.main.async 永远排不上队→buildJSON 读不到 page(竞态)。
+    func drain(seconds: Double) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            lock.lock()
+            let busy = !requests.isEmpty || pendingCompletions > 0
+            lock.unlock()
+            if !busy {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))   // 收尾已入队的回填
+                return
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        }
+    }
+
+    /// answer 择优(SPEC §3.3):①hit=true ②JS 窗屏幕矩形须含钉点(跨源校验坐标系假设)
+    /// ③多窗都含→与 windowAt 窗(转全局)中心距最小;收敛为 page 契约对象
+    static func pickBest(answers: [[String: Any]], pinGx: Int, pinGy: Int,
+                         windowFrame: [Int]?, cgX: Int, cgY: Int) -> [String: Any]? {
+        let hits = answers.filter { ($0["hit"] as? Bool) == true }
+        var pool: [[String: Any]] = []
+        for a in hits {
+            guard let sx = num(a["winScreenX"]), let sy = num(a["winScreenY"]),
+                  let ow = num(a["outerW"]), let oh = num(a["outerH"]) else {
+                NSLog("anno-bridge pick: hit answer missing win fields: url=%@", String(describing: a["url"]))
+                continue
+            }
+            guard Double(pinGx) >= sx && Double(pinGx) <= sx + ow &&
+                  Double(pinGy) >= sy && Double(pinGy) <= sy + oh else {
+                NSLog("anno-bridge pick: pin(gx=%d,gy=%d) outside js win [%.0f,%.0f %.0fx%.0f] url=%@",
+                      pinGx, pinGy, sx, sy, ow, oh, String(describing: a["url"]))
+                continue
+            }
+            pool.append(a)
+        }
+        guard !pool.isEmpty else { return nil }
+        // 261019 修复钉批注抓错标签页：同窗多标签共享同一窗矩形(screenX/Y、outerW/H 全同)，
+        // 几何包含+中心距对同窗标签完全同分 → 实际退化成「谁先到谁赢」的竞态，后台标签会赢。
+        // JS answer 本就带 visibility(document.visibilityState，被看的那页=visible)——
+        // 有 visible 答案时只在 visible 里挑；全 hidden(整浏览器被遮挡/最小化等)才回退几何老逻辑，不回归。
+        let visibles = pool.filter { ($0["visibility"] as? String) == "visible" }
+        if visibles.isEmpty {
+            NSLog("anno-bridge pick: no visible answer among %d — fallback geometry-only", pool.count)
+        } else if visibles.count < pool.count {
+            NSLog("anno-bridge pick: dropped %d hidden answer(s) by visibility, %d left",
+                  pool.count - visibles.count, visibles.count)
+        }
+        let cand = visibles.isEmpty ? pool : visibles
+        var best: ([String: Any], Double)?
+        for a in cand {
+            guard let sx = num(a["winScreenX"]), let sy = num(a["winScreenY"]),
+                  let ow = num(a["outerW"]), let oh = num(a["outerH"]) else { continue }
+            var score = 0.0
+            if let f = windowFrame, f.count == 4 {
+                let cx = Double(cgX + f[0]) + Double(f[2]) / 2
+                let cy = Double(cgY + f[1]) + Double(f[3]) / 2
+                score = hypot(sx + ow / 2 - cx, sy + oh / 2 - cy)
+            }
+            if best == nil || score < best!.1 { best = (a, score) }
+        }
+        guard let b = best?.0 else {
+            NSLog("anno-bridge pick: END hits=%d pool=%d best=nil", hits.count, pool.count)
+            return nil
+        }
+        NSLog("anno-bridge pick: END hits=%d pool=%d vis=%d bestKey=%@ url=%@",
+              hits.count, pool.count, visibles.count,
+              String(describing: b["key"]), String(describing: b["url"]))
+        return [
+            "url": b["url"] ?? NSNull(),
+            "title": b["title"] ?? NSNull(),      // 261019 加：document.title，肉眼可核对是否抓对标签页
+            "clientX": b["clientX"] ?? NSNull(),
+            "clientY": b["clientY"] ?? NSNull(),
+            "pageX": b["pageX"] ?? NSNull(),
+            "pageY": b["pageY"] ?? NSNull(),
+            "scrollY": b["scrollY"] ?? NSNull(),
+            "viewportW": b["viewportW"] ?? NSNull(),
+            "viewportH": b["viewportH"] ?? NSNull(),
+            "key": b["key"] ?? NSNull(),
+            "field": b["field"] ?? NSNull(),
+            "value": b["value"] ?? NSNull(),
+            "text": b["text"] ?? NSNull(),
+            "dpr": b["dpr"] ?? NSNull(),
+        ]
+    }
+
+    private static func num(_ v: Any?) -> Double? {
+        (v as? NSNumber)?.doubleValue ?? v as? Double
+    }
+
+    // MARK: HTTP 服务(NWConnection 手写极简 HTTP/1.1;一律 Connection: close)
+
+    private func accept(_ conn: NWConnection) {
+        conn.stateUpdateHandler = { [weak self, weak conn] st in
+            if case .cancelled = st { if let conn { self?.dropSSE(conn) } }
+            if case .failed = st { if let conn { self?.dropSSE(conn) } }
+        }
+        conn.start(queue: queue)
+        recv(conn, data: Data())
+    }
+
+    private func recv(_ conn: NWConnection, data: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [weak self] chunk, _, done, err in
+            guard let self else { conn.cancel(); return }
+            var buf = data
+            if let c = chunk { buf.append(c) }
+            if let req = Self.parseHttpRequest(buf) {
+                let (resp, keepAlive) = self.route(req)
+                if keepAlive {
+                    conn.send(content: resp, completion: .contentProcessed { _ in
+                        self.addSSE(conn)   // SSE:连接保持,挂表等推送
+                    })
+                } else {
+                    self.send(conn, resp)
+                }
+            } else if err != nil || done || buf.count > (1 << 20) {
+                conn.cancel()
+            } else {
+                self.recv(conn, data: buf)
+            }
+        }
+    }
+
+    static func parseHttpRequest(_ buf: Data) -> (method: String, path: String,
+                                                 query: [String: String], body: Data)? {
+        guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let head = String(decoding: buf[..<headerEnd.lowerBound], as: UTF8.self)
+        let lines = head.components(separatedBy: "\r\n")
+        guard !lines.isEmpty else { return nil }
+        let parts = lines[0].split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        let method = String(parts[0])
+        let full = String(parts[1])
+        var path = full
+        var query: [String: String] = [:]
+        if let q = full.firstIndex(of: "?") {
+            path = String(full[..<q])
+            for pair in full[full.index(after: q)...].split(separator: "&") {
+                let kv = pair.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2 else { continue }
+                query[urlDecode(String(kv[0]))] = urlDecode(String(kv[1]))
+            }
+        }
+        var clen = 0
+        for l in lines.dropFirst() {
+            let kv = l.split(separator: ":", maxSplits: 1)
+            if kv.count == 2, kv[0].lowercased() == "content-length" {
+                clen = Int(kv[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        let bodyStart = headerEnd.upperBound
+        guard buf.count - bodyStart >= clen else { return nil }   // body 未收齐
+        return (method, path, query, Data(buf[bodyStart...]))
+    }
+
+    static func urlDecode(_ s: String) -> String {
+        s.replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? s
+    }
+
+    private func route(_ req: (method: String, path: String,
+                               query: [String: String], body: Data)) -> (Data, Bool) {
+        if req.method == "OPTIONS" {
+            // CORS preflight 兜底(含 Chrome PNA:内网页 fetch 127.0.0.1 会先 OPTIONS)
+            let s = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n" +
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                    "Access-Control-Allow-Headers: Content-Type\r\n" +
+                    "Access-Control-Allow-Private-Network: true\r\n" +
+                    "Access-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            return (Data(s.utf8), false)
+        }
+        switch (req.method, req.path) {
+        case ("GET", "/events"):
+            // SSE 订阅流(后台标签节流免疫);keepAlive=true 连接保持由 recv 挂表
+            guard let id = Int(req.query["client"] ?? ""), let tok = req.query["token"],
+                  clientValid(id, tok) else { return (plain(403, "bad token"), false) }
+            let s = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n" +
+                    "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n" +
+                    "Connection: keep-alive\r\n\r\n"
+            return (Data(s.utf8) + Data("retry: 3000\n\n".utf8), true)
+        case ("GET", "/ping"):
+            lock.lock()
+            let id = nextClientId; nextClientId += 1
+            clients[id] = sessionToken
+            let tok = sessionToken
+            lock.unlock()
+            return (json(["app": "dingai-bridge", "compat": "anno-bridge", "version": 1, "client": id, "token": tok]), false)
+        case ("GET", "/pending"):
+            guard let id = Int(req.query["client"] ?? ""), let tok = req.query["token"],
+                  clientValid(id, tok) else { return (plain(403, "bad token"), false) }
+            let since = Int(req.query["since"] ?? "") ?? 0
+            lock.lock()
+            pruneLocked()
+            var out: [[String: Any]] = []
+            var maxSeq = since
+            for r in requests where r.id > since {
+                out.append(["id": r.id, "x_px": r.xPx, "y_px": r.yPx,
+                            "scale": r.scale, "gx": r.gx, "gy": r.gy])
+                maxSeq = max(maxSeq, r.id)
+            }
+            lock.unlock()
+            return (json(["seq": maxSeq, "requests": out]), false)
+        case ("POST", "/answer"):
+            guard let obj = try? JSONSerialization.jsonObject(with: req.body) as? [String: Any],
+                  let id = obj["client"] as? Int, let tok = obj["token"] as? String,
+                  clientValid(id, tok), let rid = obj["reqId"] as? Int else {
+                return (plain(403, "bad token"), false)
+            }
+            lock.lock()
+            if let i = requests.firstIndex(where: { $0.id == rid }) {
+                requests[i].answers.append(obj)
+            }
+            lock.unlock()
+            return (json(["ok": 1]), false)
+        default:
+            return (plain(404, "not found"), false)
+        }
+    }
+
+    private func clientValid(_ id: Int, _ token: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return clients[id] == token && token == sessionToken
+    }
+
+    private func pruneLocked() {
+        let cutoff = Date().addingTimeInterval(-5)
+        requests.removeAll { $0.createdAt < cutoff }
+    }
+
+    private func send(_ conn: NWConnection, _ data: Data) {
+        conn.send(content: data, completion: .contentProcessed { _ in conn.cancel() })
+    }
+
+    private func json(_ obj: [String: Any]) -> Data {
+        let body = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
+        return head(200, "OK", "application/json; charset=utf-8", body.count) + body
+    }
+
+    private func plain(_ code: Int, _ text: String) -> Data {
+        let body = Data(text.utf8)
+        return head(code, code == 403 ? "Forbidden" : "Not Found", "text/plain", body.count) + body
+    }
+
+    private func head(_ code: Int, _ msg: String, _ type: String, _ len: Int) -> Data {
+        // CORS * :其他端口的 http 页面跨端口 fetch 本回环服务所必需
+        let s = "HTTP/1.1 \(code) \(msg)\r\nContent-Type: \(type)\r\n" +
+                "Access-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: \(len)\r\n\r\n"
+        return Data(s.utf8)
+    }
+
+    private func randomToken() -> String {
+        var b = [UInt8](repeating: 0, count: 16)
+        arc4random_buf(&b, 16)
+        return b.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - 全局控制器
+
+final class AnnoController: NSObject, NSApplicationDelegate {
+    static let shared = AnnoController()
+
+    let outputRoot: URL   // notes/ 与 shots/ 的父目录
+    var statusItem: NSStatusItem?
+    var overlay: AnnotationWindow?
+    var lastApp: NSRunningApplication?
+
+    // 本次批注会话数据
+    var appInfo = AppInfo(bundleId: nil, name: nil, path: nil, pid: 0)
+    var windowInfo = WindowInfo(title: nil, framePx: nil)
+    var shotCG: CGImage?
+    var shotURL: URL?
+    var sessionStart = Date()
+    var ocrItems: [OcrTextItem] = []
+    var ocrDone = false
+    var shotReady = false
+    var screenW = 0, screenH = 0, imgW = 0, imgH = 0   // 点数 与 截图像素
+    var scale: Double = 1
+    var targetFrame = NSRect.zero          // 本轮批注目标屏(光标所在屏)
+    var windowCandidates: [(owner: String, title: String, frame: [Int])] = []
+    var cgOriginX = 0, cgOriginY = 0       // 目标屏在 CG 顶左全局系的原点(JS window.screenX 同系;resolve 用)
+
+    var hotKeyRef: EventHotKeyRef?
+
+    override init() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let env = ProcessInfo.processInfo.environment
+        outputRoot = home.appendingPathComponent(env["DINGAI_OUTPUT_DIR"] ?? env["ANNO_OUTPUT_DIR"] ?? "DingAI")
+        super.init()
+        for sub in ["notes", "shots"] {
+            try? FileManager.default.createDirectory(
+                at: outputRoot.appendingPathComponent(sub),
+                withIntermediateDirectories: true)
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        setupStatusBar()
+        registerHotKey()
+        trackFrontmostApp()
+        BridgeServer.shared.start()   // 页内桥(-ANNOSYNC):失败静默禁用,不影响钉钉
+        if CommandLine.arguments.contains("--auto-test") {
+            perform(#selector(autoTestBegin), with: nil, afterDelay: 0.8)
+        }
+    }
+
+    @objc func autoTestBegin() {
+        begin()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) {
+            guard let view = self.overlay?.annoView else { exit(3) }
+            let w = CGFloat(self.screenW), h = CGFloat(self.screenH)
+            view.debugAddPin(atPoint: NSPoint(x: w * 0.40, y: h * 0.35))
+            view.debugAddPin(atPoint: NSPoint(x: w * 0.62, y: h * 0.52))
+            view.debugAddArrow(from: NSPoint(x: w * 0.30, y: h * 0.68),
+                               to:   NSPoint(x: w * 0.52, y: h * 0.74))
+            view.debugAddBox(from: NSPoint(x: w * 0.55, y: h * 0.30),
+                             to:   NSPoint(x: w * 0.75, y: h * 0.40))
+            view.debugAddBox(from: NSPoint(x: w * 0.58, y: h * 0.60),
+                             to:   NSPoint(x: w * 0.78, y: h * 0.72), shape: "ellipse")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.finish(copyToPasteboard: false)
+                exit(0)
+            }
+        }
+    }
+
+    // MARK: 状态栏
+
+    func setupStatusBar() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // 图标:自绘图钉(模板图,深浅菜单栏自动适配)
+        item.button?.image = statusIcon()
+        let menu = NSMenu()
+        menu.addItem(withTitle: "DingAI 开始批注  ⌥⌘A", action: #selector(toggle), keyEquivalent: "")
+        menu.addItem(.separator())
+        let ok = CGPreflightScreenCaptureAccess()
+        let st = NSMenuItem(title: ok ? "屏幕录制权限:正常" : "屏幕录制权限:缺失(截图/OCR 受限)",
+                            action: nil, keyEquivalent: "")
+        st.isEnabled = false
+        menu.addItem(st)
+        menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
+        menu.autoenablesItems = false
+        item.menu = menu
+        statusItem = item
+    }
+
+    func statusIcon() -> NSImage? {
+        let img = NSImage(size: NSSize(width: 18, height: 18))
+        img.lockFocus()
+        NSColor.black.setFill()
+        NSColor.black.setStroke()
+        // 钉头(实心圆)+ 颈(短梯形)+ 针杆
+        let head = NSBezierPath(ovalIn: NSRect(x: 5, y: 9, width: 8, height: 8))
+        head.fill()
+        let neck = NSBezierPath()
+        neck.lineWidth = 2.4
+        neck.move(to: NSPoint(x: 9, y: 10)); neck.line(to: NSPoint(x: 9, y: 4))
+        neck.stroke()
+        let needle = NSBezierPath()
+        needle.lineWidth = 1.4
+        needle.move(to: NSPoint(x: 9, y: 4)); needle.line(to: NSPoint(x: 9, y: 0))
+        needle.stroke()
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
+    }
+
+    @objc func toggle() { overlay == nil ? begin() : finish(copyToPasteboard: true) }
+    @objc func quit() { NSApp.terminate(nil) }
+
+    // MARK: 前台 App 跟踪(overlay 自己出现前的前一个 App 即批注对象)
+
+    func trackFrontmostApp() {
+        lastApp = NSWorkspace.shared.frontmostApplication
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            guard app.processIdentifier != getpid() else { return }
+            self?.lastApp = app
+        }
+    }
+
+    // MARK: 全局热键(Carbon,免权限)
+
+    func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ -> OSStatus in
+            var hkID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+            if hkID.signature == OSType(0x414E4E4F) { // 'ANNO'
+                AnnoController.shared.toggle()
+            }
+            return noErr
+        }, 1, &spec, nil, nil)
+
+        RegisterEventHotKey(UInt32(kVK_ANSI_A), UInt32(cmdKey | optionKey),
+                            EventHotKeyID(signature: OSType(0x414E4E4F), id: 1),
+                            GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    // MARK: 进入批注
+
+    func begin() {
+        guard overlay == nil else { return }
+
+        // 1) 批注对象 = 之前的前台 App
+        if let app = lastApp {
+            appInfo = AppInfo(bundleId: app.bundleIdentifier,
+                              name: app.localizedName,
+                              path: app.bundleURL?.path,
+                              pid: Int(app.processIdentifier))
+        }
+
+        // 3) 目标屏 = 光标所在屏(多屏语义:批注你正看着的那块屏)
+        sessionStart = Date()
+        ocrItems = []; ocrDone = false; shotReady = false
+
+        let targetScreen = NSScreen.screens.first {
+            NSMouseInRect(NSEvent.mouseLocation, $0.frame, false)
+        } ?? NSScreen.main!
+        let sf = targetScreen.frame
+        targetFrame = sf
+        screenW = Int(sf.width); screenH = Int(sf.height)
+        let displayID = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+        let wanted = sf
+        // CGWindowList 全局坐标(顶左原点)下目标屏的原点,用于把窗口 frame 转成本屏局部坐标
+        let cgMinX = sf.origin.x
+        let cgMinY = NSScreen.screens[0].frame.maxY - sf.maxY
+        cgOriginX = Int(cgMinX); cgOriginY = Int(cgMinY)
+
+        // 2) 批注对象的窗口:取该 App 与目标屏相交面积最大的窗口,frame 转本屏局部(顶左原点,点数)
+        windowInfo = WindowInfo(title: nil, framePx: nil)
+        if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] {
+            let pid32 = Int32(truncatingIfNeeded: appInfo.pid)
+            let wins = list.filter {
+                ($0[kCGWindowOwnerPID as String] as? Int32) == pid32 &&
+                ($0[kCGWindowLayer as String] as? Int) == 0
+            }.compactMap { dict -> (dict: [String: Any], inter: Int)? in
+                guard let b = dict[kCGWindowBounds as String] as? [String: Any],
+                      let x = b["X"] as? Int, let y = b["Y"] as? Int,
+                      let w = b["Width"] as? Int, let h = b["Height"] as? Int else { return nil }
+                let ix = max(0, min(x + w, Int(cgMinX) + screenW) - max(x, Int(cgMinX)))
+                let iy = max(0, min(y + h, Int(cgMinY) + screenH) - max(y, Int(cgMinY)))
+                guard ix > 0 && iy > 0 else { return nil }
+                return (dict, ix * iy)
+            }.sorted { $0.inter > $1.inter }
+            if let w = wins.first?.dict {
+                windowInfo.title = w[kCGWindowName as String] as? String
+                if let b = w[kCGWindowBounds as String] as? [String: Any],
+                   let x = b["X"] as? Int, let y = b["Y"] as? Int,
+                   let bw = b["Width"] as? Int, let bh = b["Height"] as? Int {
+                    windowInfo.framePx = [x - Int(cgMinX), y - Int(cgMinY), bw, bh]
+                }
+            }
+        }
+
+        // 2b) 全屏窗口候选(落钉按坐标定位「钉真正落在哪个窗口」,钉在副窗/浏览器页上时信息签才对)
+        windowCandidates = []
+        if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] {
+            for w in list {
+                guard (w[kCGWindowLayer as String] as? Int) == 0,
+                      let b = w[kCGWindowBounds as String] as? [String: Any],
+                      let x = b["X"] as? Int, let y = b["Y"] as? Int,
+                      let bw = b["Width"] as? Int, let bh = b["Height"] as? Int,
+                      bw > 40, bh > 40 else { continue }
+                let lx = x - Int(cgMinX), ly = y - Int(cgMinY)
+                guard lx < screenW, ly < screenH, lx + bw > 0, ly + bh > 0 else { continue }
+                windowCandidates.append((owner: w[kCGWindowOwnerName as String] as? String ?? "",
+                                         title: w[kCGWindowName as String] as? String ?? "",
+                                         frame: [lx, ly, bw, bh]))
+            }
+        }
+
+        // 4) ScreenCaptureKit 截图:displayID 精确匹配目标屏(修「定格画面变形」——
+        //    此前按 frame 宽高匹配失败后 fallback 到 displays.first,截到了别的屏再拉伸)
+        Task.detached { [weak self] in
+            guard let self else { return }
+            var captured: CGImage? = nil
+            if let content = try? await SCShareableContent.current {
+                let disp = content.displays.first { $0.displayID == displayID }
+                    ?? content.displays.first {
+                        abs($0.frame.width - wanted.width) < 2 && abs($0.frame.height - wanted.height) < 2
+                    } ?? content.displays.first
+                if let disp {
+                    let filter = SCContentFilter(display: disp,
+                                                 excludingApplications: [],
+                                                 exceptingWindows: [])
+                    let cfg = SCStreamConfiguration()
+                    cfg.showsCursor = false
+                    // 必须显式指定输出尺寸:默认会给 1920x1080(与屏无关),拉到 1.538 比例屏=变形
+                    cfg.width = Int(wanted.width) * 2
+                    cfg.height = Int(wanted.height) * 2
+                    captured = try? await SCScreenshotManager.captureImage(contentFilter: filter,
+                                                                           configuration: cfg)
+                }
+            }
+            let cg = captured
+            DispatchQueue.main.async {
+                self.shotArrived(cg)
+            }
+        }
+    }
+
+    /// 截图像素坐标 → 钉所在窗口(含该点的候选中取面积最小者=最精确窗;无则 nil)
+    func windowAt(x px: Int, y py: Int) -> (owner: String, title: String, frame: [Int])? {
+        let sx = Double(px) / scale, sy = Double(py) / scale
+        // CGWindowList 返回序=Z 序前→后;取第一个包含该点的 layer0 窗(视觉最前=钉子所见)。
+        // 261014 前旧法「包含点最小面积窗」在多窗重叠时记成被盖住的下层小窗
+        // (实测 14 钉 owner 大量误记「系统信息/访达」),anno-bridge 修正。
+        for c in windowCandidates {
+            let f = c.frame
+            if sx >= Double(f[0]) && sx <= Double(f[0] + f[2]) &&
+               sy >= Double(f[1]) && sy <= Double(f[1] + f[3]) {
+                return (c.owner, c.title, f)
+            }
+        }
+        return nil
+    }
+
+    /// 截图回到主线程:建 overlay(挂背景或灰底)、存档、启动 OCR
+    func shotArrived(_ cg: CGImage?) {
+        guard overlay == nil else { return }
+        shotCG = cg
+        shotReady = true
+
+        let win = AnnotationWindow(frame: targetFrame)
+        win.annoView.controller = self
+
+        if let cg {
+            imgW = cg.width; imgH = cg.height
+            scale = Double(cg.width) / Double(max(screenW, 1))
+            let name = "anno-" + stamp() + ".png"
+            let url = outputRoot.appendingPathComponent("shots").appendingPathComponent(name)
+            if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, cg, nil)
+                CGImageDestinationFinalize(dest)
+                shotURL = url
+            }
+            // 逻辑尺寸=屏幕点尺寸(修「定格画面变形」:NSZeroSize 会把像素尺寸当逻辑尺寸,
+            // 16:9 截图被硬拉到 1.538 纵横比的屏=压扁;钉子像素换算仍走 scale= imgW/屏宽)
+            win.annoView.bgImage = NSImage(cgImage: cg,
+                                           size: NSSize(width: self.screenW, height: self.screenH))
+        } else {
+            imgW = screenW; imgH = screenH; scale = 1
+            ocrDone = true
+        }
+
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)   // 修「首击不算」:无激活时第一次点击只激活窗口不进画布
+        overlay = win
+
+        if let cg {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let items = Self.runOCR(cgImage: cg)
+                DispatchQueue.main.async {
+                    self.ocrItems = items
+                    self.ocrDone = true
+                    self.overlay?.annoView.refreshPinSigns()
+                }
+            }
+        }
+    }
+
+    static func runOCR(cgImage: CGImage) -> [OcrTextItem] {
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.recognitionLanguages = ["zh-Hans", "en-US", "vi-VN"]
+        req.usesLanguageCorrection = true
+        let h = VNImageRequestHandler(cgImage: cgImage)
+        do { try h.perform([req]) } catch { return [] }
+        let W = Double(cgImage.width), H = Double(cgImage.height)
+        var out: [OcrTextItem] = []
+        for obs in (req.results ?? []) {
+            guard let top = obs.topCandidates(1).first else { continue }
+            let b = obs.boundingBox
+            let t = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            out.append(OcrTextItem(text: t, cx: b.midX * W, cy: (1.0 - b.midY) * H))
+        }
+        return out
+    }
+
+    /// 钉子近邻文本:半径内按距离取最近若干行(2x 截图上 220px≈110pt 视觉半径)
+    func ocrNear(x: Int, y: Int, radius: Double = 220.0, limit: Int = 8) -> String {
+        guard !ocrItems.isEmpty else { return ocrDone ? "" : "OCR…" }
+        let px = Double(x), py = Double(y)
+        let hits = ocrItems
+            .map { (text: $0.text, d: hypot($0.cx - px, $0.cy - py)) }
+            .filter { $0.d <= radius }
+            .sorted { $0.d < $1.d }
+            .prefix(limit)
+        return hits.map { $0.text.count > 42 ? String($0.text.prefix(42)) + "…" : $0.text }
+            .joined(separator: " | ")
+    }
+
+    // MARK: 完成与 JSON
+
+    /// 钉所在窗属浏览器名单→发桥 resolve(-ANNOSYNC);结果异步回填 pin.pageInfo
+    static let browserOwners = ["Safari", "Chrome", "Edge", "Firefox", "Arc", "浏览器"]
+    func bridgeResolveIfBrowser(win: (owner: String, title: String, frame: [Int])?,
+                                xPx: Int, yPx: Int,
+                                completion: @escaping ([String: Any]?) -> Void) {
+        guard let win, AnnoController.browserOwners.contains(where: { win.owner.contains($0) }) else {
+            completion(nil); return
+        }
+        let gx = cgOriginX + Int((Double(xPx) / scale).rounded())
+        let gy = cgOriginY + Int((Double(yPx) / scale).rounded())
+        BridgeServer.shared.resolve(xPx: xPx, yPx: yPx, scale: scale, gx: gx, gy: gy,
+                                    windowFrame: win.frame, cgX: cgOriginX, cgY: cgOriginY,
+                                    completion: completion)
+    }
+
+    func finish(copyToPasteboard: Bool) {
+        guard let view = overlay?.annoView else { return }
+        view.endNoteEditing()
+        BridgeServer.shared.drain(seconds: 2.5)   // 排空未决桥请求(无未决则零等待)
+        let json = buildJSON(items: view.items)
+        let data = (try? JSONSerialization.data(withJSONObject: json,
+                        options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        let url = outputRoot.appendingPathComponent("notes")
+                        .appendingPathComponent("anno-" + stamp() + ".json")
+        try? data.write(to: url)
+        if copyToPasteboard {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(String(data: data, encoding: .utf8) ?? "", forType: .string)
+        }
+        let shotCopy = shotURL
+        overlay?.orderOut(nil)
+        overlay = nil
+        shotCG = nil
+        // 团队账本上报(静默 fire-and-forget,失败不影响本地)
+        if let shotCopy { reportToTeam(jsonData: data, shotFile: shotCopy) }
+    }
+
+    // MARK: 团队账本上报(configurable team server via ANNO_TEAM_URLS,失败静默跳过)
+
+    static let teamHosts: [String] = (ProcessInfo.processInfo.environment["DINGAI_TEAM_URLS"] ?? ProcessInfo.processInfo.environment["ANNO_TEAM_URLS"] ?? "").split(separator: ",").map { String($0) }.filter { !$0.isEmpty }   // e.g. DINGAI_TEAM_URLS=http://team-host:8050
+
+    func reportToTeam(jsonData: Data, shotFile: URL) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            for host in Self.teamHosts {
+                guard let shotName = self.postJson(host, data: jsonData) else { continue }
+                self.postShot(host, name: shotName, file: shotFile)
+                return
+            }
+        }
+    }
+
+    @discardableResult
+    func postJson(_ host: String, data: Data) -> String? {
+        guard let url = URL(string: host + "/api/note") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 6
+        req.httpBody = data
+        var shotName: String?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { body, resp, _ in
+            defer { sem.signal() }
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: body ?? Data()) as? [String: Any],
+                  let name = obj["shot_name"] as? String else { return }
+            shotName = name
+        }.resume()
+        sem.wait()
+        return shotName
+    }
+
+    func postShot(_ host: String, name: String, file: URL) {
+        guard let png = try? Data(contentsOf: file),
+              let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: host + "/api/shot/" + enc) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 20
+        req.httpBody = png
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { _, _, _ in sem.signal() }.resume()
+        sem.wait()
+    }
+
+    func buildJSON(items: [ActionItem]) -> [String: Any] {
+        var pins: [[String: Any]] = []
+        var arrows: [[String: Any]] = []
+        var boxes: [[String: Any]] = []
+        for it in items {
+            switch it {
+            case .pin(let p):
+                var near = p.ocrNearby
+                if near == "OCR…" { near = ocrNear(x: p.x, y: p.y) }
+                var d: [String: Any] = ["id": p.id, "x_px": p.x, "y_px": p.y, "ocr_nearby": near]
+                if let note = p.note { d["note"] = note }
+                if let o = p.windowOwner {
+                    d["window"] = ["owner": o, "title": p.windowTitle ?? ""] as [String: Any]
+                }
+                // 归一化坐标:优先相对「钉所在窗口」(语义正确:钉在该窗内的相对位置);
+                // 无窗信息时退回会话主窗(此时 nx/ny 才可能是窗外负值)
+                let base = p.windowFrame ?? windowInfo.framePx
+                if let f = base {
+                    let fx = Double(f[0]) * scale
+                    let fy = Double(f[1]) * scale
+                    let fw = Double(f[2]) * scale
+                    let fh = Double(f[3]) * scale
+                    let nx = (Double(p.x) - fx) / fw
+                    let ny = (Double(p.y) - fy) / fh
+                    d["window_nx"] = (nx * 1000).rounded() / 1000
+                    d["window_ny"] = (ny * 1000).rounded() / 1000
+                }
+                if let pg = p.pageInfo { d["page"] = pg }   // 页内桥结果(可选;桥命中才有)
+                pins.append(d)
+            case .arrow(let a):
+                arrows.append(["id": a.id, "from_px": [a.fromX, a.fromY], "to_px": [a.toX, a.toY],
+                               "color": a.color, "width": a.width])
+            case .box(let b):
+                var bd: [String: Any] = ["id": b.id, "rect_px": [b.x, b.y, b.w, b.h],
+                              "color": b.color, "width": b.width, "shape": b.shape]
+                if let note = b.note { bd["note"] = note }
+                boxes.append(bd)
+            }
+        }
+        let json: [String: Any] = [
+            "schema": "dingai-desktop-v1",
+            "tool": "dingai",
+            "schema_compat": "anno-desktop-v1",
+            "ts": isoNow(),
+            "duration_s": round(Date().timeIntervalSince(sessionStart) * 10) / 10,
+            "machine": Host.current().localizedName ?? Host.current().name ?? "unknown",
+            "user": NSUserName(),
+            "app": ["pid": appInfo.pid,
+                    "bundle_id": appInfo.bundleId ?? NSNull(),
+                    "name": appInfo.name ?? NSNull(),
+                    "path": appInfo.path ?? NSNull()] as [String: Any],
+            "screen": ["width_px": imgW, "height_px": imgH,
+                       "point_w": screenW, "point_h": screenH, "scale": scale] as [String: Any],
+            "window": ["title": windowInfo.title ?? NSNull(),
+                       "frame_px": windowInfo.framePx ?? NSNull()] as [String: Any],
+            "pins": pins,
+            "arrows": arrows,
+            "boxes": boxes,
+            "pin_count": pins.count,
+            "arrow_count": arrows.count,
+            "box_count": boxes.count,
+            "screenshot": shotURL?.lastPathComponent ?? NSNull(),
+            "screen_capture_ok": (shotCG != nil),
+        ]
+        return json
+    }
+
+    func stamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        return f.string(from: Date())
+    }
+    func isoNow() -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: Date())
+    }
+}
+
+private func area(_ b: [String: Any]?) -> Int {
+    guard let b = b, let w = b["Width"] as? Int, let h = b["Height"] as? Int else { return 0 }
+    return w * h
+}
+
+
+// MARK: - 批注窗口
+
+final class AnnotationWindow: NSWindow {
+    var annoView: AnnotationView { contentView as! AnnotationView }
+    init(frame: NSRect) {
+        let v = AnnotationView(frame: NSRect(origin: .zero, size: frame.size))
+        super.init(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        contentView = v
+        isOpaque = false
+        backgroundColor = .clear
+        level = .screenSaver
+        ignoresMouseEvents = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        isMovable = false
+        hasShadow = false
+    }
+    override var canBecomeKey: Bool { true }
+}
+
+// MARK: - 可拖动工具条容器(点空白区拖动避遮挡;点按钮不触发拖)
+
+final class DragBar: NSView {
+    var dragOrigin: NSPoint?
+    override func mouseDown(with event: NSEvent) {
+        dragOrigin = convert(event.locationInWindow, from: nil)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let origin = dragOrigin else { return }
+        let cur = convert(event.locationInWindow, from: nil)
+        let dx = cur.x - origin.x, dy = cur.y - origin.y
+        let px = frame.origin.x + dx, py = frame.origin.y + dy
+        let parent = superview?.bounds ?? bounds
+        let nx = min(max(px, 4), parent.width - frame.width - 4)
+        let ny = min(max(py, 4), parent.height - frame.height - 4)
+        setFrameOrigin(NSPoint(x: nx, y: ny))
+    }
+    override func mouseUp(with event: NSEvent) { dragOrigin = nil }
+}
+
+// MARK: - 批注画布
+
+final class AnnotationView: NSView {
+    weak var controller: AnnoController?
+    var bgImage: NSImage?
+    var items: [ActionItem] = []
+    var nextId = 1
+    var draftFrom: NSPoint?
+    var draftTo: NSPoint?
+    var hoverPoint: NSPoint?
+    var curColor = "red"
+    var curWidth = 4
+    var drawMode = 1        // 1=箭头 2=方框 3=椭圆(工具条可切)
+
+    let guideColor = NSColor.systemRed.withAlphaComponent(0.75)
+
+    // MARK: 坐标换算:AppKit 点(左下原点) ↔ 截图像素(左上原点)
+
+    func ptToPx(_ p: NSPoint) -> (Int, Int) {
+        let s = controller?.scale ?? 1
+        let x = Double(p.x) * s
+        let y = (Double(bounds.height) - Double(p.y)) * s
+        return (Int(x), Int(y))
+    }
+    func pxToPt(_ x: Int, _ y: Int) -> NSPoint {
+        let s = controller?.scale ?? 1
+        let px = Double(x) / s
+        let py = bounds.height - CGFloat(Double(y) / s)
+        return NSPoint(x: CGFloat(px), y: py)
+    }
+
+    // MARK: 交互
+
+    override var acceptsFirstResponder: Bool { true }
+    /// 非激活状态下第一次点击直接进画布(修「点一下才进入批注」),配合 NSApp.activate 双保险
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        endNoteEditing()
+        draftFrom = convert(event.locationInWindow, from: nil)
+        draftTo = draftFrom
+    }
+    override func mouseDragged(with event: NSEvent) {
+        draftTo = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) {
+        defer { draftFrom = nil; draftTo = nil; needsDisplay = true }
+        guard let from = draftFrom, let to = draftTo else { return }
+        let dist = hypot(to.x - from.x, to.y - from.y) * CGFloat(controller?.scale ?? 1)
+        if dist < 7 { addPin(at: from) }
+        else if drawMode == 1 { addArrow(from: from, to: to) }
+        else { addBox(from: from, to: to, shape: drawMode == 3 ? "ellipse" : "rect") }
+    }
+    override func mouseMoved(with event: NSEvent) {
+        hoverPoint = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    func addPin(at p: NSPoint) {
+        let (x, y) = ptToPx(p)
+        let near = controller?.ocrNear(x: x, y: y) ?? ""
+        let win = controller?.windowAt(x: x, y: y)
+        let pinId = nextId
+        items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
+                                    windowOwner: win?.owner, windowTitle: win?.title,
+                                    windowFrame: win?.frame, pageInfo: nil)))
+        let idx = items.count - 1
+        nextId += 1
+        needsDisplay = true
+        bridgeBackfill(idx: idx, pinId: pinId, win: win, xPx: x, yPx: y)
+        beginNoteEditing(pinIndex: idx, at: p)
+    }
+
+    /// 桥 resolve 发起+异步回填(-ANNOSYNC);undo/clear 后按 id 防错位,主线程回填
+    func bridgeBackfill(idx: Int, pinId: Int,
+                        win: (owner: String, title: String, frame: [Int])?,
+                        xPx: Int, yPx: Int) {
+        controller?.bridgeResolveIfBrowser(win: win, xPx: xPx, yPx: yPx) { [weak self] page in
+            guard let page else { return }
+            // RunLoop.main.perform 而非 DispatchQueue.main.async:finish 的 drain 用
+            // RunLoop.run 等待,dispatch 主队列块不保证被消费(auto-test 实测 exit 前丢失),
+            // RunLoop.perform 的块与 drain 同一调度体系,RunLoop.run 必然执行它
+            RunLoop.main.perform {
+                guard let self, idx < self.items.count,
+                      case .pin(var pin) = self.items[idx], pin.id == pinId else {
+                    NSLog("anno-bridge backfill: SKIP idx=%d pinId=%d items=%d", idx, pinId, self?.items.count ?? -1)
+                    return
+                }
+                pin.pageInfo = page
+                self.items[idx] = .pin(pin)
+                NSLog("anno-bridge backfill: OK pin %d key=%@", pinId, String(describing: page["key"]))
+            }
+        }
+    }
+
+    // MARK: 钉子备注输入(单字段表单:回车确认 / Esc 或点空白跳过)
+
+    var noteField: NSTextField?
+
+    func beginNoteEditing(pinIndex: Int, at p: NSPoint) {
+        noteField?.removeFromSuperview()
+        let fx = min(p.x + 14, bounds.width - 240)
+        let fy = min(max(p.y - 30, 8), bounds.height - 34)
+        let f = NSTextField(frame: NSRect(x: fx, y: fy, width: 226, height: 26))
+        f.placeholderString = "备注:回车确认,Esc 跳过"
+        f.bezelStyle = .roundedBezel
+        f.font = .systemFont(ofSize: 13)
+        f.backgroundColor = .white
+        f.tag = pinIndex
+        f.target = self
+        f.action = #selector(noteCommit(_:))
+        f.delegate = self
+        addSubview(f)
+        window?.makeFirstResponder(f)
+        noteField = f
+    }
+
+    @objc func noteCommit(_ sender: NSTextField) { noteFieldCommit(text: sender.stringValue) }
+
+    /// 防御性收口:任何出口(新点击/撤销/清空/完成)前先把备注框内容落账
+    func endNoteEditing() {
+        if let f = noteField { noteFieldCommit(text: f.stringValue) }
+    }
+
+    func noteFieldCommit(text: String) {
+        guard let f = noteField else { return }
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // tag=items 下标:钉与框选图形共用同一备注框(261014 框选直接批注)
+        if case .pin(var pin) = items[f.tag] {
+            pin.note = t.isEmpty ? nil : t
+            items[f.tag] = .pin(pin)
+        } else if case .box(var b) = items[f.tag] {
+            b.note = t.isEmpty ? nil : t
+            items[f.tag] = .box(b)
+        }
+        let field = f
+        noteField = nil
+        field.removeFromSuperview()
+        window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+    func addArrow(from: NSPoint, to: NSPoint) {
+        let (fx, fy) = ptToPx(from)
+        let (tx, ty) = ptToPx(to)
+        let a = ArrowRecord(id: nextId, fromX: fx, fromY: fy, toX: tx, toY: ty,
+                            color: curColor, width: curWidth)
+        items.append(.arrow(a))
+        nextId += 1
+        needsDisplay = true
+    }
+
+    func addBox(from: NSPoint, to: NSPoint, shape: String = "rect") {
+        let (fx, fy) = ptToPx(from)
+        let (tx, ty) = ptToPx(to)
+        let b = BoxRecord(id: nextId,
+                          x: min(fx, tx), y: min(fy, ty),
+                          w: abs(tx - fx), h: abs(ty - fy),
+                          color: curColor, width: curWidth, shape: shape, note: nil)
+        items.append(.box(b))
+        let idx = items.count - 1
+        nextId += 1
+        needsDisplay = true
+        beginNoteEditing(pinIndex: idx, at: to)   // 框选后直接弹备注框(对齐钉子交互)
+    }
+
+    // 自动测试直调(点坐标为视图坐标;不弹备注框,note 走 nil)
+    func debugAddPin(atPoint p: NSPoint) {
+        let (x, y) = ptToPx(p)
+        let near = controller?.ocrNear(x: x, y: y) ?? ""
+        let win = controller?.windowAt(x: x, y: y)
+        let pinId = nextId
+        items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
+                                    windowOwner: win?.owner, windowTitle: win?.title,
+                                    windowFrame: win?.frame, pageInfo: nil)))
+        let idx = items.count - 1
+        nextId += 1
+        needsDisplay = true
+        bridgeBackfill(idx: idx, pinId: pinId, win: win, xPx: x, yPx: y)
+    }
+    // 自动测试直调(不弹备注框,note 走 nil;生产路径=addBox 弹备注)
+    func debugAddBox(from: NSPoint, to: NSPoint, shape: String = "rect") {
+        let (fx, fy) = ptToPx(from)
+        let (tx, ty) = ptToPx(to)
+        items.append(.box(BoxRecord(id: nextId,
+                          x: min(fx, tx), y: min(fy, ty),
+                          w: abs(tx - fx), h: abs(ty - fy),
+                          color: curColor, width: curWidth, shape: shape, note: nil)))
+        nextId += 1
+        needsDisplay = true
+    }
+    func debugAddArrow(from: NSPoint, to: NSPoint) { addArrow(from: from, to: to) }
+
+    @objc func undo() {
+        endNoteEditing()
+        if !items.isEmpty { items.removeLast() }
+        needsDisplay = true
+    }
+    @objc func clearAll() {
+        endNoteEditing()
+        items.removeAll()
+        needsDisplay = true
+    }
+    func refreshPinSigns() {
+        // OCR 就绪后,把落钉时尚未出结果的钉子("OCR…")补查回填
+        for i in items.indices {
+            if case .pin(var p) = items[i], p.ocrNearby == "OCR…" {
+                p.ocrNearby = controller?.ocrNear(x: p.x, y: p.y) ?? ""
+                items[i] = .pin(p)
+            }
+        }
+        needsDisplay = true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case UInt16(kVK_Escape): controller?.finish(copyToPasteboard: true)
+        case UInt16(kVK_ANSI_Z) where event.modifierFlags.contains(.command): undo()
+        default: super.keyDown(with: event)
+        }
+    }
+
+    // MARK: 绘制
+
+    override func draw(_ dirtyRect: NSRect) {
+        if let img = bgImage {
+            img.draw(in: bounds)
+        } else {
+            NSColor(calibratedWhite: 0.12, alpha: 1).setFill()
+            bounds.fill()
+            let hint = "截图中…(若无授权,菜单栏「批」可查权限状态)"
+            let attr: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 15),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.55)]
+            (hint as NSString).draw(at: NSPoint(x: bounds.midX - 130, y: bounds.midY),
+                                    withAttributes: attr)
+        }
+
+        // 拖拽预览(箭头/方框/椭圆,按当前模式)
+        if let f = draftFrom, let t = draftTo, f != t {
+            if drawMode == 1 {
+                drawArrow(from: f, to: t, color: colorNamed(curColor), width: curWidth)
+            } else {
+                drawBox(rect: NSRect(x: min(f.x, t.x), y: min(f.y, t.y),
+                                     width: abs(t.x - f.x), height: abs(t.y - f.y)),
+                        color: colorNamed(curColor), width: curWidth,
+                        shape: drawMode == 3 ? "ellipse" : "rect")
+            }
+        }
+
+        for it in items {
+            switch it {
+            case .pin(let p): drawPin(p)
+            case .arrow(let a): drawArrow(from: pxToPt(a.fromX, a.fromY), to: pxToPt(a.toX, a.toY),
+                                          color: colorNamed(a.color), width: a.width)
+            case .box(let b):
+                let tl = pxToPt(b.x, b.y + b.h)
+                drawBox(rect: NSRect(origin: tl, size: NSSize(width: CGFloat(b.w) / CGFloat(controller?.scale ?? 1),
+                                                              height: CGFloat(b.h) / CGFloat(controller?.scale ?? 1))),
+                        color: colorNamed(b.color), width: b.width, shape: b.shape)
+            }
+        }
+
+        // 悬停十字光标提示
+        if let h = hoverPoint, draftFrom == nil {
+            NSColor.white.withAlphaComponent(0.5).setStroke()
+            let path = NSBezierPath()
+            path.setLineDash([2, 6], count: 2, phase: 0)
+            path.move(to: NSPoint(x: h.x - 14, y: h.y)); path.line(to: NSPoint(x: h.x + 14, y: h.y))
+            path.move(to: NSPoint(x: h.x, y: h.y - 14)); path.line(to: NSPoint(x: h.x, y: h.y + 14))
+            path.stroke()
+        }
+
+        if let t = flashText, Date() < flashUntil {
+            let f = NSFont.systemFont(ofSize: 13, weight: .medium)
+            let attr: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
+            let size = (t as NSString).size(withAttributes: attr)
+            let rect = NSRect(x: bounds.midX - size.width / 2 - 8, y: 74,
+                              width: size.width + 16, height: size.height + 8)
+            NSColor.black.withAlphaComponent(0.85).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+            (t as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.minY + 4), withAttributes: attr)
+        }
+    }
+
+    func colorNamed(_ n: String) -> NSColor {
+        switch n {
+        case "yellow": return NSColor.systemYellow
+        case "cyan": return NSColor.systemTeal
+        default: return NSColor.systemRed
+        }
+    }
+
+    /// 钉子:XY 辅助线 + 圆钉 + 坐标气泡 + 信息签(app/窗口/OCR)
+    func drawPin(_ p: PinRecord) {
+        let pt = pxToPt(p.x, p.y)
+
+        // XY 辅助线
+        guideColor.setStroke()
+        let g = NSBezierPath()
+        g.setLineDash([6, 5], count: 2, phase: 0)
+        g.lineWidth = 1
+        g.move(to: NSPoint(x: 0, y: pt.y)); g.line(to: NSPoint(x: bounds.width, y: pt.y))
+        g.move(to: NSPoint(x: pt.x, y: 0)); g.line(to: NSPoint(x: pt.x, y: bounds.height))
+        g.stroke()
+
+        // 钉体
+        let r: CGFloat = 7
+        let dot = NSBezierPath(ovalIn: NSRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
+        NSColor.white.setFill(); dot.fill()
+        let inner = NSBezierPath(ovalIn: NSRect(x: pt.x - r + 2, y: pt.y - r + 2,
+                                                width: (r - 2) * 2, height: (r - 2) * 2))
+        NSColor.systemRed.setFill(); inner.fill()
+
+        // 坐标气泡
+        drawBubble(text: "⌗\(p.id)  \(p.x),\(p.y)", at: NSPoint(x: pt.x + 12, y: pt.y + 10))
+
+        // 信息签:备注 / 钉所在窗口(按坐标定位,可能≠前台主窗) / 前台应用 / OCR 近邻首行
+        var lines: [String] = []
+        if let n = p.note {
+            lines.append("✎ " + (n.count > 34 ? String(n.prefix(34)) + "…" : n))
+        }
+        if let o = p.windowOwner, !o.isEmpty {
+            let t = (p.windowTitle ?? "").isEmpty ? "" : " · " + String(p.windowTitle!.prefix(24))
+            lines.append("win: " + o + t)
+        }
+        if let n = controller?.appInfo.name, n != (p.windowOwner ?? "") { lines.append("app: " + n) }
+        if !p.ocrNearby.isEmpty {
+            let first = p.ocrNearby.components(separatedBy: " | ").first ?? ""
+            lines.append("ocr: " + (first.count > 34 ? String(first.prefix(34)) + "…" : first))
+        }
+        if !lines.isEmpty {
+            let h = CGFloat(lines.count) * 18 + 8
+            drawSign(lines: lines, at: NSPoint(x: pt.x + 12, y: pt.y - 8 - h))
+        }
+    }
+
+    /// 箭头:线 + 三角头(sharp 风格)
+    func drawArrow(from: NSPoint, to: NSPoint, color: NSColor, width: Int) {
+        color.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = CGFloat(width)
+        path.lineCapStyle = .round
+        path.move(to: from); path.line(to: to)
+        path.stroke()
+
+        let ang = atan2(to.y - from.y, to.x - from.x)
+        let head: CGFloat = CGFloat(width) * 3.5 + 8
+        let p1 = NSPoint(x: to.x - head * cos(ang - 0.42), y: to.y - head * sin(ang - 0.42))
+        let p2 = NSPoint(x: to.x - head * cos(ang + 0.42), y: to.y - head * sin(ang + 0.42))
+        let tri = NSBezierPath()
+        tri.move(to: to); tri.line(to: p1); tri.line(to: p2); tri.close()
+        color.setFill(); tri.fill()
+    }
+
+    /// 方框:描边 + 半透明填充
+    func drawBox(rect: NSRect, color: NSColor, width: Int, shape: String = "rect") {
+        color.withAlphaComponent(0.16).setFill()
+        rect.fill()
+        color.setStroke()
+        let p = (shape == "ellipse")
+            ? NSBezierPath(ovalIn: rect)
+            : NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
+        p.lineWidth = CGFloat(width)
+        p.stroke()
+    }
+
+    func drawBubble(text: String, at origin: NSPoint) {
+        let f = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let attr: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
+        let size = (text as NSString).size(withAttributes: attr)
+        let pad: CGFloat = 6
+        let rect = NSRect(x: origin.x, y: origin.y, width: size.width + pad * 2, height: size.height + 4)
+        NSColor.black.withAlphaComponent(0.82).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+        (text as NSString).draw(at: NSPoint(x: rect.minX + pad, y: rect.minY + 2), withAttributes: attr)
+    }
+
+    func drawSign(lines: [String], at origin: NSPoint) {
+        let f = NSFont.systemFont(ofSize: 12)
+        let attr: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
+        let wid = lines.map { ($0 as NSString).size(withAttributes: attr).width }.max() ?? 0
+        let h: CGFloat = 18
+        let rect = NSRect(x: origin.x, y: origin.y, width: wid + 16, height: h * CGFloat(lines.count) + 8)
+        NSColor.black.withAlphaComponent(0.72).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        NSColor.white.withAlphaComponent(0.25).setStroke()
+        let b = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8); b.lineWidth = 1; b.stroke()
+        for (i, line) in lines.enumerated() {
+            (line as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.maxY - 6 - h * CGFloat(i + 1)),
+                                    withAttributes: attr)
+        }
+    }
+
+    // MARK: 底部工具条(viewDidMoveToWindow 挂载,窗口就绪必然触发)
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.makeFirstResponder(self)
+        if window != nil, !toolBarAdded {
+            toolBarAdded = true
+            installToolBar()
+            needsDisplay = true
+        }
+    }
+    var toolBarAdded = false
+    var modeArrowBtn: NSButton?
+    var modeBoxBtn: NSButton?
+    var modeEllipseBtn: NSButton?
+
+    func installToolBar() {
+        let bar = DragBar(frame: NSRect(x: bounds.midX - 450, y: 16, width: 900, height: 44))
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
+        bar.layer?.cornerRadius = 10
+        bar.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        bar.layer?.borderWidth = 1
+
+        var x: CGFloat = 12
+        // 模式:箭头 / 方框 / 椭圆(方框·椭圆模式拖拽画区域图形;单击始终落钉)
+        let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+        a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
+        bar.addSubview(a); modeArrowBtn = a; x += 74
+        let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+        b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
+        bar.addSubview(b); modeBoxBtn = b; x += 74
+        let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+        e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
+        bar.addSubview(e); modeEllipseBtn = e; x += 78
+        refreshModeButtons()
+
+        for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
+            let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
+            dot.action = #selector(pickColor(_:)); dot.tag = tag
+            dot.target = self
+            bar.addSubview(dot); x += 26
+        }
+        x += 8
+        for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
+            let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
+            w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
+            bar.addSubview(w); x += 36
+        }
+        x += 10
+        let acts: [(String, Selector)] = [("⌘Z撤销", #selector(undo)),
+                                          ("清空", #selector(clearAll)),
+                                          ("复制JSON", #selector(copyJSON)),
+                                          ("完成✓", #selector(doneNow))]
+        for (t, sel) in acts {
+            let w = CGFloat(t.count * 15 + 20)
+            let btn = textBtn(t, frame: NSRect(x: x, y: 8, width: w, height: 28))
+            btn.action = sel; btn.target = self
+            bar.addSubview(btn); x += w + 8
+        }
+        addSubview(bar)
+    }
+
+    func refreshModeButtons() {
+        for (btn, mode) in [(modeArrowBtn, 1), (modeBoxBtn, 2), (modeEllipseBtn, 3)] {
+            btn?.layer?.borderColor = NSColor.white.cgColor
+            btn?.layer?.borderWidth = (drawMode == mode) ? 2 : 0
+            btn?.layer?.cornerRadius = 6
+        }
+    }
+
+    @objc func pickMode(_ s: NSButton) {
+        drawMode = s.tag - 20
+        refreshModeButtons()
+    }
+
+    func colorDot(_ c: NSColor, frame: NSRect) -> NSButton {
+        let b = NSButton(title: "", target: nil, action: nil)
+        b.frame = frame
+        b.bezelStyle = .texturedRounded
+        b.wantsLayer = true
+        b.layer?.backgroundColor = c.cgColor
+        b.layer?.cornerRadius = 10
+        b.layer?.borderColor = NSColor.white.withAlphaComponent(0.6).cgColor
+        b.layer?.borderWidth = 1.5
+        return b
+    }
+    func textBtn(_ t: String, frame: NSRect) -> NSButton {
+        let b = NSButton(title: t, target: nil, action: nil)
+        b.frame = frame
+        b.isBordered = false
+        b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
+        b.layer?.cornerRadius = 6
+        b.font = .systemFont(ofSize: 12, weight: .medium)
+        b.contentTintColor = .black
+        return b
+    }
+
+    @objc func pickColor(_ s: NSButton) {
+        curColor = ["red", "yellow", "cyan"][max(0, s.tag - 1)]
+    }
+    @objc func pickWidth(_ s: NSButton) {
+        curWidth = [2, 4, 6][max(0, s.tag - 11)]
+    }
+    @objc func copyJSON() {
+        guard let c = controller else { return }
+        let json = c.buildJSON(items: items)
+        let data = (try? JSONSerialization.data(withJSONObject: json,
+                        options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(String(data: data, encoding: .utf8) ?? "", forType: .string)
+        flashBubble("JSON 已复制(\(items.count) 笔)")
+    }
+    @objc func doneNow() { controller?.finish(copyToPasteboard: true) }
+
+    var flashText: String?
+    var flashUntil = Date.distantPast
+    func flashBubble(_ t: String) {
+        flashText = t
+        flashUntil = Date().addingTimeInterval(1.5)
+        needsDisplay = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { self.needsDisplay = true }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for a in trackingAreas { removeTrackingArea(a) }
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeAlways],
+                                       owner: self, userInfo: nil))
+    }
+}
+
+// MARK: - 备注输入框 delegate(回车走 action;Esc/失焦在这里收口)
+
+extension AnnotationView: NSTextFieldDelegate {
+    func controlTextDidEndEditing(_ obj: Notification) {
+        // 失焦(点到别处/切换)也把已输入内容落账
+        if let f = obj.object as? NSTextField, f == noteField {
+            noteFieldCommit(text: f.stringValue)
+        }
+    }
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation) {
+            noteFieldCommit(text: "")   // Esc = 跳过备注(钉子保留)
+            return true
+        }
+        return false
+    }
+}
+
+// MARK: - 入口
+
+let app = NSApplication.shared
+let ctrl = AnnoController.shared
+app.delegate = ctrl
+app.run()
