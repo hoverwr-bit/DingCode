@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY dingai_team_server.py .
+ENV DINGAI_TEAM_HOST=0.0.0.0
+ENV DINGAI_TEAM_PORT=8050
+ENV DINGAI_TEAM_ROOT=/data
+ENV DINGAI_TEAM_REQUIRE_AUTH=1
+VOLUME /data
+EXPOSE 8050
+CMD ["python3", "dingai_team_server.py"]
