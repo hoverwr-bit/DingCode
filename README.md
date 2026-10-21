@@ -46,6 +46,36 @@ GitHub Actions (`.github/workflows/dingcode.yml`) runs the Python and page check
 
 `⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. B / C / Q set the selected pin to bug, change, or question. Esc writes JSON and a PNG taken at that moment. New pins start `open`. An agent can later mark one `ai-fixed`; a person confirms it on the team board.
 
+## Auto-fix / 自动修复
+
+Auto mode is on by default. After Send (Esc or 完成), the Mac app binds the target and runs a headless agent in that project. Turn it off in the menu (自动模式:关) and Send goes back to copying the handoff prompt.
+
+The target is the page origin (`http://localhost:8090`) when a pin has a page URL, otherwise the window title, otherwise the app name. The first Send for an unbound target asks for a folder and stores it in `~/.dingcode/projects.json`.
+
+```
+python3 tools/dingcode/dingcode bind http://localhost:8090 ~/personal-hub
+python3 tools/dingcode/dingcode bindings
+python3 tools/dingcode/dingcode config engine claude
+python3 tools/dingcode/dingcode config engine codex
+python3 tools/dingcode/dingcode config auto off
+python3 tools/dingcode/dingcode autofix ~/DingCode/notes/anno.json
+```
+
+The default engine is Claude Code: `claude -p "<prompt>" --permission-mode acceptEdits`, run in the bound folder. Codex is `codex exec --full-auto` in that folder. The menu item 引擎 switches them. A Mac app does not inherit a login `PATH`; the CLI also looks in `~/.local/bin`, `/opt/homebrew/bin`, `~/.npm-global/bin`, and `~/.claude/local`. Set `DINGCODE_CLI` if the app cannot find `dingcode`.
+
+The prompt carries the handoff rules, the note, and the screenshot paths. It tells the agent to edit only inside the bound folder, keep the change small, not refactor, not add a framework, address each pin by id, and finish with JSON: each pin id maps to `status` (`fixed`, `not-fixed`, or `unsure`), a one-line Chinese `summary_zh` (what changed, which file and line), and `files`. Before the agent runs, DingCode records the folder without stashing: a git repo keeps `HEAD` plus `git diff` and copies of already-dirty files; any other folder is copied. After the run the menu-bar icon is idle, running, done (waiting for you), or failed. The notification looks like `1 pin fixed, 1 not fixed`. The results window shows that Chinese line, before/after shots, and the diff (green added, red removed), with 打开文件, 确认修好, and 打回并再修 for the current pin. The session stays open until every pin is confirmed. Each round is stored in `~/.dingcode/runs/<session>/round-N/` (`summary.json`, `diff.patch`, screenshots). 撤回本轮 restores that round's pre-run files.
+
+```
+python3 tools/dingcode/dingcode result <session>
+python3 tools/dingcode/dingcode revert <session> [round]
+```
+
+自动模式默认开启。在 Mac 上点发送（Esc 或「完成」）之后，DingCode 把当前目标绑到一个本地项目，并在那个目录里跑无头编程代理，不用再把提示词粘贴到对话框。菜单里关掉「自动模式」后，发送恢复成原来的复制交接提示。
+
+目标优先用页面 origin（例如 `http://localhost:8090`），没有页面地址时用窗口标题，再没有就用 App 名。某个目标第一次发送时会弹出文件夹选择，并写进 `~/.dingcode/projects.json`。
+
+默认引擎是 Claude Code（`claude -p`，`--permission-mode acceptEdits`）。菜单「引擎」可以改成 Codex（`codex exec --full-auto`）。两条命令都在绑定的项目目录里执行。提示词要求：只改这个目录里的文件、改动尽量小、不重构、不加框架、按钉子 id 处理，并用 JSON 交回每颗钉子的 `status`（fixed / not-fixed / unsure）、一句中文 `summary_zh`（改了什么、哪个文件第几行）和 `files`。开跑前先记下目录现状，不用 stash：是 git 仓库就记下提交号和 `git diff`，并复制已经改过的文件；不是仓库就把文件复制下来。菜单栏图标分空闲、进行中、待确认、失败。通知类似 `1 pin fixed, 1 not fixed`。结果窗口按钉子显示这句中文、改前/改后截图、绿增红删的差异，可以打开文件、确认修好，或写一句说明只打回这一颗。全部确认后这一轮才算结束。每一轮保存在 `~/.dingcode/runs/<session>/round-N/`（summary.json、diff.patch、截图）。「撤回本轮」把项目恢复到这一轮开始之前。`dingcode result <session>` 查看结果，`dingcode revert <session> [round]` 撤回。
+
 ## Desktop ↔ page bridge
 
 The macOS app listens on `127.0.0.1:8763` only. A page that has loaded `anno.js` answers `elementFromPoint` so a desktop pin landing in a browser can record the DOM field. Nothing else is contacted unless team upload is configured.

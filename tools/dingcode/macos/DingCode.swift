@@ -18,6 +18,7 @@ import Carbon.HIToolbox
 import ImageIO
 import Network
 import ScreenCaptureKit
+import UserNotifications
 import Vision
 
 func dingcodeEnv(_ suffix: String) -> String? {
@@ -639,6 +640,30 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     var verifyPinIndex = -1
     var verifyPinId = ""
     var verifyNoteId = ""
+    var autoMenuItem: NSMenuItem?
+    var engineMenuItem: NSMenuItem?
+    var runMenuItem: NSMenuItem?
+    var autofixPoll: Timer?
+    var autofixProc: Process?
+    var autofixNoteURL: URL?
+    var autofixRound = 1
+    var autofixSession = ""
+    var autofixWatching = false
+    var autofixBeforeFull: CGImage?
+    var autofixAfter: CGImage?
+    var autofixPins: [[String: Any]] = []
+    var autofixCursor = 0
+    var sendBackField: NSTextField?
+    var autofixBeforeView: NSImageView?
+    var autofixAfterView: NSImageView?
+    var autofixCaption: NSTextField?
+    var autofixSummaryLabel: NSTextField?
+    var autofixStatusLabel: NSTextField?
+    var autofixDiffView: NSTextView?
+    var autofixOpenButton: NSButton?
+    var autofixFiles: [String] = []
+    var autofixFolder = ""
+    var cliCache: (String, [String])?
 
     override init() {
         let relative = dingcodeEnv("OUTPUT_DIR") ?? ProcessInfo.processInfo.environment["ANNO_OUTPUT_DIR"]
@@ -700,6 +725,18 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "检查本次改动", action: #selector(checkScope), keyEquivalent: "")
         menu.addItem(withTitle: "复核上一批", action: #selector(recaptureLast), keyEquivalent: "")
         menu.addItem(withTitle: "导出 GitHub Issue", action: #selector(exportIssue), keyEquivalent: "")
+        let cfg = loadAutoConfig()
+        let autoItem = NSMenuItem(title: cfg.auto ? "自动模式:开" : "自动模式:关", action: #selector(toggleAutoMode), keyEquivalent: "")
+        menu.addItem(autoItem)
+        autoMenuItem = autoItem
+        let engineItem = NSMenuItem(title: cfg.engine == "codex" ? "引擎:Codex" : "引擎:Claude Code", action: #selector(toggleEngine), keyEquivalent: "")
+        menu.addItem(engineItem)
+        engineMenuItem = engineItem
+        let runItem = NSMenuItem(title: "自动修复:空闲", action: nil, keyEquivalent: "")
+        runItem.isEnabled = false
+        menu.addItem(runItem)
+        runMenuItem = runItem
+        menu.addItem(withTitle: "撤回最近一轮", action: #selector(autofixRevertRound), keyEquivalent: "")
         let axItem = NSMenuItem(title: AXIsProcessTrusted() ? "辅助功能:已允许(控件跟随)" : "辅助功能:未允许,点此请求",
                                 action: #selector(askAX), keyEquivalent: "")
         menu.addItem(axItem)
@@ -715,7 +752,22 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    func statusIcon() -> NSImage? {
+    func statusIcon(_ state: String = "idle") -> NSImage? {
+        let symbol: String
+        switch state {
+        case "running": symbol = "arrow.triangle.2.circlepath"
+        case "done": symbol = "checkmark.circle"
+        case "failed": symbol = "exclamationmark.triangle"
+        default: symbol = "pin.fill"
+        }
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: state) {
+            img.isTemplate = true
+            return img
+        }
+        return drawnPin()
+    }
+
+    func drawnPin() -> NSImage? {
         let img = NSImage(size: NSSize(width: 18, height: 18))
         img.lockFocus()
         NSColor.black.setFill()
@@ -1112,16 +1164,20 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                         .appendingPathComponent("anno-" + stamp() + ".json")
         try? data.write(to: url)
         recordHandoffBaseline()
-        if copyToPasteboard {
-            let text = String(data: data, encoding: .utf8) ?? ""
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(handoffPrompt(text), forType: .string)
+        let auto = copyToPasteboard && loadAutoConfig().auto
+        if copyToPasteboard && !auto {
+            copyPrompt(data)
         }
         let shotCopy = shotURL
         overlay?.orderOut(nil)
         overlay = nil
         shotCG = nil
         reportToTeam(json: json, jsonData: data, noteFile: url, shotFile: shotCopy)
+        if auto {
+            let pins = json["pins"] as? [[String: Any]] ?? []
+            if pins.isEmpty { copyPrompt(data) }
+            else { startAutoFixAfterSend(json: json, noteFile: url, data: data) }
+        }
         done?()
     }
 
@@ -1934,6 +1990,613 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         }.resume()
         sem.wait()
         return posted
+    }
+
+    func dotConfigDir() -> String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".dingcode")
+    }
+
+    func readJSONFile(_ path: String) -> [String: Any] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return obj
+    }
+
+    func writeJSONFile(_ path: String, _ obj: [String: Any]) {
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+
+    func stringMap(_ value: Any?) -> [String: String] {
+        guard let raw = value as? [String: Any] else { return [:] }
+        var out: [String: String] = [:]
+        for (key, item) in raw {
+            if let text = item as? String { out[key] = text }
+        }
+        return out
+    }
+
+    func loadAutoConfig() -> (engine: String, auto: Bool) {
+        let obj = readJSONFile((dotConfigDir() as NSString).appendingPathComponent("config.json"))
+        let engine = (obj["engine"] as? String) == "codex" ? "codex" : "claude"
+        let auto = obj["auto"] as? Bool ?? true
+        return (engine, auto)
+    }
+
+    func saveAutoConfig(engine: String, auto: Bool) {
+        writeJSONFile((dotConfigDir() as NSString).appendingPathComponent("config.json"), ["engine": engine, "auto": auto])
+    }
+
+    func refreshAutoMenu() {
+        let cfg = loadAutoConfig()
+        autoMenuItem?.title = cfg.auto ? "自动模式:开" : "自动模式:关"
+        engineMenuItem?.title = cfg.engine == "codex" ? "引擎:Codex" : "引擎:Claude Code"
+    }
+
+    @objc func toggleAutoMode() {
+        let cfg = loadAutoConfig()
+        saveAutoConfig(engine: cfg.engine, auto: !cfg.auto)
+        refreshAutoMenu()
+    }
+
+    @objc func toggleEngine() {
+        let cfg = loadAutoConfig()
+        saveAutoConfig(engine: cfg.engine == "codex" ? "claude" : "codex", auto: cfg.auto)
+        refreshAutoMenu()
+    }
+
+    func normalizeTarget(_ raw: String) -> String {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.contains("://"), let url = URL(string: text), let host = url.host, let scheme = url.scheme, !host.isEmpty else {
+            return text
+        }
+        if let port = url.port { return "\(scheme)://\(host):\(port)" }
+        return "\(scheme)://\(host)"
+    }
+
+    func bindingTarget(_ json: [String: Any]) -> String {
+        if let pins = json["pins"] as? [[String: Any]] {
+            for pin in pins {
+                if let page = pin["page"] as? [String: Any], let url = page["url"] as? String {
+                    let origin = normalizeTarget(url)
+                    if origin.contains("://") { return origin }
+                }
+            }
+        }
+        if let window = json["window"] as? [String: Any], let title = window["title"] as? String {
+            let text = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        if let app = json["app"] as? [String: Any], let name = app["name"] as? String {
+            let text = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        return ""
+    }
+
+    func lookupFolder(_ target: String) -> String? {
+        let obj = readJSONFile((dotConfigDir() as NSString).appendingPathComponent("projects.json"))
+        let bindings = stringMap(obj["bindings"])
+        let key = normalizeTarget(target)
+        if let folder = bindings[key], !folder.isEmpty { return folder }
+        if let folder = bindings[target], !folder.isEmpty { return folder }
+        return nil
+    }
+
+    func saveBinding(_ target: String, _ folder: String) {
+        let key = normalizeTarget(target)
+        guard !key.isEmpty else { return }
+        let path = (dotConfigDir() as NSString).appendingPathComponent("projects.json")
+        var obj = readJSONFile(path)
+        var bindings = stringMap(obj["bindings"])
+        bindings[key] = folder
+        obj["bindings"] = bindings
+        writeJSONFile(path, obj)
+    }
+
+    func copyPrompt(_ data: Data) {
+        let text = String(data: data, encoding: .utf8) ?? ""
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(handoffPrompt(text), forType: .string)
+    }
+
+    func askProjectFolder(for target: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "绑定"
+        panel.message = "把 \(target) 绑定到本地项目文件夹。之后发送会在这个目录里自动修复。"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
+    }
+
+    func handoffCommand() -> (String, [String])? {
+        if let cached = cliCache { return cached }
+        if let cli = dingcodeEnv("CLI"), FileManager.default.isExecutableFile(atPath: cli) {
+            cliCache = (cli, [])
+            return cliCache
+        }
+        let exe = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
+        let dir = (exe as NSString).deletingLastPathComponent
+        for raw in ["../handoff.py", "../../../../handoff.py"] {
+            let path = ((dir as NSString).appendingPathComponent(raw) as NSString).standardizingPath
+            if FileManager.default.fileExists(atPath: path) {
+                cliCache = ("/usr/bin/python3", [path])
+                return cliCache
+            }
+        }
+        let home = NSHomeDirectory()
+        for bin in ["\(home)/.local/bin", "/opt/homebrew/bin", "\(home)/.npm-global/bin", "\(home)/.claude/local", "/usr/local/bin"] {
+            let path = (bin as NSString).appendingPathComponent("dingcode")
+            if FileManager.default.isExecutableFile(atPath: path) {
+                cliCache = (path, [])
+                return cliCache
+            }
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = ["-lc", "command -v dingcode"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        if (try? proc.run()) != nil {
+            proc.waitUntilExit()
+            let found = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !found.isEmpty, FileManager.default.isExecutableFile(atPath: found) {
+                cliCache = (found, [])
+                return cliCache
+            }
+        }
+        return nil
+    }
+
+    func notifyUser(_ title: String, _ body: String) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
+            guard ok else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+    }
+
+    func setRunTitle(_ text: String) {
+        if text.isEmpty {
+            statusItem?.length = NSStatusItem.squareLength
+            statusItem?.button?.title = ""
+        } else {
+            statusItem?.length = NSStatusItem.variableLength
+            statusItem?.button?.title = " " + text
+        }
+    }
+
+    func applyRunState(_ state: String, menu: String? = nil) {
+        statusItem?.button?.image = statusIcon(state)
+        switch state {
+        case "running":
+            setRunTitle("修复中")
+            runMenuItem?.title = menu ?? "自动修复:进行中"
+        case "done":
+            setRunTitle("待确认")
+            runMenuItem?.title = menu ?? "自动修复:待确认"
+        case "failed":
+            setRunTitle("失败")
+            runMenuItem?.title = menu ?? "自动修复:失败"
+        default:
+            setRunTitle("")
+            runMenuItem?.title = menu ?? "自动修复:空闲"
+        }
+    }
+
+    func startAutoFixAfterSend(json: [String: Any], noteFile: URL, data: Data) {
+        let target = bindingTarget(json)
+        if target.isEmpty {
+            copyPrompt(data)
+            notifyUser("没有可绑定的目标", "这次已复制交接提示。")
+            return
+        }
+        if lookupFolder(target) == nil {
+            guard let picked = askProjectFolder(for: target) else {
+                copyPrompt(data)
+                return
+            }
+            saveBinding(target, picked)
+        }
+        launchAutofix(note: noteFile, round: 1, feedback: "", pin: "")
+    }
+
+    func launchAutofix(note: URL, round: Int, feedback: String, pin: String) {
+        guard let cmd = handoffCommand() else {
+            notifyUser("找不到 dingcode", "设置 DINGCODE_CLI，或把 dingcode 放到 PATH。")
+            if let data = try? Data(contentsOf: note) { copyPrompt(data) }
+            return
+        }
+        autofixNoteURL = note
+        autofixRound = round
+        autofixSession = note.deletingPathExtension().lastPathComponent
+        var args = cmd.1 + ["autofix", note.path, "--round", String(round)]
+        if !feedback.isEmpty { args += ["--feedback", feedback] }
+        if !pin.isEmpty { args += ["--pin", pin] }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: cmd.0)
+        proc.arguments = args
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        proc.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.pollAutofix() }
+        }
+        do { try proc.run() } catch {
+            notifyUser("自动修复没有启动", error.localizedDescription)
+            return
+        }
+        autofixProc = proc
+        autofixWatching = true
+        applyRunState("running", menu: "自动修复:进行中 第\(round)轮")
+        autofixPoll?.invalidate()
+        autofixPoll = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollAutofix()
+        }
+    }
+
+    func runStatus() -> [String: Any]? {
+        guard !autofixSession.isEmpty else { return nil }
+        let path = (dotConfigDir() as NSString).appendingPathComponent("runs/\(autofixSession)/status.json")
+        let obj = readJSONFile(path)
+        return obj.isEmpty ? nil : obj
+    }
+
+    func pollAutofix() {
+        guard autofixWatching else { return }
+        guard let obj = runStatus(), let status = obj["status"] as? String, !status.isEmpty else { return }
+        if status == "running" {
+            let round = jsonInt(obj["round"])
+            applyRunState("running", menu: round > 0 ? "自动修复:进行中 第\(round)轮" : "自动修复:进行中")
+            return
+        }
+        autofixWatching = false
+        autofixPoll?.invalidate()
+        autofixPoll = nil
+        autofixFolder = (obj["folder"] as? String) ?? autofixFolder
+        if let round = obj["round"] as? NSNumber, round.intValue > 0 { autofixRound = round.intValue }
+        if status == "failed" {
+            let err = (obj["error"] as? String) ?? ""
+            applyRunState("failed")
+            let line = (obj["summary_en"] as? String) ?? ""
+            notifyUser("自动修复失败", line.isEmpty ? (err.isEmpty ? "查看 ~/.dingcode/runs/\(autofixSession)/log.txt" : err) : line)
+            if let url = autofixNoteURL, FileManager.default.fileExists(atPath: roundPath(autofixRound) + "/summary.json") {
+                reviewAutofix(url)
+            }
+            return
+        }
+        applyRunState("done")
+        let line = (obj["summary_en"] as? String) ?? (obj["summary_line"] as? String) ?? "看改前改后，确认或打回。"
+        notifyUser("自动修复完成", line)
+        if let url = autofixNoteURL { reviewAutofix(url) }
+    }
+
+    func reviewAutofix(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let note = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pins = note["pins"] as? [[String: Any]], !pins.isEmpty else { return }
+        autofixNoteURL = url
+        autofixPins = pins
+        autofixCursor = pins.firstIndex { ($0["status"] as? String) != "confirmed" } ?? 0
+        var before: CGImage?
+        if let shotName = note["screenshot"] as? String, !shotName.isEmpty {
+            let beforeURL = outputRoot.appendingPathComponent("shots").appendingPathComponent(shotName)
+            if let src = CGImageSourceCreateWithURL(beforeURL as CFURL, nil) {
+                before = CGImageSourceCreateImageAtIndex(src, 0, nil)
+            }
+        }
+        autofixBeforeFull = before
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main else {
+            showAutofixReview()
+            return
+        }
+        let scale = screen.backingScaleFactor
+        let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0
+        captureDisplay(displayID: displayID, wanted: screen.frame, pxScale: scale) { [weak self] cg in
+            guard let self else { return }
+            if cg == nil { self.notifyUser("截图失败", "请允许屏幕录制后再看改后。") }
+            self.autofixAfter = cg
+            self.archiveRoundShots(before: before, after: cg)
+            self.showAutofixReview()
+        }
+    }
+
+    func roundPath(_ round: Int) -> String {
+        (dotConfigDir() as NSString).appendingPathComponent("runs/\(autofixSession)/round-\(round)")
+    }
+
+    func writePNG(_ image: CGImage, to path: String) {
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
+    }
+
+    func archiveRoundShots(before: CGImage?, after: CGImage?) {
+        let dir = roundPath(autofixRound)
+        if let before { writePNG(before, to: (dir as NSString).appendingPathComponent("before.png")) }
+        if let after { writePNG(after, to: (dir as NSString).appendingPathComponent("after.png")) }
+    }
+
+    func mergedPinRows() -> [String: [String: Any]] {
+        var rows: [String: [String: Any]] = [:]
+        let root = (dotConfigDir() as NSString).appendingPathComponent("runs/\(autofixSession)")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
+        let rounds = names.filter { $0.hasPrefix("round-") }.sorted {
+            jsonInt(String($0.dropFirst(6))) < jsonInt(String($1.dropFirst(6)))
+        }
+        for name in rounds {
+            let summary = readJSONFile((root as NSString).appendingPathComponent("\(name)/summary.json"))
+            for pin in summary["pins"] as? [[String: Any]] ?? [] {
+                let key: String
+                if let text = pin["id"] as? String, !text.isEmpty { key = text }
+                else if let num = pin["id"] as? NSNumber { key = num.stringValue }
+                else { continue }
+                rows[key] = pin
+            }
+        }
+        return rows
+    }
+
+    func coloredDiff(_ text: String) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let body = text.isEmpty ? "这一轮没有代码差异。\n" : text
+        for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
+            let raw = String(line) + "\n"
+            let color: NSColor
+            if raw.hasPrefix("+"), !raw.hasPrefix("+++") { color = .systemGreen }
+            else if raw.hasPrefix("-"), !raw.hasPrefix("---") { color = .systemRed }
+            else { color = .labelColor }
+            result.append(NSAttributedString(string: raw, attributes: [.font: font, .foregroundColor: color]))
+        }
+        return result
+    }
+
+    func croppedPin(_ image: CGImage?, _ pin: [String: Any], mapped: Bool) -> NSImage? {
+        guard let image else { return nil }
+        var x = jsonInt(pin["x_px"])
+        var y = jsonInt(pin["y_px"])
+        if mapped, let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main,
+           let hit = pinOnCurrentWindow(pin, screen: screen, scale: screen.backingScaleFactor) {
+            x = hit.x
+            y = hit.y
+        }
+        let crop = cropAround(image, x: x, y: y) ?? image
+        return NSImage(cgImage: crop, size: NSSize(width: crop.width, height: crop.height))
+    }
+
+    func pinCaption(_ pin: [String: Any], _ index: Int) -> String {
+        let raw = pin["id"]
+        let id: String
+        if let text = raw as? String, !text.isEmpty { id = text }
+        else { id = String(jsonInt(raw) == 0 ? index + 1 : jsonInt(raw)) }
+        return "第 \(autofixRound) 轮 · 钉 \(index + 1)/\(autofixPins.count) · id \(id)"
+    }
+
+    func showAutofixReview() {
+        if verifyWindow == nil { buildAutofixWindow() }
+        refreshAutofixImages()
+        verifyWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func buildAutofixWindow() {
+        let width: CGFloat = 980
+        let height: CGFloat = 780
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "自动修复"
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let caption = NSTextField(labelWithString: "")
+        caption.frame = NSRect(x: 20, y: 746, width: 700, height: 22)
+        caption.alignment = .left
+        content.addSubview(caption)
+        autofixCaption = caption
+        let status = NSTextField(labelWithString: "")
+        status.frame = NSRect(x: 730, y: 746, width: 230, height: 22)
+        status.alignment = .right
+        status.font = .systemFont(ofSize: 13, weight: .semibold)
+        content.addSubview(status)
+        autofixStatusLabel = status
+        let summary = NSTextField(wrappingLabelWithString: "")
+        summary.frame = NSRect(x: 20, y: 688, width: 940, height: 52)
+        summary.maximumNumberOfLines = 2
+        content.addSubview(summary)
+        autofixSummaryLabel = summary
+        func side(_ text: String, _ x: CGFloat) {
+            let field = NSTextField(labelWithString: text)
+            field.frame = NSRect(x: x, y: 660, width: 460, height: 22)
+            field.alignment = .center
+            content.addSubview(field)
+        }
+        side("改前", 20)
+        side("改后", 500)
+        let beforeView = NSImageView(frame: NSRect(x: 20, y: 348, width: 460, height: 308))
+        beforeView.imageScaling = .scaleProportionallyUpOrDown
+        let afterView = NSImageView(frame: NSRect(x: 500, y: 348, width: 460, height: 308))
+        afterView.imageScaling = .scaleProportionallyUpOrDown
+        content.addSubview(beforeView)
+        content.addSubview(afterView)
+        autofixBeforeView = beforeView
+        autofixAfterView = afterView
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 108, width: 940, height: 230))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 920, height: 230))
+        text.isEditable = false
+        text.isRichText = true
+        text.autoresizingMask = [.width]
+        text.textContainer?.widthTracksTextView = true
+        scroll.documentView = text
+        content.addSubview(scroll)
+        autofixDiffView = text
+        let field = NSTextField(frame: NSRect(x: 20, y: 64, width: 700, height: 26))
+        field.placeholderString = "打回说明（可选），只重跑这一颗钉子"
+        content.addSubview(field)
+        sendBackField = field
+        func button(_ title: String, _ x: CGFloat, _ w: CGFloat, _ action: Selector) -> NSButton {
+            let btn = NSButton(title: title, target: self, action: action)
+            btn.frame = NSRect(x: x, y: 16, width: w, height: 32)
+            btn.bezelStyle = .rounded
+            return btn
+        }
+        content.addSubview(button("确认修好", 20, 130, #selector(autofixConfirm)))
+        content.addSubview(button("打回并再修", 160, 140, #selector(autofixSendBack)))
+        content.addSubview(button("下一钉", 310, 110, #selector(autofixNext)))
+        let open = button("打开文件", 430, 140, #selector(autofixOpenFile))
+        content.addSubview(open)
+        autofixOpenButton = open
+        content.addSubview(button("撤回本轮", 580, 140, #selector(autofixRevertRound)))
+        win.contentView = content
+        win.center()
+        verifyWindow = win
+    }
+
+    func refreshAutofixImages() {
+        guard autofixPins.indices.contains(autofixCursor) else { return }
+        let pin = autofixPins[autofixCursor]
+        let pid = pinIdString(pin, index: autofixCursor)
+        autofixCaption?.stringValue = pinCaption(pin, autofixCursor)
+        verifyWindow?.title = "自动修复 第 \(autofixRound) 轮"
+        autofixBeforeView?.image = croppedPin(autofixBeforeFull, pin, mapped: false)
+        autofixAfterView?.image = croppedPin(autofixAfter, pin, mapped: true)
+        let row = mergedPinRows()[pid] ?? [:]
+        let state = (row["status"] as? String) ?? "unsure"
+        let zh = (row["summary_zh"] as? String) ?? ""
+        autofixSummaryLabel?.stringValue = zh.isEmpty ? "没有中文说明" : zh
+        switch state {
+        case "fixed":
+            autofixStatusLabel?.stringValue = "已改"
+            autofixStatusLabel?.textColor = .systemGreen
+        case "not-fixed":
+            autofixStatusLabel?.stringValue = "未改"
+            autofixStatusLabel?.textColor = .systemRed
+        default:
+            autofixStatusLabel?.stringValue = "不确定"
+            autofixStatusLabel?.textColor = .secondaryLabelColor
+        }
+        let reverted = (readJSONFile(roundPath(autofixRound) + "/summary.json")["reverted"] as? Bool) == true
+        if reverted { autofixStatusLabel?.stringValue = (autofixStatusLabel?.stringValue ?? "") + " · 已撤回" }
+        let diff = (row["diff"] as? String) ?? ""
+        autofixDiffView?.textStorage?.setAttributedString(coloredDiff(diff))
+        autofixFiles = stringList(row["files"])
+        autofixOpenButton?.toolTip = autofixFiles.joined(separator: "\n")
+        if autofixFolder.isEmpty {
+            autofixFolder = (runStatus()?["folder"] as? String) ?? ""
+        }
+    }
+
+    func stringList(_ value: Any?) -> [String] {
+        if let list = value as? [String] { return list }
+        guard let list = value as? [Any] else { return [] }
+        return list.compactMap { $0 as? String }
+    }
+
+    func pinIdString(_ pin: [String: Any], index: Int) -> String {
+        let numbered = jsonInt(pin["id"])
+        if let text = pin["id"] as? String, !text.isEmpty, Int(text) == nil { return text }
+        return numbered == 0 ? String(index + 1) : String(numbered)
+    }
+
+    func rewritePinStatus(_ index: Int, _ status: String) {
+        guard let url = autofixNoteURL,
+              let data = try? Data(contentsOf: url),
+              var note = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var pins = note["pins"] as? [[String: Any]],
+              pins.indices.contains(index) else { return }
+        pins[index]["status"] = status
+        note["pins"] = pins
+        if let out = try? JSONSerialization.data(withJSONObject: note, options: [.prettyPrinted, .sortedKeys]) {
+            try? out.write(to: url)
+        }
+        autofixPins = pins
+        let choice = syncChoice()
+        guard choice.mode == "server", let host = choice.hosts.first else { return }
+        let noteId = url.deletingPathExtension().lastPathComponent
+        let pinId = pinIdString(pins[index], index: index)
+        let project = choice.project
+        let token = choice.token
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.postPinStatus(host: host, token: token, project: project, noteId: noteId, pinId: pinId, status: status)
+        }
+    }
+
+    @objc func autofixConfirm() {
+        rewritePinStatus(autofixCursor, "confirmed")
+        if let next = autofixPins.indices.first(where: { ($0 > autofixCursor) && (autofixPins[$0]["status"] as? String) != "confirmed" })
+            ?? autofixPins.indices.first(where: { (autofixPins[$0]["status"] as? String) != "confirmed" }) {
+            autofixCursor = next
+            refreshAutofixImages()
+            return
+        }
+        verifyWindow?.orderOut(nil)
+        verifyWindow = nil
+        applyRunState("idle")
+        notifyUser("全部确认", "这一批钉子都已确认。")
+    }
+
+    @objc func autofixNext() {
+        guard !autofixPins.isEmpty else { return }
+        autofixCursor = (autofixCursor + 1) % autofixPins.count
+        refreshAutofixImages()
+    }
+
+    @objc func autofixSendBack() {
+        let feedback = sendBackField?.stringValue ?? ""
+        let pin = autofixPins.indices.contains(autofixCursor) ? autofixPins[autofixCursor] : [:]
+        let pid = pinIdString(pin, index: autofixCursor)
+        verifyWindow?.orderOut(nil)
+        verifyWindow = nil
+        if autofixRound >= 3 {
+            applyRunState("failed", menu: "自动修复:已停止")
+            notifyUser("已到 3 轮", "自动修复停止。剩下的钉请手工处理。")
+            return
+        }
+        guard let url = autofixNoteURL else { return }
+        let note = feedback.isEmpty ? "请再看这颗钉子" : feedback
+        launchAutofix(note: url, round: autofixRound + 1, feedback: "pin \(pid): \(note)", pin: pid)
+    }
+
+    @objc func autofixOpenFile() {
+        guard let rel = autofixFiles.first, !rel.contains(".."), !autofixFolder.isEmpty else {
+            notifyUser("没有文件", "这颗钉子没有对应到项目里的文件。")
+            return
+        }
+        let url = URL(fileURLWithPath: autofixFolder).appendingPathComponent(rel)
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func autofixRevertRound() {
+        guard !autofixSession.isEmpty, let cmd = handoffCommand() else {
+            notifyUser("没有可撤回的一轮", "先跑完一次自动修复。")
+            return
+        }
+        let session = autofixSession
+        let round = String(max(autofixRound, 1))
+        let args = cmd.1 + ["revert", session, round]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: cmd.0)
+            proc.arguments = args
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            proc.waitUntilExit()
+            let ok = proc.terminationStatus == 0
+            DispatchQueue.main.async {
+                self?.notifyUser(ok ? "已撤回本轮" : "撤回失败", ok ? "项目已回到这一轮之前。" : "查看 ~/.dingcode/runs/\(session)/round-\(round)")
+                self?.refreshAutofixImages()
+            }
+        }
     }
 
     @objc func checkScope() {

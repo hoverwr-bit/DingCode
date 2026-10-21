@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 # matching LSMinimumSystemVersion, or LaunchServices refuses to open the app (-10825).
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos14.0" -o DingCode DingCode.swift \
   -framework AppKit -framework AVFoundation -framework AudioToolbox -framework Carbon \
-  -framework Vision -framework ScreenCaptureKit -framework ApplicationServices
+  -framework UserNotifications -framework Vision -framework ScreenCaptureKit -framework ApplicationServices
 
 APP="DingCode.app"
 rm -rf "$APP"
