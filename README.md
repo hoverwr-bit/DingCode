@@ -97,6 +97,39 @@ python3 tools/dingcode/dingcode mcp
 
 `pins` and `mark-fixed` are also MCP tools (`dingcode_list_pins`, `dingcode_mark_fixed`). They read the shared folder or the team server from the settings above. Marking a pin fixed stores the PNG next to the pin. The handoff prompt stays the first MCP tool.
 
+## MCP
+
+`dingcode mcp` speaks MCP on stdio. A client that sends one JSON object per line (Claude Code, Codex, Cursor) gets newline-delimited replies. A client that sends `Content-Length` frames still gets that framing. Put `dingcode` on `PATH`, or call `python3 tools/dingcode/dingcode mcp`.
+
+Claude Code:
+
+```
+claude mcp add -s user dingcode -- dingcode mcp
+```
+
+Codex (`~/.codex/config.toml`):
+
+```
+[mcp_servers.dingcode]
+command = "dingcode"
+args = ["mcp"]
+```
+
+Cursor (`~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "dingcode": {
+      "command": "dingcode",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+pi has no MCP client. This repo ships [skills/dingcode/SKILL.md](skills/dingcode/SKILL.md). Point pi at that skill and it uses the `dingcode` CLI (`prompt`, `pins`, `mark-fixed`, `scope`).
+
 The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
 
 After the agent marks the pin fixed, compare the tree with the snapshot taken at export:

@@ -27,7 +27,7 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py session end <id>
   python3 handoff.py session list
   python3 handoff.py update                 # only contacts GitHub when DINGCODE_UPDATE=1
-  python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
+  python3 handoff.py mcp                    # stdio MCP: newline-delimited JSON, or Content-Length
 """
 
 import json
@@ -451,12 +451,18 @@ def handle_rpc(msg):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}}
 
 
+_NDJSON = [False]
+
+
 def read_message(stream):
     headers = {}
     while True:
         line = stream.readline()
         if not line:
             return None
+        if not headers and line.lstrip().startswith(b"{"):
+            _NDJSON[0] = True
+            return json.loads(line.decode("utf-8"))
         if line in (b"\r\n", b"\n"):
             break
         decoded = line.decode("utf-8", "replace")
@@ -473,6 +479,10 @@ def read_message(stream):
 
 def write_message(obj, stream):
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    if _NDJSON[0]:
+        stream.write(data + b"\n")
+        stream.flush()
+        return
     stream.write(("Content-Length: %d\r\n\r\n" % len(data)).encode("ascii") + data)
     stream.flush()
 

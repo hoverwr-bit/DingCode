@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -67,13 +68,37 @@ class HandoffTests(unittest.TestCase):
         self.assertIsNone(handoff.handle_rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
     def test_framing_roundtrip(self):
+        handoff._NDJSON[0] = False
         raw = io.BytesIO()
         handoff.write_message({"jsonrpc": "2.0", "id": 1, "method": "ping"}, raw)
+        self.assertTrue(raw.getvalue().startswith(b"Content-Length:"))
         raw.seek(0)
         msg = handoff.read_message(raw)
         self.assertEqual(msg["method"], "ping")
         reply = handoff.handle_rpc(msg)
         self.assertEqual(reply["result"], {})
+
+    def test_ndjson_initialize_and_tools_list(self):
+        handoff._NDJSON[0] = False
+        stdin = io.BytesIO(
+            b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
+            b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
+        )
+        stdout = io.BytesIO()
+        try:
+            handoff.serve_mcp(stdin, stdout)
+            lines = [line for line in stdout.getvalue().split(b"\n") if line]
+            self.assertEqual(len(lines), 2)
+            self.assertFalse(any(line.startswith(b"Content-Length") for line in lines))
+            init = json.loads(lines[0])
+            listed = json.loads(lines[1])
+            self.assertEqual(init["id"], 1)
+            self.assertEqual(init["result"]["serverInfo"]["name"], "dingcode")
+            names = [tool["name"] for tool in listed["result"]["tools"]]
+            self.assertIn("dingcode_handoff", names)
+            self.assertEqual(listed["id"], 2)
+        finally:
+            handoff._NDJSON[0] = False
 
     def test_lists_and_marks_a_shared_folder_pin(self):
         import core.sync as sync
