@@ -1,0 +1,44 @@
+name: dingcode
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Core, handoff, team server, and Linux checks
+        working-directory: tools/dingcode
+        run: |
+          python3 -m unittest core.test_core handoff_test linux.test_linux
+          python3 -m unittest discover -s team-server -p 'test_*.py'
+          node --check web/anno.js
+          node web/anno-layout.test.js
+          node web/anno-source.test.js
+          node web/anno-i18n.test.js
+          node --check extension/background.js
+          node --check extension/content.js
+      - name: Team server image
+        run: docker build -f tools/dingcode/team-server/Dockerfile -t dingcode-team tools/dingcode
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build DingCode
+        run: dotnet build tools/dingcode/windows/DingCodeWin.csproj -c Release
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DingCode
+        run: bash tools/dingcode/macos/build.sh

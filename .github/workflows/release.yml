@@ -1,4 +1,4 @@
-name: dingai-release
+name: dingcode-release
 
 on:
   push:
@@ -16,18 +16,18 @@ jobs:
       - name: Pack the Python tools
         run: |
           mkdir -p dist
-          tar -czf dist/dingai-linux.tar.gz tools/dingai
+          tar -czf dist/dingcode-linux.tar.gz tools/dingcode
       - uses: actions/upload-artifact@v4
         with:
-          name: dingai-linux
-          path: dist/dingai-linux.tar.gz
+          name: dingcode-linux
+          path: dist/dingcode-linux.tar.gz
 
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build DingAI.app
-        run: bash tools/dingai/macos/build.sh
+      - name: Build DingCode.app
+        run: bash tools/dingcode/macos/build.sh
       - name: Sign and notarize when Apple secrets are present
         env:
           P12: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
@@ -48,17 +48,17 @@ jobs:
           security import cert.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
           IDENTITY=$(security find-identity -v -p codesigning build.keychain | sed -n 's/.*"\(.*\)"/\1/p' | head -1)
-          codesign --force --options runtime --sign "$IDENTITY" tools/dingai/macos/DingAI.app
-          ditto -c -k --keepParent tools/dingai/macos/DingAI.app DingAI-mac.zip
-          xcrun notarytool submit DingAI-mac.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait
-          xcrun stapler staple tools/dingai/macos/DingAI.app
-          rm -f cert.p12 DingAI-mac.zip
+          codesign --force --options runtime --sign "$IDENTITY" tools/dingcode/macos/DingCode.app
+          ditto -c -k --keepParent tools/dingcode/macos/DingCode.app DingCode-mac.zip
+          xcrun notarytool submit DingCode-mac.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD" --wait
+          xcrun stapler staple tools/dingcode/macos/DingCode.app
+          rm -f cert.p12 DingCode-mac.zip
       - name: Zip the app
-        run: mkdir -p dist && ditto -c -k --keepParent tools/dingai/macos/DingAI.app dist/DingAI-mac.zip
+        run: mkdir -p dist && ditto -c -k --keepParent tools/dingcode/macos/DingCode.app dist/DingCode-mac.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: dingai-mac
-          path: dist/DingAI-mac.zip
+          name: dingcode-mac
+          path: dist/DingCode-mac.zip
 
   windows:
     runs-on: windows-latest
@@ -67,8 +67,8 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
-      - name: Publish DingAIWin
-        run: dotnet publish tools/dingai/windows/DingAIWin.csproj -c Release -o dist/win
+      - name: Publish DingCode
+        run: dotnet publish tools/dingcode/windows/DingCodeWin.csproj -c Release -o dist/win
       - name: Sign when a Windows certificate secret is present
         shell: pwsh
         env:
@@ -79,14 +79,14 @@ jobs:
             Write-Host "Windows signing secrets are not set. Publishing unsigned."
             exit 0
           }
-          $pfx = Join-Path $env:RUNNER_TEMP "dingai.pfx"
+          $pfx = Join-Path $env:RUNNER_TEMP "dingcode.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Select-Object -First 1
-          & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD dist\win\DingAIWin.exe
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD dist\win\DingCode.exe
           Remove-Item $pfx
       - uses: actions/upload-artifact@v4
         with:
-          name: dingai-windows
+          name: dingcode-windows
           path: dist/win
 
   release:
@@ -100,6 +100,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/dingai-linux/dingai-linux.tar.gz
-            dist/dingai-mac/DingAI-mac.zip
-            dist/dingai-windows/**
+            dist/dingcode-linux/dingcode-linux.tar.gz
+            dist/dingcode-mac/DingCode-mac.zip
+            dist/dingcode-windows/**

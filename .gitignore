@@ -1,7 +1,7 @@
 .DS_Store
 *.app
-tools/dingai/macos/DingAI
-tools/dingai/extension/dist/
+tools/dingcode/macos/DingCode
+tools/dingcode/extension/dist/
 bin/
 obj/
 notes/

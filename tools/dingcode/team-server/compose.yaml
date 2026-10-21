@@ -1,0 +1,18 @@
+services:
+  dingcode-team:
+    build:
+      context: ..
+      dockerfile: team-server/Dockerfile
+    ports:
+      - "8050:8050"
+    environment:
+      DINGCODE_TEAM_HOST: 0.0.0.0
+      DINGCODE_TEAM_PORT: "8050"
+      DINGCODE_TEAM_ROOT: /data
+      DINGCODE_TEAM_REQUIRE_AUTH: "1"
+      # Set this yourself. Do not commit a real token.
+      DINGCODE_TEAM_ADMIN_TOKEN: ${DINGCODE_TEAM_ADMIN_TOKEN:-${DINGAI_TEAM_ADMIN_TOKEN:-change-me}}
+    volumes:
+      - dingcode-data:/data
+volumes:
+  dingcode-data:
