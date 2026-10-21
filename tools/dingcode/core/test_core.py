@@ -1,6 +1,8 @@
+import http.client
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -381,6 +383,112 @@ class PathTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+
+class BridgeOriginTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {
+            "HOME": os.environ.get("HOME"),
+            "DINGCODE_EXTENSION_ID": os.environ.get("DINGCODE_EXTENSION_ID"),
+        }
+        os.environ["HOME"] = self.tmp.name
+        os.environ["DINGCODE_EXTENSION_ID"] = "a" * 32
+        dot = os.path.join(self.tmp.name, ".dingcode")
+        os.makedirs(dot)
+        with open(os.path.join(dot, "projects.json"), "w", encoding="utf-8") as fh:
+            json.dump({"bindings": {"http://localhost:8090": self.tmp.name}}, fh)
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_allowlist_rejects_an_external_origin(self):
+        from core.bridge import allowed_origins, classify_origin
+        allow = allowed_origins()
+        self.assertIn("http://localhost:8090", allow)
+        self.assertEqual(classify_origin(None, allow), ("cli", None))
+        self.assertEqual(classify_origin("", allow)[0], "deny")
+        self.assertEqual(classify_origin("null", allow)[0], "deny")
+        self.assertEqual(classify_origin("https://evil.example", allow)[0], "deny")
+        self.assertEqual(classify_origin("http://localhost:8090\r\nX: 1", allow)[0], "deny")
+        kind, echo = classify_origin("http://localhost:8090", allow)
+        self.assertEqual((kind, echo), ("allow", "http://localhost:8090"))
+        self.assertEqual(classify_origin("chrome-extension://" + ("a" * 32), allow)[0], "allow")
+        self.assertEqual(classify_origin("chrome-extension://" + ("b" * 32), allow)[0], "deny")
+
+    def test_ping_hides_the_token_from_an_external_origin(self):
+        from core.bridge import make_server
+        httpd = make_server(0)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def request(method, path, headers=None, body=None):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request(method, path, body=body, headers=headers or {})
+            res = conn.getresponse()
+            payload = res.read()
+            headers_out = {key.lower(): value for key, value in res.getheaders()}
+            status = res.status
+            conn.close()
+            return status, payload, headers_out
+
+        status, body, headers = request("GET", "/ping", {"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn(b"token", body)
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertNotIn("access-control-allow-private-network", headers)
+
+        status, body, headers = request("OPTIONS", "/ping", {
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        })
+        self.assertEqual(status, 403)
+        self.assertNotIn(b"token", body)
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertNotIn("access-control-allow-private-network", headers)
+
+        status, body, headers = request("GET", "/ping", {"Origin": "http://localhost:8090"})
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload.get("token"))
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:8090")
+        self.assertEqual(headers.get("access-control-allow-private-network"), "true")
+        self.assertNotEqual(headers.get("access-control-allow-origin"), "*")
+        token = payload["token"]
+        client = payload["client"]
+
+        status, body, headers = request(
+            "GET", "/pending?client=%s&token=%s" % (client, token),
+            {"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn(token.encode("ascii"), body)
+        self.assertNotIn("access-control-allow-origin", headers)
+
+        status, body, _headers = request(
+            "POST", "/voice?token=%s" % token, {"Origin": "http://localhost:8090"}, b"clip")
+        self.assertEqual(status, 403)
+        self.assertNotIn(token.encode("ascii"), body)
+
+        status, body, headers = request(
+            "POST", "/voice?client=%s&token=%s" % (client, token),
+            {"Origin": "http://localhost:8090"}, b"clip")
+        self.assertEqual(status, 200)
+        self.assertNotIn(token.encode("ascii"), body)
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:8090")
+
+        status, body, headers = request("GET", "/ping")
+        self.assertEqual(status, 200)
+        self.assertIn("token", json.loads(body))
+        self.assertNotIn("access-control-allow-origin", headers)
+        self.assertNotIn("access-control-allow-private-network", headers)
 
 
 if __name__ == "__main__":

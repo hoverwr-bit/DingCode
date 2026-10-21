@@ -228,7 +228,8 @@
         rec.onstop = function () {
           try { rec.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
           var token = (av7bridge && av7bridge.token) || '';
-          bridgeFetch('http://127.0.0.1:8763/voice?token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
+          var client = (av7bridge && av7bridge.client != null) ? av7bridge.client : '';
+          bridgeFetch('http://127.0.0.1:8763/voice?client=' + encodeURIComponent(client) + '&token=' + encodeURIComponent(token), { method: 'POST', body: new Blob(voiceChunks) })
             .then(function (r) { return r.text(); })
             .then(function (text) {
               text = (text || '').trim();

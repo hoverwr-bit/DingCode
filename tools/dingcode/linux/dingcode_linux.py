@@ -503,6 +503,9 @@ def _keysym(lib, display, event):
 
 
 def main(argv):
+    if len(argv) > 1 and argv[1] == "bridge":
+        from core.bridge import main as bridge_main
+        return bridge_main(argv[2:])
     if env("DINGCODE_UPDATE", "DINGAI_UPDATE") == "1":
         try:
             from core.update import check_update
@@ -537,6 +540,11 @@ def main(argv):
         print(note["pin_count"])
         return 0
     if os.environ.get("DISPLAY"):
+        try:
+            from core.bridge import serve_background
+            serve_background()
+        except Exception:
+            pass
         return run_toolbar()
     print("Set DISPLAY for the X11 session, or pass --check.", file=sys.stderr)
     return 1
