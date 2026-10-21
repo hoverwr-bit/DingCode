@@ -1161,7 +1161,14 @@ def repo_info(folder):
     head = out.decode("utf-8", "replace").strip()
     if not head:
         return None
-    prefix = os.path.relpath(os.path.abspath(folder), os.path.abspath(root))
+    # Git prints the canonical toplevel. On macOS that is /private/var while a
+    # tempfile path is still the /var alias. abspath() does not resolve that
+    # symlink, so the prefix would be ../.. and every later diff would be empty.
+    root = os.path.realpath(root)
+    try:
+        prefix = os.path.relpath(os.path.realpath(folder), root)
+    except ValueError:
+        prefix = ""
     if prefix == ".":
         prefix = ""
     return {"root": root, "head": head, "prefix": prefix}
@@ -1202,6 +1209,72 @@ def _symlink_targets(folder, rels):
             except OSError:
                 continue
     return found
+
+
+def _snapshot_outside_links(folder, dest):
+    """Copy bytes of symlink targets that resolve outside the bound folder.
+
+    Restoring through the link is not enough when /var and /private/var disagree,
+    or when the link path never shows up as a git change. The bytes are written
+    back to the real target recorded here, which is the path from before the run.
+    """
+    saved = []
+    blob_root = os.path.join(dest, "outside")
+    for rel in iter_project_files(folder):
+        if _rel_escapes(rel):
+            continue
+        path = os.path.join(folder, rel)
+        if not os.path.islink(path):
+            continue
+        try:
+            target = os.path.realpath(path)
+        except OSError:
+            continue
+        if not target or path_inside(folder, target):
+            continue
+        if not os.path.isfile(target):
+            continue
+        try:
+            if os.path.getsize(target) > 2000000:
+                continue
+        except OSError:
+            continue
+        name = "%d.bin" % len(saved)
+        try:
+            os.makedirs(blob_root, exist_ok=True)
+            shutil.copy2(target, os.path.join(blob_root, name))
+        except OSError:
+            continue
+        saved.append({"rel": rel, "target": target, "saved": "outside/" + name})
+    return saved
+
+
+def _restore_outside_targets(dest, meta):
+    restored = []
+    for item in (meta or {}).get("outside_targets") or []:
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target") or ""
+        saved = item.get("saved") or ""
+        if not target or not saved or _rel_escapes(saved):
+            continue
+        data = _read_file(os.path.join(dest, saved))
+        if data is None:
+            continue
+        try:
+            real = os.path.realpath(target)
+        except OSError:
+            real = target
+        parent = os.path.dirname(real)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            with open(real, "wb") as fh:
+                fh.write(data)
+            restored.append(item.get("rel") or real)
+        except OSError:
+            pass
+    return restored
 
 
 def path_inside(folder, path):
@@ -1292,8 +1365,10 @@ def iter_project_files(folder):
 
 def snapshot_before(folder, dest):
     """Stash-free pre-run state. Git keeps HEAD plus copies of dirty files. Otherwise copy the tree."""
+    folder = os.path.realpath(folder)
     os.makedirs(dest, exist_ok=True)
     pre = os.path.join(dest, "pre")
+    outside_targets = _snapshot_outside_links(folder, dest)
     info = repo_info(folder)
     if info:
         copied = []
@@ -1308,9 +1383,10 @@ def snapshot_before(folder, dest):
         meta = {
             "kind": "git", "head": info["head"], "root": info["root"],
             "prefix": info.get("prefix") or "", "copied": copied,
-            "folder": os.path.abspath(folder),
+            "folder": os.path.realpath(folder),
             "repo_dirty": _porcelain_paths(info["root"]),
             "symlinks": _symlink_targets(folder, copied),
+            "outside_targets": outside_targets,
         }
         _write_json(os.path.join(dest, "manifest.json"), meta)
         return meta
@@ -1319,8 +1395,9 @@ def snapshot_before(folder, dest):
         if _copy_rel(folder, pre, rel):
             copied.append(rel)
     meta = {
-        "kind": "copy", "copied": copied, "folder": os.path.abspath(folder),
+        "kind": "copy", "copied": copied, "folder": os.path.realpath(folder),
         "symlinks": _symlink_targets(folder, copied),
+        "outside_targets": outside_targets,
     }
     _write_json(os.path.join(dest, "manifest.json"), meta)
     return meta
@@ -1378,6 +1455,7 @@ def unified_rel(rel, before, after):
 
 
 def diff_since(folder, dest, meta):
+    folder = os.path.realpath(folder)
     parts = []
     for rel in sorted(_candidate_paths(folder, dest, meta)):
         before = pre_bytes(dest, meta, rel)
@@ -1390,6 +1468,7 @@ def diff_since(folder, dest, meta):
 
 
 def revert_snapshot(folder, dest):
+    folder = os.path.realpath(folder)
     meta = _read_json(os.path.join(dest, "manifest.json"), {})
     if not meta:
         return {"ok": False, "error": "no snapshot"}
@@ -1405,9 +1484,11 @@ def revert_snapshot(folder, dest):
         if recorded and os.path.islink(after_path):
             try:
                 current = os.path.realpath(after_path)
+                recorded_real = os.path.realpath(recorded)
             except OSError:
                 current = ""
-            if current != recorded:
+                recorded_real = recorded
+            if current != recorded_real:
                 try:
                     os.remove(after_path)
                 except OSError:
@@ -1418,7 +1499,7 @@ def revert_snapshot(folder, dest):
                     pass
                 if before is not None:
                     try:
-                        with open(recorded, "wb") as fh:
+                        with open(recorded_real, "wb") as fh:
                             fh.write(before)
                     except OSError:
                         pass
@@ -1441,6 +1522,7 @@ def revert_snapshot(folder, dest):
             restored.append(rel)
         except OSError:
             pass
+    restored.extend(_restore_outside_targets(dest, meta))
     meta["reverted"] = True
     _write_json(os.path.join(dest, "manifest.json"), meta)
     return {"ok": True, "restored": restored, "removed": removed}
@@ -1453,6 +1535,7 @@ def outside_changes(folder, dest, meta):
     before the run. Symlinks are resolved, so a link inside the folder that
     points outside counts.
     """
+    folder = os.path.realpath(folder)
     labels = []
     git_rels = []
     seen = set()
