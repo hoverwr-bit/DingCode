@@ -5,7 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swiftc -O -swift-version 5 -o DingCode DingCode.swift \
+# Swift 6 defaults the binary to the SDK (minos 28 on the current toolchain). Pin 14.0,
+# matching LSMinimumSystemVersion, or LaunchServices refuses to open the app (-10825).
+swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos14.0" -o DingCode DingCode.swift \
   -framework AppKit -framework AVFoundation -framework AudioToolbox -framework Carbon \
   -framework Vision -framework ScreenCaptureKit -framework ApplicationServices
 
