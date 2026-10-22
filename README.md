@@ -2,9 +2,9 @@
 
 A toolbox of local helpers for AI coding agents. The first tool is **DingCode** (formerly DingAI / AnnoOverlay / anno): point at the screen, and the agent receives machine-readable JSON instead of a one-line description.
 
-**DingCode = pin annotations for vibe coding (钉给 vibe coding 用的批注工具).**
+**DingCode = pin annotations for vibe coding (钉给 vibe coding 用的批注工具).** Product requirements: [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md).
 
-**给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingCode**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
+**给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingCode**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。产品需求见 [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md)。
 
 Languages are Chinese, English, and Vietnamese (`DINGCODE_LANG=zh|en|vi`). Signing, notarization, and packaged releases are described in `tools/dingcode/RELEASE.md`. An update check runs only when `DINGCODE_UPDATE=1`.
 
@@ -20,6 +20,7 @@ DingCode drops pins on any app or web page and exports JSON: app, window, pixel 
 | `tools/dingcode/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
 | `tools/dingcode/core/` | Python standard library: note schema, label placement, folder and server sync. Used by Linux and `handoff.py` |
 | `tools/dingcode/team-server/` | Optional self-hosted board. Accounts, SQLite, Docker. No telemetry |
+| `tools/dingcode/docs/PRD.md` | Product requirements (Chinese): users, flow, editions still to confirm, feature status, security, storage |
 | `tools/dingcode/probes/` | Diagnostic probes (display, capture, OCR, red-pixel scans) |
 
 ## Build / 构建
