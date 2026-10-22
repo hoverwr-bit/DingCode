@@ -442,9 +442,9 @@ internal class Controller
         {
             VoiceWav = Path.Combine(Path.GetTempPath(), "dingcode-hold.wav");
             var sink = new StringBuilder(8);
-            Native.mciSendString("close dingcode", sink, sink.Capacity, IntPtr.Zero);
-            Native.mciSendString("open new type waveaudio alias dingcode", sink, sink.Capacity, IntPtr.Zero);
-            Native.mciSendString("record dingcode", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("close dingcode", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("open new type waveaudio alias dingcode", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("record dingcode", sink, sink.Capacity, IntPtr.Zero);
         }
         catch { }
     }
@@ -454,9 +454,9 @@ internal class Controller
         try
         {
             var sink = new StringBuilder(8);
-            Native.mciSendString("stop dingcode", sink, sink.Capacity, IntPtr.Zero);
-            Native.mciSendString("save dingcode \"" + VoiceWav + "\"", sink, sink.Capacity, IntPtr.Zero);
-            Native.mciSendString("close dingcode", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("stop dingcode", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("save dingcode \"" + VoiceWav + "\"", sink, sink.Capacity, IntPtr.Zero);
+            Win32.mciSendString("close dingcode", sink, sink.Capacity, IntPtr.Zero);
         }
         catch { return ""; }
         return TranscribeWav(VoiceWav);
@@ -633,7 +633,7 @@ internal class Controller
                 foreach (var face in detector.DetectFacesAsync(gray).AsTask().GetAwaiter().GetResult())
                 {
                     var box = face.FaceBox;
-                    Pixelate(Shot, new System.Drawing.Rectangle(box.X, box.Y, box.Width, box.Height));
+                    Pixelate(Shot, new System.Drawing.Rectangle((int)box.X, (int)box.Y, (int)box.Width, (int)box.Height));
                 }
             }
             catch { }

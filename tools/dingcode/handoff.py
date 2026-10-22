@@ -1089,19 +1089,36 @@ def find_binary(name):
     return name
 
 
+def engine_prompt(prompt):
+    """Keep the task text from being parsed as a CLI flag.
+
+    The handoff rules start with '- '. Claude and Codex treat a positional
+    argument that starts with '-' as an option (`unknown option '- Make...'`).
+    A heading line fixes that, and '--' stops option parsing before the text.
+    """
+    text = "" if prompt is None else str(prompt)
+    if text.startswith("DingCode task:"):
+        return text
+    return "DingCode task:\n" + text
+
+
 def engine_command(engine, prompt, folder):
+    body = engine_prompt(prompt)
     if engine == "codex":
         return [
             find_binary("codex"), "exec",
             "--sandbox", "workspace-write",
             "-c", "sandbox_workspace_write.network_access=false",
-            prompt,
+            "--",
+            body,
         ], folder
     return [
-        find_binary("claude"), "-p", prompt,
+        find_binary("claude"), "-p",
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Glob,Grep",
         "--disallowedTools", "Bash,WebFetch,WebSearch",
+        "--",
+        body,
     ], folder
 
 

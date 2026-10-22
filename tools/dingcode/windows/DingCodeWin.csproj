@@ -12,9 +12,6 @@
   <ItemGroup>
     <Content Include="..\i18n\strings.json" Link="strings.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <ItemGroup>
-    <!-- Framework assemblies shipped with the Windows desktop pack. Not a NuGet package. -->
-    <Reference Include="UIAutomationClient" />
-    <Reference Include="UIAutomationTypes" />
-  </ItemGroup>
+  <!-- UseWPF brings in System.Windows.Automation (UIAutomationClient / UIAutomationTypes).
+       A bare Reference Include cannot be resolved on the net8.0-windows targeting pack and only warns. -->
 </Project>
