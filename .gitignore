@@ -1,0 +1,13 @@
+.DS_Store
+*.app
+tools/dingcode/macos/DingCode
+tools/dingcode/extension/dist/
+bin/
+obj/
+notes/
+shots/
+*.p12
+*.pem
+*.cer
+__pycache__/
+*.pyc

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DingCode</AssemblyName>
+    <RootNamespace>DingCode</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="..\i18n\strings.json" Link="strings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- UseWPF brings in System.Windows.Automation (UIAutomationClient / UIAutomationTypes).
+       A bare Reference Include cannot be resolved on the net8.0-windows targeting pack and only warns. -->
+</Project>
