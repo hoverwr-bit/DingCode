@@ -7,6 +7,10 @@ http(s) keys in ~/.dingcode/projects.json. The response echoes that origin.
 Access-Control-Allow-Private-Network is sent only then. Any other Origin,
 including "null", is 403 and the body has no token. The same check covers
 /pending, /answer, and /voice. /voice also requires the registered client id.
+
+The session record page (core/runs_api.py) lives under /app and reads through
+/api/*. Those paths accept only a loopback Host plus the page's own origin
+(self) or a local no-Origin client, and never get CORS headers.
 """
 
 import json
@@ -93,12 +97,15 @@ def allowed_origins():
     return allow
 
 
-def classify_origin(origin, allow=None):
-    """Return ('cli', None), ('allow', echo), or ('deny', None).
+def classify_origin(origin, allow=None, port=None):
+    """Return ('cli', None), ('self', None), ('allow', echo), or ('deny', None).
 
     origin is None when the request has no Origin header. That is the local
     CLI case: the token may be returned, and no CORS or private-network header
     is sent. A present Origin is echoed only when it is on the allowlist.
+    A loopback origin on this service's own port classifies as "self": the
+    record page served from /app. Same-origin requests need no CORS header,
+    so "self" never gets one.
     """
     if allow is None:
         allow = allowed_origins()
@@ -107,7 +114,13 @@ def classify_origin(origin, allow=None):
     if not isinstance(origin, str) or origin == "" or _UNSAFE.search(origin):
         return "deny", None
     norm = normalize_origin(origin)
-    if not norm or norm not in allow:
+    if not norm:
+        return "deny", None
+    if port is not None:
+        parsed = urlparse(norm)
+        if parsed.hostname in ("127.0.0.1", "localhost") and parsed.port == int(port):
+            return "self", None
+    if norm not in allow:
         return "deny", None
     return "allow", origin
 
@@ -149,7 +162,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return self.headers.get("Origin")
 
     def _decision(self):
-        return classify_origin(self._origin(), allowed_origins())
+        return classify_origin(self._origin(), allowed_origins(), self.server.server_address[1])
+
+    def _host_ok(self):
+        """DNS-rebinding guard for /api and /app: the Host must be loopback here."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return False
+        port = self.server.server_address[1]
+        return host in ("127.0.0.1:%d" % port, "localhost:%d" % port)
 
     def _query(self):
         parsed = urlparse(self.path)
@@ -206,6 +227,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         path, query = self._query()
         state = self.server.state
+        if path == "/api" or path.startswith("/api/") or path == "/app" or path.startswith("/app/"):
+            # Record-page surface: loopback Host only, and only the page itself
+            # (self) or a local client with no Origin header may call it. Any
+            # other Origin, even an allowlisted one, is an external site.
+            if decision[0] not in ("self", "cli") or not self._host_ok():
+                self._write(403, "forbidden", "text/plain; charset=utf-8", decision)
+                return
+            if self.command != "GET":
+                self._write(405, "method not allowed", "text/plain; charset=utf-8", decision, [("Allow", "GET")])
+                return
+            from core import runs_api
+            runs_api.handle(self, path, query, decision)
+            return
         if self.command == "GET" and path == "/ping":
             client_id, token = state.register()
             body = json.dumps({

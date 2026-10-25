@@ -1,10 +1,13 @@
 import http.client
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.diff import compare_png, write_diff
 from core.export import EXPORTERS, export_note, register_exporter

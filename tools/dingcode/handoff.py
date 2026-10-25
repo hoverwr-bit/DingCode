@@ -868,6 +868,9 @@ def release_main(argv):
 
 
 def dot_dir():
+    override = env("DINGCODE_HOME", "DINGAI_HOME")
+    if override:
+        return override
     return os.path.join(os.path.expanduser("~"), ".dingcode")
 
 
