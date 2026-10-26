@@ -2080,8 +2080,9 @@ def session_prompt(session):
     """
     data = _read_file(os.path.join(run_dir(session), "prompt.md"))
     if data is not None and data.strip():
+        # 旧版 Windows 写过 \r\n 的文件也归一回 \n，和派活时的原样提示词一致。
         return {"ok": True, "session": session, "source": "prompt.md",
-                "prompt": data.decode("utf-8", "replace")}
+                "prompt": data.decode("utf-8", "replace").replace("\r\n", "\n")}
     raw = _read_file(os.path.join(run_dir(session), "note.json"))
     if raw is None:
         return {"ok": False, "error": "no prompt for session", "session": session}
@@ -2346,7 +2347,8 @@ def manual_dispatch(session, round_n, kept, text, shots, note_path, cfg):
     prompt = build_autofix_prompt(text, folder, shots, rules=load_rules_for(folder))
     folder_run = run_dir(session)
     os.makedirs(folder_run, exist_ok=True)
-    with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8") as fh:
+    # newline="\n"：Windows 文本模式会把 \n 转成 \r\n，session_prompt 原样读回就变味。
+    with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(prompt)
     pin_id = ""
     pins = kept.get("pins") or []
@@ -2355,9 +2357,9 @@ def manual_dispatch(session, round_n, kept, text, shots, note_path, cfg):
     # 钉 id 会进文件名：只放行安全字符，杜绝 note 里构造的穿越写法。
     if pin_id and _SAFE_ID.match(pin_id):
         # 单钉模式各存一份，多颗钉的提示词不互相覆盖。
-        with open(os.path.join(folder_run, "prompt-%s.md" % pin_id), "w", encoding="utf-8") as fh:
+        with open(os.path.join(folder_run, "prompt-%s.md" % pin_id), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(prompt)
-    with open(os.path.join(folder_run, "note.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(folder_run, "note.json"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     try:
         if folder:
@@ -2461,9 +2463,9 @@ def autofix_main(argv):
     cmd, cwd = engine_command(engine, prompt, folder, cfg["engine_path"])
     folder_run = run_dir(session)
     os.makedirs(folder_run, exist_ok=True)
-    with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(prompt)
-    with open(os.path.join(folder_run, "note.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(folder_run, "note.json"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     write_run_status(session, {
         "status": "running", "engine": engine, "folder": folder, "target": target,
