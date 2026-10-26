@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("DINGAI_SESSIONS", "0")
 
@@ -624,14 +625,15 @@ class PinRevertTests(unittest.TestCase):
                 os.environ[key] = value
         self.tmp.cleanup()
 
-    def repo(self):
+    def repo(self, content="l1\nl2\nl3\n"):
         folder = os.path.join(self.home, "repo")
         os.makedirs(folder)
         subprocess.run(["git", "init", "-q"], cwd=folder, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "dingcode@example.com"], cwd=folder, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.name", "DingCode"], cwd=folder, check=True, capture_output=True)
-        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8") as fh:
-            fh.write("l1\nl2\nl3\n")
+        # newline=""：不管宿主平台，磁盘字节就是 content 里的写法（CRLF 用例靠它）。
+        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
         subprocess.run(["git", "add", "a.txt"], cwd=folder, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=folder, check=True, capture_output=True)
         return folder
@@ -816,6 +818,124 @@ class PinRevertTests(unittest.TestCase):
         result = handoff.revert_pin("anno-none", "1")
         self.assertFalse(result.get("ok"))
         self.assertIn("no pin-only round", result.get("error") or "")
+
+    # -- 跨平台（M5）：CRLF 字节与 git 缺失降级 ------------------------------
+
+    def test_revert_pin_three_way_merge_keeps_crlf_bytes(self):
+        folder = self.repo("l1\r\nl2\r\nl3\r\n")
+        note_path = self.note_for("anno-crlf")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        # round-1：pin 1 改 l2→X；round-2：pin 2 追加 Y。全程 CRLF。
+        self.engine("#!/bin/sh\nprintf 'l1\\r\\nX\\r\\nl3\\r\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        self.engine("#!/bin/sh\nprintf 'l1\\r\\nX\\r\\nl3\\r\\nY\\r\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"2\",\"status\":\"fixed\",\"summary_zh\":\"追加末行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "2", "--pin", "2"]), 0)
+        result = handoff.revert_pin("anno-crlf", "1")
+        self.assertTrue(result.get("ok"), result)
+        # CRLF 字节在快照/合并/写回全程不丢，pin 2 的行保留。
+        with open(os.path.join(folder, "a.txt"), "rb") as fh:
+            self.assertEqual(fh.read(), b"l1\r\nl2\r\nl3\r\nY\r\n")
+
+    def test_revert_pin_without_git_refuses_unreadable_base(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-nogit")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        # Windows 未装 git：git 快照的改前字节读不到。即使磁盘 == post
+        # （快路径成立），也绝不能把既有文件当"新文件"删掉 → 冲突，磁盘零改动。
+        with mock.patch.object(handoff, "git_exe", lambda: None):
+            result = handoff.revert_pin("anno-nogit", "1")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("conflicts"), ["a.txt"])
+        self.assertTrue(os.path.isfile(os.path.join(folder, "a.txt")))
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nX\nl3\n")
+        self.assertNotIn("reverted", self.summary_of("anno-nogit", 1))
+
+    def test_revert_pin_without_git_copy_kind_quick_path_works(self):
+        folder = os.path.join(self.home, "plain")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("l1\nl2\nl3\n")
+        # 非 git 项目（copy 型快照）：pre/ 副本就是改前字节，撤回不依赖 git。
+        dest = handoff.round_dir("anno-nogit-copy", 1)
+        os.makedirs(os.path.join(dest, "pre"))
+        os.makedirs(os.path.join(dest, "post"))
+        base = b"l1\nl2\nl3\n"
+        pinned = b"l1\nX\nl3\n"
+        with open(os.path.join(dest, "pre", "a.txt"), "wb") as fh:
+            fh.write(base)
+        with open(os.path.join(dest, "post", "a.txt"), "wb") as fh:
+            fh.write(pinned)
+        handoff._write_json(os.path.join(dest, "manifest.json"), {
+            "kind": "copy", "folder": folder, "copied": ["a.txt"],
+            "files_sha256": {"a.txt": {
+                "pre": hashlib.sha256(base).hexdigest(),
+                "post": hashlib.sha256(pinned).hexdigest(),
+            }},
+        })
+        handoff._write_json(os.path.join(dest, "summary.json"), {
+            "pins": [{"id": "1", "status": "fixed", "pin_only": True, "pin": "1", "rerun": 1}],
+        })
+        # 这颗钉跑完后磁盘就是 post 的样子（快路径前提）。
+        with open(os.path.join(folder, "a.txt"), "wb") as fh:
+            fh.write(pinned)
+        with mock.patch.object(handoff, "git_exe", lambda: None):
+            result = handoff.revert_pin("anno-nogit-copy", "1")
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["restored"], ["a.txt"])
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nl2\nl3\n")
+
+    def test_revert_pin_without_git_conflicts_cleanly(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-nogit2")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        # 磁盘 != post，无 git 可合并 → 明确冲突，磁盘与元数据零改动。
+        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("l1\nZ\nl3\n")
+        with mock.patch.object(handoff, "git_exe", lambda: None):
+            result = handoff.revert_pin("anno-nogit2", "1")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("conflicts"), ["a.txt"])
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nZ\nl3\n")
+        self.assertNotIn("reverted", self.summary_of("anno-nogit2", 1))
+
+
+class WindowsPathTests(unittest.TestCase):
+    """M5 跨平台：_rel_escapes 的 Windows 风格路径防线（盘符、UNC、反斜杠 ..）。"""
+
+    def test_windows_absolute_and_backslash_walk_rejected(self):
+        for rel in (
+            "C:\\proj\\secret.txt",            # 盘符绝对路径
+            "\\\\server\\share\\secret.txt",   # UNC
+            "..\\..\\secret.txt",              # 反斜杠 ..
+            "src\\..\\..\\secret.txt",
+        ):
+            self.assertTrue(handoff._rel_escapes(rel), rel)
+        # 正常相对路径不受影响。
+        self.assertFalse(handoff._rel_escapes("src/a.txt"))
+        self.assertFalse(handoff._rel_escapes("src/b.txt"))
+
+    def test_drive_relative_rejected_on_windows(self):
+        # "C:foo" 在 Windows 上 os.path.join 会丢掉整个前缀目录，必须拒绝；
+        # macOS/Linux 上不会出现，用 monkeypatch 模拟 os.name == "nt" 验证。
+        with mock.patch.object(handoff.os, "name", "nt"):
+            self.assertTrue(handoff._rel_escapes("C:secret.txt"))
+        # 模拟之外，POSIX 语义不变。
+        self.assertFalse(handoff._rel_escapes("src/a.txt"))
 
 
 if __name__ == "__main__":

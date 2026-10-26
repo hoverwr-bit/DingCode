@@ -1756,6 +1756,140 @@ static class PageBridge
     static string SessionToken = "";
     static int NextClientId = 1;
 
+    // -- 记录页（设计 20261025 M5）：/api/*、/app/* 反代到 python bridge --
+
+    static readonly HttpClient PythonHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+    static readonly object PythonGate = new object();
+    static Process PythonProc;
+
+    static int PythonPort()
+    {
+        var raw = DingPaths.Env("API_PORT");
+        return int.TryParse(raw, out var port) && port > 0 ? port : 8764;
+    }
+
+    static bool PathForRecord(string path)
+    {
+        return path == "/api" || path.StartsWith("/api/", StringComparison.Ordinal)
+            || path == "/app" || path.StartsWith("/app/", StringComparison.Ordinal);
+    }
+
+    static void HandleRecord(HttpListenerContext ctx)
+    {
+        var path = ctx.Request.Url.AbsolutePath;
+        if (path == "/api/desktop" || path.StartsWith("/api/desktop/", StringComparison.Ordinal))
+        {
+            // 桌面专用面：只属于桌面端自己的 server，python bridge 也不转发。
+            Write(ctx.Response, 501, "text/plain; charset=utf-8",
+                Encoding.UTF8.GetBytes("not implemented"), null, false);
+            return;
+        }
+        // 鉴权（Host/Origin/token）由 python bridge 全权判定，这里只透传。
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            EnsurePythonBridge();
+            try
+            {
+                ProxyOnce(ctx);
+                return;
+            }
+            catch { }
+            StopPythonBridge();   // 进程退出或超时：杀掉，下一轮懒重启
+        }
+        Write(ctx.Response, 503, "text/plain; charset=utf-8",
+            Encoding.UTF8.GetBytes("record bridge unavailable"), null, false);
+    }
+
+    static void EnsurePythonBridge()
+    {
+        lock (PythonGate)
+        {
+            if (PythonProc != null && !PythonProc.HasExited) return;
+            var python = PythonExe();
+            var script = Path.Combine(AppContext.BaseDirectory, "handoff.py");
+            if (python == null || !File.Exists(script)) { PythonProc = null; return; }
+            var start = new ProcessStartInfo
+            {
+                FileName = python,
+                Arguments = "handoff.py bridge --port " + PythonPort(),
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = false,   // 无 shell；PATH 环境原样继承
+                CreateNoWindow = true,
+            };
+            try { PythonProc = Process.Start(start); }
+            catch { PythonProc = null; }
+        }
+    }
+
+    static string PythonExe()
+    {
+        var forced = DingPaths.Env("PYTHON");
+        if (!string.IsNullOrEmpty(forced) && File.Exists(forced)) return forced;
+        foreach (var name in new[] { "python.exe", "python3.exe" })
+        {
+            var found = FindOnPath(name);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    static string FindOnPath(string file)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(';'))
+        {
+            if (dir.Trim().Length == 0) continue;
+            try
+            {
+                var cand = Path.Combine(dir.Trim('"'), file);
+                if (File.Exists(cand)) return cand;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    static void StopPythonBridge()
+    {
+        lock (PythonGate)
+        {
+            if (PythonProc == null) return;
+            try { if (!PythonProc.HasExited) PythonProc.Kill(); } catch { }
+            PythonProc = null;
+        }
+    }
+
+    static void ProxyOnce(HttpListenerContext ctx)
+    {
+        var req = ctx.Request;
+        var url = "http://127.0.0.1:" + PythonPort() + req.Url.PathAndQuery;
+        using (var msg = new HttpRequestMessage(new HttpMethod(req.HttpMethod), url))
+        {
+            foreach (var key in new[] { "Origin", "Content-Type", "Referer" })
+            {
+                var value = req.Headers[key];
+                if (!string.IsNullOrEmpty(value)) msg.Headers.TryAddWithoutValidation(key, value);
+            }
+            if (req.HasEntityBody)
+            {
+                using (var ms = new MemoryStream())
+                {
+                    req.InputStream.CopyTo(ms);
+                    msg.Content = new ByteArrayContent(ms.ToArray());
+                }
+            }
+            using (var resp = PythonHttp.SendAsync(msg).GetAwaiter().GetResult())
+            using (var ms = new MemoryStream())
+            {
+                resp.Content.CopyToAsync(ms).GetAwaiter().GetResult();
+                var body = ms.ToArray();
+                var type = resp.Content.Headers.ContentType != null
+                    ? resp.Content.Headers.ContentType.ToString() : "text/plain; charset=utf-8";
+                Write(ctx.Response, (int)resp.StatusCode, type, body, null, false);
+            }
+        }
+    }
+
     public static void Start()
     {
         try
@@ -1928,6 +2062,7 @@ static class PageBridge
     {
         var req = ctx.Request;
         var path = req.Url.AbsolutePath;
+        if (PathForRecord(path)) { HandleRecord(ctx); return; }
         var ok = Decide(req.Headers["Origin"], out var echo);
         if (!ok)
         {

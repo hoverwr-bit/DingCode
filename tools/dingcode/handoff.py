@@ -41,11 +41,13 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
 import difflib
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 
 from core.paths import data_home, env, project_file, project_root_name, state_dir
@@ -885,13 +887,35 @@ def _read_json(path, fallback):
     return data if isinstance(data, dict) else fallback
 
 
+def python_exe():
+    """sys.executable, or a sane fallback. Windows 常无 python3.exe（只有商店占位别名）。"""
+    if sys.executable:
+        return sys.executable
+    if os.name == "nt":
+        return shutil.which("python") or "python"
+    return shutil.which("python3") or "python3"
+
+
+def _replace_file(tmp, path, tries=3):
+    """os.replace with a short retry: Windows 上目标被占用（杀软/编辑器）时是瞬时
+    PermissionError，POSIX 上不会失败。重试耗尽仍失败则抛给调用方。"""
+    for attempt in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _write_json(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(obj, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-    os.replace(tmp, path)
+    _replace_file(tmp, path)
 
 
 def projects_path():
@@ -1162,9 +1186,34 @@ def resolve_autofix_note(arg):
 SKIP_SNAPSHOT = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".dingcode", ".dingai"}
 
 
+_GIT_PATH = {"exe": None, "done": False}
+
+
+def git_exe():
+    """Locate git once. Windows 上 GUI 进程的 PATH 常缺 git，补查常见安装位置。"""
+    if _GIT_PATH["done"]:
+        return _GIT_PATH["exe"]
+    found = shutil.which("git")
+    if not found and os.name == "nt":
+        for cand in (
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "cmd", "git.exe"),
+        ):
+            if cand and os.path.isfile(cand):
+                found = cand
+                break
+    _GIT_PATH["exe"] = found or None
+    _GIT_PATH["done"] = True
+    return _GIT_PATH["exe"]
+
+
 def run_git(folder, args):
+    exe = git_exe()
+    if not exe:
+        return 127, b""
     try:
-        proc = subprocess.run(["git", *args], cwd=folder, capture_output=True)
+        proc = subprocess.run([exe, *args], cwd=folder, capture_output=True)
     except OSError:
         return 127, b""
     return proc.returncode, proc.stdout or b""
@@ -1314,7 +1363,12 @@ def path_inside(folder, path):
 
 
 def _rel_escapes(rel):
-    if not rel or os.path.isabs(rel):
+    if not rel or os.path.isabs(rel) or ntpath.isabs(rel):
+        # ntpath.isabs 同时覆盖 Windows 盘符绝对路径与 UNC（\\server\share），
+        # 在 POSIX 上也拒绝这些 Windows 风格写法，防止手工构造的 manifest 穿越。
+        return True
+    if os.name == "nt" and ntpath.splitdrive(rel)[0]:
+        # 盘符相对路径（"C:foo"）：Windows 的 os.path.join 会丢掉整个前缀目录。
         return True
     parts = rel.replace("\\", "/").split("/")
     return ".." in parts
@@ -1968,9 +2022,12 @@ def _merge_file(current, base, other):
             with open(path, "wb") as fh:
                 fh.write(data if data is not None else b"")
             paths[name] = path
+        exe = git_exe()
+        if not exe:
+            return None
         try:
             proc = subprocess.run(
-                ["git", "merge-file", "-p",
+                [exe, "merge-file", "-p",
                  "-L", "current", "-L", "pin-post", "-L", "pin-before",
                  paths["current"], paths["base"], paths["other"]],
                 capture_output=True)
@@ -2023,6 +2080,12 @@ def revert_pin(session, pid):
         post = _read_file(os.path.join(dest, "post", rel))
         post_sha = entry.get("post") or ""
         current_sha = hashlib.sha256(current or b"").hexdigest()
+        if base is None and entry.get("pre"):
+            # base 读不到，但捕获时明明记下了改前 sha256：pre/ 副本缺失且 git
+            # 不可用（如 Windows 撤回时 git 掉出 PATH）。当"新文件"删掉会毁文件
+            # → 归入冲突，磁盘零改动。
+            conflicts.append(rel)
+            continue
         if post_sha and current_sha == post_sha:
             # 快路径：磁盘就是这颗钉改完的样子（post/ 副本缺失也认 sha256）。
             plan.append((rel, "remove" if base is None else "write",
@@ -2135,7 +2198,7 @@ def autofix_per_pin(note_path, session):
         for pid in ids:
             numbers = round_numbers(session)
             round_n = (numbers[-1] + 1) if numbers else 1
-            cmd = [sys.executable or "python3", script, "autofix", note_path,
+            cmd = [python_exe(), script, "autofix", note_path,
                    "--round", str(round_n), "--pin", str(pid)]
             log.write("per-pin %s round %s\n" % (pid, round_n))
             log.flush()

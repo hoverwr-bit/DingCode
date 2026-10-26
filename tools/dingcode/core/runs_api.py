@@ -36,6 +36,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 from core.paths import env
 
@@ -377,8 +378,25 @@ def _note_pin(note, pid):
     return None
 
 
+def _replace_file(tmp, path, tries=3):
+    """os.replace with a short retry (handoff._replace_file semantics kept local)."""
+    for attempt in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _write_note_atomic(path, note):
-    """Atomic write with a one-shot .bak, per the design (core/sync.py pattern)."""
+    """Atomic write with a one-shot .bak, per the design (core/sync.py pattern).
+
+    Returns False when the final replace fails — on Windows os.replace raises
+    PermissionError while another process holds the target open (editor, AV
+    scan); the caller answers 409 instead of crashing the handler thread.
+    """
     try:
         with open(path, "rb") as fh:
             original = fh.read()
@@ -391,10 +409,18 @@ def _write_note_atomic(path, note):
         except OSError:
             pass
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(note, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        _replace_file(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def pin_note_edit(handler, decision, sid, pid):
@@ -428,7 +454,9 @@ def pin_note_edit(handler, decision, sid, pid):
         _error(handler, decision, 404, "no such pin")
         return
     pin["note"] = text
-    _write_note_atomic(note_path, note)
+    if not _write_note_atomic(note_path, note):
+        _error(handler, decision, 409, "note file busy")
+        return
     _json(handler, decision, 200, {"ok": True, "pin_id": str(pid), "note": text})
 
 
@@ -506,7 +534,7 @@ def _spawn_autofix(session, round_n, pid, feedback=""):
     import handoff
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    argv = [sys.executable or "python3", os.path.join(root, "handoff.py"),
+    argv = [handoff.python_exe(), os.path.join(root, "handoff.py"),
             "autofix", session, "--round", str(round_n), "--pin", pid]
     if feedback:
         argv += ["--feedback", feedback]

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -531,6 +532,30 @@ class RunsApiTests(unittest.TestCase):
         self.assertEqual(status, 404)
         status, _, _ = self.request("/app/missing.html")
         self.assertEqual(status, 404)
+
+    def test_static_windows_style_traversal_rejected(self):
+        # Windows 风格反斜杠穿越（M5）：反斜杠与编码 %5C 都不许绕过守卫，绝不能 200。
+        for path in ("/app/..\\core\\bridge.py", "/app/..\\..\\windows\\Program.cs",
+                     "/app/%2e%2e%5ccore%5cbridge.py"):
+            status, _, _ = self.request(path)
+            self.assertNotEqual(status, 200, path)
+
+    def test_note_edit_busy_returns_409(self):
+        # Windows 场景：note 被编辑器/杀软占用 → os.replace 抛 PermissionError，
+        # 接口返回 409 而不是崩掉 handler 线程。
+        with open(self.source_note, encoding="utf-8") as fh:
+            before = fh.read()
+        creds = self.creds()
+        with mock.patch("core.runs_api.os.replace", side_effect=PermissionError(13, "busy")):
+            status, body, _ = self.post_write(
+                "/api/runs/%s/pins/p1/note" % SID,
+                {**creds, "confirm": "p1", "note": "占用时也要优雅失败"})
+        self.assertEqual(status, 409)
+        self.assertIn("busy", json.loads(body)["error"])
+        # 失败不落脏数据：源 note 不变，也没有残留 .tmp。
+        with open(self.source_note, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertFalse(os.path.exists(self.source_note + ".tmp"))
 
 
 if __name__ == "__main__":
