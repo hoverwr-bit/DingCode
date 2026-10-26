@@ -262,6 +262,7 @@ final class BridgeServer {
     }()
     static let forwardMaxBody = 1 << 20        // 转发请求体上限 1 MiB
     static let forwardMaxResponse = 32 << 20   // 转发响应上限 32 MiB
+    static let forwardMaxConcurrent = 16       // 转发并发上限,满则直接 503 不连上游
     var forwardEnabled = true                  // 找不到 handoff.py 时由 App 置 false(钉子同步照常)
 
     private let lock = NSLock()
@@ -286,6 +287,7 @@ final class BridgeServer {
     var onTrack: (([[String: Any]]) -> Void)?
     private var pendingCompletions = 0     // 未回调完成的 resolve 数(drain 用)
     private var sseClients: [NWConnection] = []
+    private var forwardActive = 0          // 进行中的转发数(只在 queue 上读写)
     private var hbTimer: Timer?
 
     func start() {
@@ -466,26 +468,42 @@ final class BridgeServer {
             if case .failed = st { if let conn { self?.dropSSE(conn) } }
         }
         conn.start(queue: queue)
-        recv(conn, data: Data())
+        // 读请求头 10 秒超时:到时还没收齐 \r\n\r\n 就断开,防慢速占位。
+        // 头一收齐(走 route、SSE 或转发都算)即在 recv 里取消;回调与本定时器同在串行 queue 上,无竞态。
+        let headerTimer = DispatchWorkItem { [weak conn] in
+            NSLog("anno-bridge: header timeout 10s, dropping connection")
+            conn?.cancel()
+        }
+        queue.asyncAfter(deadline: .now() + 10, execute: headerTimer)
+        recv(conn, data: Data(), headerTimer: headerTimer)
     }
 
-    private func recv(_ conn: NWConnection, data: Data) {
+    private func recv(_ conn: NWConnection, data: Data, headerTimer: DispatchWorkItem? = nil) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [weak self] chunk, _, done, err in
             guard let self else { conn.cancel(); return }
             var buf = data
             if let c = chunk { buf.append(c) }
+            if buf.range(of: Data("\r\n\r\n".utf8)) != nil {
+                headerTimer?.cancel()   // 头已收齐,10s 超时不再适用(SSE 长连接不受影响)
+            }
             // BK-02 转发层:DingCode.app 转发来的 /app、/api 请求原样转给内部 python bridge,
             // 不走 origin 判定(鉴权由 Python 端负责)
             switch self.forwardPlan(buf) {
             case .tooLarge:
                 self.send(conn, Self.forwardStatus(413, "Payload Too Large"))
                 return
+            case .badRequest:
+                self.send(conn, Self.forwardStatus(400, "bad request"))
+                return
+            case .desktop501:
+                self.send(conn, Self.forwardStatus(501, "not implemented"))
+                return
             case .go(let raw):
                 self.forward(conn, request: raw)
                 return
             case .wait:
                 if err != nil || done { conn.cancel(); return }   // 流断了,等不齐
-                self.recv(conn, data: buf)
+                self.recv(conn, data: buf, headerTimer: headerTimer)
                 return
             case .local:
                 break
@@ -502,7 +520,7 @@ final class BridgeServer {
             } else if err != nil || done || buf.count > (1 << 20) {
                 conn.cancel()
             } else {
-                self.recv(conn, data: buf)
+                self.recv(conn, data: buf, headerTimer: headerTimer)
             }
         }
     }
@@ -512,6 +530,8 @@ final class BridgeServer {
     private enum ForwardPlan {
         case wait        // 头已收齐、体没收齐,继续收
         case tooLarge    // 超上限,413
+        case badRequest  // 头部畸形(多 Content-Length / 有 Transfer-Encoding / CL 非纯数字 / 裸 CR·LF),400 不转发
+        case desktop501  // /api/desktop 与 /api/desktop/*:桌面端本地处理,501 不转发
         case go(Data)    // 原样转发的请求字节
         case local       // 非转发路径,走原有 route
     }
@@ -521,7 +541,8 @@ final class BridgeServer {
     }
 
     /// 头未收齐→.local(路径未知,交给原有逻辑,原 1 MiB 上限不变);
-    /// 头收齐后按路径与 Content-Length 判定,体超限立即 413 不再读
+    /// 头收齐后先做安全检查(多 CL / TE / CL 非纯数字 / 裸 CR·LF→400,畸形请求不转发),
+    /// 再按路径与 Content-Length 判定,体超限立即 413 不再读
     private func forwardPlan(_ buf: Data) -> ForwardPlan {
         guard forwardEnabled else { return .local }
         guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else { return .local }
@@ -533,22 +554,47 @@ final class BridgeServer {
         let full = String(parts[1])
         let path = full.firstIndex(of: "?").map { String(full[..<$0]) } ?? full
         guard Self.isForwardPath(path) else { return .local }
-        var clen = -1
+        // 裸 CR/LF 检查在原始字节上做(不转 String):头区域(含请求行)里
+        // 0x0D 后面不是 0x0A,或 0x0A 前面不是 0x0D → 400
+        let headBytes = [UInt8](buf[..<headerEnd.lowerBound])
+        let cr = UInt8(0x0D), lf = UInt8(0x0A)
+        for (i, b) in headBytes.enumerated() {
+            if b == cr && (i + 1 >= headBytes.count || headBytes[i + 1] != lf) { return .badRequest }
+            if b == lf && (i == 0 || headBytes[i - 1] != cr) { return .badRequest }
+        }
+        var clCount = 0
+        var sawTE = false
+        var clRaw: String?
         for l in lines.dropFirst() {
             let kv = l.split(separator: ":", maxSplits: 1)
-            if kv.count == 2, kv[0].lowercased() == "content-length" {
-                clen = Int(kv[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            guard kv.count == 2 else { continue }
+            let name = kv[0].lowercased()
+            if name == "content-length" {
+                clCount += 1
+                clRaw = String(kv[1])
+            } else if name == "transfer-encoding" {
+                sawTE = true
             }
         }
-        if clen > Self.forwardMaxBody { return .tooLarge }
-        if clen < 0 {
-            // 缺 Content-Length:头收齐即转发;已收到的数据若超 头+上限(边发边不给长度)也拒
-            if buf.count > headerEnd.upperBound + Self.forwardMaxBody { return .tooLarge }
-            return .go(buf)
+        // 多个 Content-Length 或任何 Transfer-Encoding(无论值)→ 拒;防 CL/TE 走私有解析分歧
+        if sawTE || clCount > 1 { return .badRequest }
+        // /api/desktop 与 /api/desktop/* 不转发:由桌面端本地回 501(设计文档 §与 windows/Program.cs 对齐)
+        if path == "/api/desktop" || path.hasPrefix("/api/desktop/") { return .desktop501 }
+        // CL 值:去首尾空格/制表符后必须是非空纯 ASCII 数字 0-9(不收 +、-、空格分隔等),且不溢出 Int
+        if let raw = clRaw {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            let isDigits = !t.isEmpty && t.allSatisfy { ch in
+                ch.asciiValue.map { (48...57).contains($0) } ?? false
+            }
+            guard isDigits, let clen = Int(t) else { return .badRequest }
+            if clen > Self.forwardMaxBody { return .tooLarge }
+            let needed = headerEnd.upperBound + clen
+            if buf.count >= needed { return .go(Data(buf[..<needed])) }
+            return .wait
         }
-        let needed = headerEnd.upperBound + clen
-        if buf.count >= needed { return .go(Data(buf[..<needed])) }
-        return .wait
+        // 缺 Content-Length:头收齐即转发;已收到的数据若超 头+上限(边发边不给长度)也拒
+        if buf.count > headerEnd.upperBound + Self.forwardMaxBody { return .tooLarge }
+        return .go(buf)
     }
 
     /// 转发层自答的状态行(不走 origin/CORS 逻辑)
@@ -562,7 +608,14 @@ final class BridgeServer {
     /// 原样把请求字节(请求行、全部头含 Host/Origin、体)转给 127.0.0.1:<bridgePort>,
     /// 上游响应原样回写后关闭。上游 python bridge 回 Connection: close,读到 EOF 即完整。
     private func forward(_ client: NWConnection, request: Data) {
+        // 并发上限 16:满则直接 503 关闭,不连上游。计数只在 queue 上读写(回调全在 queue)。
+        guard forwardActive < Self.forwardMaxConcurrent else {
+            send(client, Self.forwardStatus(503, "service unavailable"))
+            return
+        }
+        forwardActive += 1
         guard let port = NWEndpoint.Port(rawValue: Self.bridgePort) else {
+            forwardActive -= 1
             send(client, Self.forwardStatus(502, "bad gateway"))
             return
         }
@@ -573,6 +626,7 @@ final class BridgeServer {
         func finish(_ reply: Data?) {          // reply=nil:直接断开
             guard !finished else { return }
             finished = true
+            forwardActive -= 1
             timeout?.cancel()
             upstream.cancel()
             if let reply {
