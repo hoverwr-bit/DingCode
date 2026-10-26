@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { api, note_text, type NoteDoc, type RunPayload } from "../api";
+import { api, note_text, type AppConfig, type NoteDoc, type RunPayload } from "../api";
 import PinCard from "./PinCard.vue";
 import StatusBadge from "./StatusBadge.vue";
 
@@ -9,8 +9,11 @@ const emit = defineEmits<{ (e: "back"): void }>();
 
 const payload = ref<RunPayload | null>(null);
 const noteDoc = ref<NoteDoc | null>(null);
+const config = ref<AppConfig | null>(null);
 const error = ref("");
 const loading = ref(true);
+// M6 手动派活：完整提示词可在记录页再次复制。
+const copyState = ref("");
 // 设计：SPA 每 1.5s 轮询 GET /api/runs/<sid>（运行中才有意义）。
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -20,10 +23,27 @@ async function load() {
   try {
     payload.value = await api.run(props.sid);
     noteDoc.value = await api.note(props.sid);
+    if (!config.value) {
+      config.value = await api.config().catch(() => null);
+    }
   } catch (err) {
     error.value = String(err);
   } finally {
     loading.value = false;
+  }
+}
+
+async function copyPrompt() {
+  try {
+    const data = await api.sessionPrompt(props.sid);
+    if (!data) {
+      copyState.value = "没有可复制的提示词";
+      return;
+    }
+    await navigator.clipboard.writeText(data.prompt);
+    copyState.value = "已复制完整提示词 ✓";
+  } catch {
+    copyState.value = "复制失败";
   }
 }
 
@@ -93,7 +113,16 @@ function onReverted(_pid: string) {
         <div class="flex items-center gap-3">
           <h2 class="font-mono text-sm font-semibold">{{ payload.session }}</h2>
           <StatusBadge :status="payload.status" />
+          <button
+            class="ml-auto rounded border border-blue-500 px-3 py-1 text-xs text-blue-600 hover:bg-blue-50"
+            @click="copyPrompt"
+          >复制提示词</button>
         </div>
+        <p v-if="copyState" class="mt-1 text-right text-xs text-slate-500">{{ copyState }}</p>
+        <p
+          v-if="payload.status === 'manual'"
+          class="mt-2 rounded bg-amber-50 px-3 py-2 text-xs text-amber-800"
+        >这个会话是手动派活：没有启动任何 CLI。点右上「复制提示词」把完整提示词贴给你的执行工具。</p>
         <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
           <dt class="text-slate-500">最新轮次</dt>
           <dd>{{ payload.round }}</dd>

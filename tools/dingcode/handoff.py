@@ -42,6 +42,7 @@ import difflib
 import hashlib
 import json
 import ntpath
+import re
 import os
 import shutil
 import subprocess
@@ -76,6 +77,9 @@ DEP_NAMES = {
 LINE_LIMIT = 400
 FILE_LIMIT = 8
 
+# 钉 id 进文件名（prompt-<id>.md）时的白名单，与 runs_api 的 _PIN 一致。
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
 
 def project_dir():
     chosen = (env("DINGCODE_PROJECT", "DINGAI_PROJECT", default="") or "").strip()
@@ -105,6 +109,19 @@ def load_rules():
         if text:
             return text
     return DEFAULT_RULES
+
+
+def load_rules_for(folder):
+    """Bound-folder rules first (M6 项目绑定表), then the usual load_rules chain."""
+    if folder:
+        try:
+            with open(project_file(folder, "handoff-rules.md"), encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError:
+            text = ""
+        if text:
+            return text
+    return load_rules()
 
 
 def limit_text(text, limit):
@@ -933,15 +950,55 @@ def config_path():
     return os.path.join(dot_dir(), "config.json")
 
 
-def load_auto_config():
+def load_config():
+    """Full config.json merged with defaults (M6 首次设置引导).
+
+    dispatch 与旧 auto 字段兼容：config 里没有 dispatch 时由 auto 推导
+    （auto=false 等价 manual）。port=0 表示用默认端口。
+    """
     data = _read_json(config_path(), {})
     engine = data.get("engine") if data.get("engine") in ("claude", "codex") else "claude"
-    auto = True if "auto" not in data else bool(data.get("auto"))
-    return {"engine": engine, "auto": auto}
+    if data.get("dispatch") in ("auto", "manual"):
+        dispatch = data["dispatch"]
+    else:
+        dispatch = "auto" if bool(data.get("auto", True)) else "manual"
+    try:
+        port = int(data.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return {
+        "engine": engine,
+        "auto": dispatch == "auto",
+        "dispatch": dispatch,
+        "setup_done": bool(data.get("setup_done")),
+        "engine_path": str(data.get("engine_path") or ""),
+        "port": port if 1 <= port <= 65535 else 0,
+        "extension_id": str(data.get("extension_id") or ""),
+    }
+
+
+def load_auto_config():
+    cfg = load_config()
+    return {"engine": cfg["engine"], "auto": cfg["auto"]}
+
+
+def save_config(patch):
+    """Merge keys into config.json, keeping unrelated fields (extension_id 等)。
+
+    dispatch 写进 config 时同步旧的 auto 布尔字段，老版本读到的行为不变。
+    """
+    data = _read_json(config_path(), {})
+    data.update(patch)
+    # dispatch 一定落盘（没有就由旧 auto 推导），auto 同步成同一个意思。
+    if data.get("dispatch") not in ("auto", "manual"):
+        data["dispatch"] = "auto" if bool(data.get("auto", True)) else "manual"
+    data["auto"] = data["dispatch"] == "auto"
+    _write_json(config_path(), data)
+    return load_config()
 
 
 def save_auto_config(engine, auto):
-    _write_json(config_path(), {"engine": engine, "auto": bool(auto)})
+    save_config({"engine": engine, "dispatch": "auto" if auto else "manual"})
 
 
 def current_engine():
@@ -963,6 +1020,28 @@ def set_engine(name):
 def set_auto(enabled):
     cfg = load_auto_config()
     save_auto_config(cfg["engine"], enabled)
+
+
+def dispatch_mode():
+    return load_config()["dispatch"]
+
+
+def setup_done():
+    """首次设置引导的判定：config.json 没写 setup_done 就还没确认过（旧用户也一样）。"""
+    return load_config()["setup_done"]
+
+
+def unbind_target(target):
+    key = normalize_target(target)
+    data = load_projects()
+    if key in data["bindings"]:
+        del data["bindings"][key]
+    elif target in data["bindings"]:
+        del data["bindings"][target]
+    else:
+        return False
+    _write_json(projects_path(), data)
+    return True
 
 
 def normalize_target(target):
@@ -1052,8 +1131,12 @@ def screenshot_paths(note, note_path):
 
 
 def autofix_constraints(folder):
+    if folder:
+        scope = "Only edit files inside this folder: %s" % folder
+    else:
+        scope = "项目目录未绑定：请在目标项目的代码目录里执行这些修改，不要动 home 目录。"
     return "\n".join([
-        "Only edit files inside this folder: %s" % folder,
+        scope,
         "Make the smallest change that fixes the pins. Do not refactor.",
         "Do not add a framework.",
         "Address each pin by id.",
@@ -1131,18 +1214,21 @@ def engine_prompt(prompt):
     return "DingCode task:\n" + text
 
 
-def engine_command(engine, prompt, folder):
+def engine_command(engine, prompt, folder, engine_path=""):
+    """CLI argv（不经 shell）。engine_path 是设置页的自定义命令路径（如 ~/bin/claude-safe），
+    为空时按 engine 名在 PATH 里找。参数沿用所选 engine 的一套。"""
     body = engine_prompt(prompt)
+    binary = find_binary(os.path.expanduser(engine_path)) if engine_path else find_binary(engine)
     if engine == "codex":
         return [
-            find_binary("codex"), "exec",
+            binary, "exec",
             "--sandbox", "workspace-write",
             "-c", "sandbox_workspace_write.network_access=false",
             "--",
             body,
         ], folder
     return [
-        find_binary("claude"), "-p",
+        binary, "-p",
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Glob,Grep",
         "--disallowedTools", "Bash,WebFetch,WebSearch",
@@ -1986,6 +2072,29 @@ def result_payload(session):
     return payload
 
 
+def session_prompt(session):
+    """该会话的完整提示词（M6 手动派活复制用）。
+
+    优先 runs/<sid>/prompt.md（autofix/manual 派活时落盘的那份）；没有就由
+    runs/<sid>/note.json 现拼一份。folder 未绑定时提示词里写明未绑定。
+    """
+    data = _read_file(os.path.join(run_dir(session), "prompt.md"))
+    if data is not None and data.strip():
+        return {"ok": True, "session": session, "source": "prompt.md",
+                "prompt": data.decode("utf-8", "replace")}
+    raw = _read_file(os.path.join(run_dir(session), "note.json"))
+    if raw is None:
+        return {"ok": False, "error": "no prompt for session", "session": session}
+    try:
+        note = json.loads(raw.decode("utf-8", "replace") or "{}")
+    except ValueError:
+        return {"ok": False, "error": "note is not valid json", "session": session}
+    text = json.dumps(note if isinstance(note, dict) else {}, ensure_ascii=False, indent=2)
+    folder = read_run_status(session).get("folder") or ""
+    prompt = build_autofix_prompt(text, folder, screenshot_paths(note, os.path.join(run_dir(session), "note.json")))
+    return {"ok": True, "session": session, "source": "built", "prompt": prompt}
+
+
 def revert_round(session, round_n=None):
     numbers = round_numbers(session)
     if round_n is None:
@@ -2225,6 +2334,49 @@ def autofix_per_pin(note_path, session):
     return 0 if not failed else 1
 
 
+def manual_dispatch(session, round_n, kept, text, shots, note_path, cfg):
+    """手动派活（M6）：只生成完整提示词并记录，不启动任何 CLI。
+
+    未绑定的目标也照常生成（提示词里写明目录未绑定）；复不复制由人决定。
+    返回后 runs/<sid>/prompt.md 就是该会话可在记录页再次复制的完整提示词。
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    target = note_target(kept)
+    folder = lookup_binding(target)
+    prompt = build_autofix_prompt(text, folder, shots, rules=load_rules_for(folder))
+    folder_run = run_dir(session)
+    os.makedirs(folder_run, exist_ok=True)
+    with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    pin_id = ""
+    pins = kept.get("pins") or []
+    if len(pins) == 1 and isinstance(pins[0], dict):
+        pin_id = str(pins[0].get("id") or "")
+    # 钉 id 会进文件名：只放行安全字符，杜绝 note 里构造的穿越写法。
+    if pin_id and _SAFE_ID.match(pin_id):
+        # 单钉模式各存一份，多颗钉的提示词不互相覆盖。
+        with open(os.path.join(folder_run, "prompt-%s.md" % pin_id), "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+    with open(os.path.join(folder_run, "note.json"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        if folder:
+            record_baseline(folder)
+        observe_note(text, "manual")
+    except Exception:
+        pass
+    write_run_status(session, {
+        "status": "manual", "dispatch": "manual", "engine": cfg["engine"],
+        "folder": folder, "target": target, "note": note_path, "round": round_n,
+        "error": "", "finished": now,
+    })
+    sys.stdout.write(json.dumps({
+        "ok": True, "session": session, "status": "manual", "round": round_n,
+        "target": target, "prompt": os.path.join(folder_run, "prompt.md"),
+    }, ensure_ascii=False) + "\n")
+    return 0
+
+
 def autofix_main(argv):
     if len(argv) < 3:
         sys.stderr.write("usage: handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id] [--per-pin]\n")
@@ -2266,6 +2418,18 @@ def autofix_main(argv):
         })
         sys.stdout.write(json.dumps({"ok": False, "error": "no open pins", "session": session}) + "\n")
         return 1
+    cfg = load_config()
+    if cfg["dispatch"] == "manual":
+        shots = screenshot_paths(note, note_path)
+        text = json.dumps(kept, ensure_ascii=False, indent=2)
+        return manual_dispatch(session, round_n, kept, text, shots, note_path, cfg)
+    if not cfg["setup_done"]:
+        write_run_status(session, {
+            "status": "failed", "round": round_n, "error": "setup not done",
+            "note": note_path, "finished": now,
+        })
+        sys.stdout.write(json.dumps({"ok": False, "error": "setup not done", "session": session}) + "\n")
+        return 3
     rerun_k = 0
     if pin_only:
         # 3 轮上限只约束整轮自动循环；单钉重跑有自己的每钉上限。
@@ -2290,11 +2454,11 @@ def autofix_main(argv):
         })
         sys.stdout.write(json.dumps({"ok": False, "error": "unbound", "target": target, "session": session}) + "\n")
         return 3
-    engine = current_engine()
+    engine = cfg["engine"]
     shots = screenshot_paths(note, note_path)
     text = json.dumps(kept, ensure_ascii=False, indent=2)
-    prompt = build_autofix_prompt(text, folder, shots, feedback)
-    cmd, cwd = engine_command(engine, prompt, folder)
+    prompt = build_autofix_prompt(text, folder, shots, feedback, rules=load_rules_for(folder))
+    cmd, cwd = engine_command(engine, prompt, folder, cfg["engine_path"])
     folder_run = run_dir(session)
     os.makedirs(folder_run, exist_ok=True)
     with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8") as fh:

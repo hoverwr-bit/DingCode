@@ -255,6 +255,8 @@ class AutofixTests(unittest.TestCase):
             os.chmod(path, 0o755)
         os.environ["DINGCODE_ENGINE_PATH"] = bindir
         os.environ["DINGCODE_AUTOFIX_DRY"] = "1"
+        # M6 起 auto 派活前须完成首次设置：这些用例走 auto 链路，先写好 config。
+        handoff.save_config({"dispatch": "auto", "setup_done": True})
 
     def tearDown(self):
         for key, value in self.old.items():
@@ -280,6 +282,129 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(handoff.lookup_binding(handoff.note_target(titled)), notes)
         self.assertEqual(handoff.note_target({"pins": [], "app": {"name": "Xcode"}}), "Xcode")
         self.assertEqual(handoff.lookup_binding("http://127.0.0.1:1"), "")
+
+    def _gate_note(self, name, url="http://localhost:8090/app"):
+        notes = os.path.join(self.home, "gate-notes")
+        os.makedirs(notes, exist_ok=True)
+        path = os.path.join(notes, name + ".json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"pins": [{"id": 1, "status": "open", "note": "GATE-PIN",
+                                 "page": {"url": url}}]}, fh)
+        return path
+
+    def test_first_setup_gate_blocks_auto_dispatch(self):
+        # M6 首次判定：config.json 没有 setup_done 时 auto 派活不启动。
+        folder = os.path.join(self.home, "gate-hub")
+        os.makedirs(folder)
+        handoff.bind_target("http://localhost:8090", folder)
+        handoff.save_config({"dispatch": "auto", "setup_done": False})
+        note_path = self._gate_note("anno-gate")
+        code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"])
+        self.assertEqual(code, 3)
+        status = handoff.read_run_status("anno-gate")
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["error"], "setup not done")
+        self.assertEqual(handoff.round_numbers("anno-gate"), [])  # 没起 CLI，也没有轮
+        # 设置完成（保存 setup_done）后同一颗钉就能派。
+        handoff.save_config({"setup_done": True})
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"]), 0)
+
+    def test_manual_dispatch_generates_prompt_without_cli(self):
+        # M6 手动派活：只生成提示词并记录，不启动任何 CLI。
+        folder = os.path.join(self.home, "manual-hub")
+        os.makedirs(folder)
+        handoff.bind_target("http://localhost:8090", folder)
+        handoff.save_config({"dispatch": "manual", "setup_done": True})
+        note_path = self._gate_note("anno-manual")
+        code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"])
+        self.assertEqual(code, 0)
+        status = handoff.read_run_status("anno-manual")
+        self.assertEqual(status["status"], "manual")
+        self.assertEqual(status["dispatch"], "manual")
+        self.assertEqual(status["folder"], folder)
+        run = handoff.run_dir("anno-manual")
+        # 没有轮、没有引擎日志：CLI 没被启动。
+        self.assertEqual(handoff.round_numbers("anno-manual"), [])
+        self.assertFalse(os.path.isfile(os.path.join(run, "log.txt")))
+        with open(os.path.join(run, "prompt.md"), encoding="utf-8") as fh:
+            prompt = fh.read()
+        self.assertIn("GATE-PIN", prompt)
+        self.assertIn("Only edit files inside this folder: %s" % folder, prompt)
+        self.assertIn("-----BEGIN USER ANNOTATION DATA-----", prompt)
+        # 记录页可再次复制：session_prompt 命中 prompt.md。
+        got = handoff.session_prompt("anno-manual")
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["source"], "prompt.md")
+        self.assertEqual(got["prompt"], prompt)
+        # 未绑定的目标在手动模式也生成提示词，写明目录未绑定，不启动 CLI。
+        note_path2 = self._gate_note("anno-manual-unbound", url="http://127.0.0.1:9/")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path2, "--round", "1"]), 0)
+        status2 = handoff.read_run_status("anno-manual-unbound")
+        self.assertEqual(status2["status"], "manual")
+        self.assertEqual(status2["folder"], "")
+        with open(os.path.join(run2 := handoff.run_dir("anno-manual-unbound"),
+                               "prompt.md"), encoding="utf-8") as fh:
+            self.assertIn("项目目录未绑定", fh.read())
+        self.assertEqual(handoff.round_numbers("anno-manual-unbound"), [])
+
+    def test_config_dispatch_back_compat(self):
+        # 旧 config 只有 auto 布尔：auto=false 等价 manual；写回时保留无关字段。
+        cfg_path = handoff.config_path()
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump({"engine": "codex", "auto": False, "extension_id": "a" * 32}, fh)
+        cfg = handoff.load_config()
+        self.assertEqual(cfg["dispatch"], "manual")
+        self.assertFalse(cfg["auto"])
+        self.assertEqual(cfg["engine"], "codex")
+        self.assertEqual(cfg["extension_id"], "a" * 32)
+        self.assertFalse(cfg["setup_done"])
+        # 保存合并写：extension_id 不丢，dispatch 同步 auto 字段。
+        handoff.save_config({"setup_done": True})
+        with open(cfg_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self.assertEqual(raw["extension_id"], "a" * 32)
+        self.assertTrue(raw["setup_done"])
+        self.assertEqual(raw["dispatch"], "manual")
+        self.assertFalse(raw["auto"])
+        cfg = handoff.load_config()
+        self.assertEqual(cfg["dispatch"], "manual")
+        self.assertTrue(cfg["setup_done"])
+
+    def test_engine_path_custom_command(self):
+        # 设置页的自定义命令路径（如 ~/bin/claude-safe）不经 shell 直接作为 argv[0]。
+        custom = os.path.join(self.home, "bin", "claude")  # setUp 已造好的可执行
+        handoff.save_config({"engine_path": custom})
+        argv, cwd = handoff.engine_command("claude", "prompt text", self.home)
+        self.assertEqual(argv[0], custom)
+        self.assertEqual(argv[1], "-p")
+        # 带 ~ 的写法在启动时展开。
+        handoff.save_config({"engine_path": "~/bin/claude"})
+        argv, _ = handoff.engine_command("claude", "p", self.home)
+        self.assertEqual(argv[0], custom)
+        # 留空回到按 engine 名查找。
+        handoff.save_config({"engine_path": ""})
+        argv, _ = handoff.engine_command("claude", "p", self.home)
+        self.assertEqual(os.path.basename(argv[0]), "claude")
+
+    def test_session_prompt_built_from_note(self):
+        # 没有 prompt.md 时由 runs/<sid>/note.json 现拼，folder 取 status。
+        folder = os.path.join(self.home, "prompt-hub")
+        os.makedirs(folder)
+        run = handoff.run_dir("anno-prompt")
+        os.makedirs(run)
+        with open(os.path.join(run, "note.json"), "w", encoding="utf-8") as fh:
+            json.dump({"pins": [{"id": 1, "note": "PROMPT-PIN"}]}, fh)
+        handoff.write_run_status("anno-prompt", {"folder": folder})
+        got = handoff.session_prompt("anno-prompt")
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["source"], "built")
+        self.assertIn("PROMPT-PIN", got["prompt"])
+        self.assertIn(folder, got["prompt"])
+        # 完全没有会话数据 → 不 ok。
+        self.assertFalse(handoff.session_prompt("anno-missing")["ok"])
 
     def test_command_construction(self):
         folder = os.path.join(self.home, "proj")
@@ -636,6 +761,8 @@ class PinRevertTests(unittest.TestCase):
             os.chmod(path, 0o755)
         os.environ["DINGCODE_ENGINE_PATH"] = bindir
         os.environ["DINGCODE_AUTOFIX_DRY"] = "1"
+        # M6 起 auto 派活前须完成首次设置：这些用例走 auto 链路，先写好 config。
+        handoff.save_config({"dispatch": "auto", "setup_done": True})
 
     def tearDown(self):
         for key, value in self.old.items():

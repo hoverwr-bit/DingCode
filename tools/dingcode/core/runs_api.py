@@ -27,6 +27,20 @@ POST /api/runs/{sid}/pins/{pid}/revert per-pin revert (three-way merge);
                                        a merge conflict is 409 + conflict files
                                        and nothing on disk is touched
 
+M6 首次设置引导 (setup page):
+GET  /api/config             merged config.json (dispatch/setup_done/engine/port)
+POST /api/config             write dispatch|engine|engine_path|port|setup_done,
+                             confirm == "config"; engine_path must be an existing
+                             absolute file, port 0..65535
+GET  /api/projects           bindings with folder exists / is-git flags
+POST /api/projects           bind {name, folder} (folder must be an existing
+                             absolute dir) or unbind {name, delete: true},
+                             confirm == "projects"
+GET  /api/projects/{n}/rules read <folder>/.dingcode/handoff-rules.md
+POST /api/projects/{n}/rules write it, confirm == the project name;
+                             {n} is the URL-encoded binding key
+GET  /api/runs/{sid}/prompt  the session's full prompt for manual dispatch copy
+
 /app, /app/*   the prebuilt SPA in web/record/dist (suffix whitelist,
                explicit Content-Type, nosniff, realpath traversal guard)
 """
@@ -37,6 +51,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import unquote
 
 from core.paths import env
 
@@ -57,6 +72,11 @@ POST_LIMIT = 64 << 10
 NOTE_LIMIT = 2000       # handoff.PIN_TEXT_LIMIT
 FEEDBACK_LIMIT = 1000   # handoff.FEEDBACK_LIMIT
 MAX_RERUNS = 3          # per-pin cap, matches the global 3-round loop cap
+RULES_LIMIT = 20000     # per-project handoff-rules.md, chars
+NAME_LIMIT = 200        # binding key length
+ENGINE_PATH_LIMIT = 500
+
+_CTRL = re.compile(r"[\x00-\x1f]")
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -118,7 +138,7 @@ def handle(handler, path, query, decision):
         serve_static(handler, path, decision)
         return
     if handler.command != "GET":
-        # Reads are GET-only; POST reaches exactly the two write routes below.
+        # Reads are GET-only; POST reaches exactly the write routes below.
         match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/note", path)
         if match:
             pin_note_edit(handler, decision, match.group(1), match.group(2))
@@ -130,6 +150,16 @@ def handle(handler, path, query, decision):
         match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/revert", path)
         if match:
             pin_revert(handler, decision, match.group(1), match.group(2))
+            return
+        if path == "/api/config":
+            config_write(handler, decision)
+            return
+        if path == "/api/projects":
+            projects_write(handler, decision)
+            return
+        match = re.fullmatch(r"/api/projects/([^/]+)/rules", path)
+        if match:
+            project_rules_write(handler, decision, match.group(1))
             return
         _error(handler, decision, 404, "not found")
         return
@@ -165,6 +195,20 @@ def handle(handler, path, query, decision):
     match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)", path)
     if match:
         pin_history(handler, decision, match.group(1), match.group(2))
+        return
+    if path == "/api/config":
+        config_read(handler, decision)
+        return
+    if path == "/api/projects":
+        projects_read(handler, decision)
+        return
+    match = re.fullmatch(r"/api/projects/([^/]+)/rules", path)
+    if match:
+        project_rules_read(handler, decision, match.group(1))
+        return
+    match = re.fullmatch(r"/api/runs/([^/]+)/prompt", path)
+    if match:
+        run_prompt(handler, decision, match.group(1))
         return
     _error(handler, decision, 404, "not found")
 
@@ -536,6 +580,223 @@ def _spawn_autofix(session, round_n, pid, feedback=""):
 
 
 spawn_autofix = _spawn_autofix
+
+
+# -- M6 设置接口 -----------------------------------------------------------
+
+def config_read(handler, decision):
+    import handoff
+
+    cfg = handoff.load_config()
+    cfg["app_url"] = "http://127.0.0.1:%d/app/" % (handler.server.server_address[1])
+    _json(handler, decision, 200, {"ok": True, **cfg})
+
+
+def config_write(handler, decision):
+    import handoff
+
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, "config"):
+        return
+    patch = {}
+    if "dispatch" in body:
+        if body["dispatch"] not in ("auto", "manual"):
+            _error(handler, decision, 400, "dispatch must be auto or manual")
+            return
+        patch["dispatch"] = body["dispatch"]
+    if "engine" in body:
+        if body["engine"] not in ("claude", "codex"):
+            _error(handler, decision, 400, "engine must be claude or codex")
+            return
+        patch["engine"] = body["engine"]
+    if "engine_path" in body:
+        path = body["engine_path"]
+        if path is None or path == "":
+            patch["engine_path"] = ""
+        else:
+            if not isinstance(path, str) or len(path) > ENGINE_PATH_LIMIT or _CTRL.search(path):
+                _error(handler, decision, 400, "bad engine_path")
+                return
+            expanded = os.path.expanduser(path)
+            if not os.path.isabs(expanded) or not os.path.isfile(expanded):
+                _error(handler, decision, 400, "engine_path must be an existing file")
+                return
+            patch["engine_path"] = path
+    if "port" in body:
+        port = body["port"]
+        if isinstance(port, bool) or not isinstance(port, (int, str)):
+            _error(handler, decision, 400, "port must be a number")
+            return
+        try:
+            port = int(port)
+        except ValueError:
+            _error(handler, decision, 400, "port must be a number")
+            return
+        if not 0 <= port <= 65535:
+            _error(handler, decision, 400, "port out of range")
+            return
+        patch["port"] = port  # 0 = 回到默认端口
+    if "setup_done" in body:
+        if not isinstance(body["setup_done"], bool):
+            _error(handler, decision, 400, "setup_done must be a boolean")
+            return
+        patch["setup_done"] = body["setup_done"]
+    cfg = handoff.save_config(patch)
+    _json(handler, decision, 200, {"ok": True, **cfg})
+
+
+def _binding_rows():
+    import handoff
+
+    rows = []
+    for name, folder in (handoff.load_projects().get("bindings") or {}).items():
+        rows.append({
+            "name": str(name),
+            "folder": str(folder),
+            "exists": os.path.isdir(str(folder)),
+            "is_git": os.path.isdir(os.path.join(str(folder), ".git"))
+                      or os.path.isfile(os.path.join(str(folder), ".git")),
+        })
+    rows.sort(key=lambda row: row["name"])
+    return rows
+
+
+def projects_read(handler, decision):
+    _json(handler, decision, 200, {"ok": True, "projects": _binding_rows()})
+
+
+def _check_name(handler, decision, name):
+    if not name or len(name) > NAME_LIMIT or _CTRL.search(name):
+        _error(handler, decision, 400, "bad project name")
+        return ""
+    return name
+
+
+def projects_write(handler, decision):
+    import handoff
+
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, "projects"):
+        return
+    name = body.get("name")
+    name = name.strip() if isinstance(name, str) else ""
+    if not _check_name(handler, decision, name):
+        return
+    if body.get("delete"):
+        if not handoff.unbind_target(name):
+            _error(handler, decision, 404, "no such binding")
+            return
+        _json(handler, decision, 200, {"ok": True, "projects": _binding_rows()})
+        return
+    folder = body.get("folder")
+    if not isinstance(folder, str) or not folder.strip():
+        _error(handler, decision, 400, "folder must be a path string")
+        return
+    expanded = os.path.abspath(os.path.expanduser(folder.strip()))
+    # 目录须为已存在的绝对路径：相对路径和 ~ 之外的名字都不收。
+    if not os.path.isabs(expanded) or not os.path.isdir(expanded):
+        _error(handler, decision, 400, "folder must be an existing absolute directory")
+        return
+    if not handoff.bind_target(name, expanded):
+        _error(handler, decision, 400, "could not bind folder")
+        return
+    _json(handler, decision, 200, {"ok": True, "projects": _binding_rows()})
+
+
+def _rules_target(handler, decision, raw):
+    """URL 段里的绑定键（percent-encoded）→ 已绑定目录；未绑定返回 None 并已回错。"""
+    import handoff
+
+    name = unquote(raw)
+    if not _check_name(handler, decision, name):
+        return None
+    bindings = handoff.load_projects().get("bindings") or {}
+    folder = bindings.get(name) or bindings.get(handoff.normalize_target(name)) or ""
+    if not folder or not os.path.isdir(str(folder)):
+        _error(handler, decision, 404, "no such binding")
+        return None
+    return name, str(folder)
+
+
+def project_rules_read(handler, decision, raw):
+    import handoff
+
+    found = _rules_target(handler, decision, raw)
+    if found is None:
+        return
+    name, folder = found
+    path = _rules_file(folder)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rules = fh.read()
+        exists = True
+    except OSError:
+        rules, exists = "", False
+    _json(handler, decision, 200, {
+        "ok": True, "name": name, "folder": folder, "exists": exists,
+        "rules": rules, "default": handoff.DEFAULT_RULES,
+    })
+
+
+def project_rules_write(handler, decision, raw):
+    import handoff
+
+    found = _rules_target(handler, decision, raw)
+    if found is None:
+        return
+    name, folder = found
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, name):
+        return
+    rules = body.get("rules")
+    if not isinstance(rules, str):
+        _error(handler, decision, 400, "rules must be a string")
+        return
+    rules = rules.strip()
+    if len(rules) > RULES_LIMIT:
+        _error(handler, decision, 400, "rules too long (max %d)" % RULES_LIMIT)
+        return
+    path = _rules_file(folder)
+    if not rules:
+        # 存空规则等于回到默认：删掉项目文件，load_rules 落到下一级。
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        _json(handler, decision, 200, {"ok": True, "name": name, "rules": ""})
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(rules + "\n")
+    except OSError as exc:
+        _error(handler, decision, 500, "could not write rules: %s" % exc)
+        return
+    _json(handler, decision, 200, {"ok": True, "name": name, "rules": rules})
+
+
+def _rules_file(folder):
+    from core.paths import project_file
+
+    return project_file(folder, "handoff-rules.md")
+
+
+def run_prompt(handler, decision, sid):
+    import handoff
+
+    if not _check_sid(handler, decision, sid):
+        return
+    result = handoff.session_prompt(sid)
+    if not result.get("ok"):
+        _error(handler, decision, 404, result.get("error") or "no prompt")
+        return
+    _json(handler, decision, 200, result)
 
 
 def serve_static(handler, path, decision):

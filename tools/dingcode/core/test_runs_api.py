@@ -559,6 +559,204 @@ class RunsApiTests(unittest.TestCase):
             self.assertEqual(fh.read(), before)
         self.assertFalse(os.path.exists(self.source_note + ".tmp"))
 
+    # -- M6 首次设置引导 -----------------------------------------------------
+
+    def test_config_get_defaults(self):
+        # 全新临时 home：没有 setup_done（首次判定成立），dispatch 由缺省 auto 推导。
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["setup_done"])
+        self.assertEqual(data["dispatch"], "auto")
+        self.assertTrue(data["auto"])
+        self.assertEqual(data["engine"], "claude")
+        self.assertIn("/app/", data["app_url"])
+
+    def test_config_write_auth(self):
+        status, _, _ = self.post_write("/api/config", {"dispatch": "manual"}, origin=None)
+        self.assertEqual(status, 403)
+        status, body, _ = self.post_write("/api/config", {"dispatch": "manual"})
+        self.assertEqual(status, 401)
+        creds = self.creds()
+        status, body, _ = self.post_write(
+            "/api/config", {**creds, "dispatch": "manual", "confirm": "projects"})
+        self.assertEqual(status, 403)
+        self.assertIn("confirm", json.loads(body)["error"])
+
+    def test_config_write_roundtrip_and_validations(self):
+        creds = self.creds()
+        status, body, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config", "dispatch": "manual",
+            "engine": "codex", "port": 9999, "setup_done": True,
+        })
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["dispatch"], "manual")
+        self.assertFalse(data["auto"])  # 旧 auto 字段同步
+        self.assertTrue(data["setup_done"])
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(json.loads(body)["port"], 9999)
+        # config.json 里保留无关字段（extension_id），dispatch 同步 auto。
+        from handoff import config_path, load_config
+        with open(config_path(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw["extension_id"] = "a" * 32
+        with open(config_path(), "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        cfg = load_config()
+        self.assertEqual(cfg["extension_id"], "a" * 32)
+        self.assertEqual(cfg["dispatch"], "manual")
+        # 校验：非法 dispatch / engine / port / engine_path 都 400。
+        for patch in (
+            {"dispatch": "x"}, {"engine": "claude-code"}, {"port": 70000},
+            {"port": "abc"}, {"engine_path": "relative/claude"},
+            {"engine_path": os.path.join(self.home, "no-such-bin")},
+            {"setup_done": "yes"},
+        ):
+            status, body, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", **patch})
+            self.assertEqual(status, 400, patch)
+
+    def test_projects_read_write_and_delete(self):
+        status, body, _ = self.request("/api/projects")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"], [])
+        creds = self.creds()
+        # 目录必须是已存在的绝对路径。
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": "relative/path"})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": os.path.join(self.home, "missing-dir")})
+        self.assertEqual(status, 400)
+        folder = os.path.join(self.home, "bound-proj")
+        os.makedirs(folder)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": folder})
+        self.assertEqual(status, 200)
+        rows = json.loads(body)["projects"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Notes")
+        self.assertEqual(rows[0]["folder"], folder)
+        self.assertTrue(rows[0]["exists"])
+        self.assertFalse(rows[0]["is_git"])
+        # 同名再绑 = 修改。
+        folder2 = os.path.join(self.home, "bound-proj-2")
+        os.makedirs(folder2)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": folder2})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"][0]["folder"], folder2)
+        # 未知的删除 404；存在的删除成功。
+        status, _, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Nope", "delete": True})
+        self.assertEqual(status, 404)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "delete": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"], [])
+
+    def test_projects_rules_read_write(self):
+        folder = os.path.join(self.home, "rules-proj")
+        os.makedirs(folder)
+        from handoff import bind_target
+        self.assertEqual(bind_target("RulesApp", folder), "RulesApp")
+        status, _, _ = self.request("/api/projects/Unbound/rules")
+        self.assertEqual(status, 404)
+        status, body, _ = self.request("/api/projects/RulesApp/rules")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["exists"])
+        self.assertTrue(data["default"].strip())
+        # 写需要鉴权；confirm 必须是项目名本身。
+        creds = self.creds()
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules",
+            {**creds, "confirm": "OtherApp", "rules": "- x"})
+        self.assertEqual(status, 403)
+        rules = "- 最小改动。\n- 不要重构。"
+        status, body, _ = self.post_write(
+            "/api/projects/RulesApp/rules", {**creds, "confirm": "RulesApp", "rules": rules})
+        self.assertEqual(status, 200)
+        rules_path = os.path.join(folder, ".dingcode", "handoff-rules.md")
+        with open(rules_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), rules + "\n")
+        status, body, _ = self.request("/api/projects/RulesApp/rules")
+        data = json.loads(body)
+        self.assertTrue(data["exists"])
+        self.assertEqual(data["rules"], rules + "\n")  # 文件原样返回（含结尾换行）
+        # 绑定键是网址时走 percent-encoding。
+        folder2 = os.path.join(self.home, "rules-web")
+        os.makedirs(folder2)
+        bind_target("http://localhost:8090", folder2)
+        encoded = "http%3A%2F%2Flocalhost%3A8090"
+        status, _, _ = self.post_write(
+            "/api/projects/%s/rules" % encoded,
+            {**creds, "confirm": "http://localhost:8090", "rules": "- web 规则"})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/projects/%s/rules" % encoded)
+        self.assertEqual(json.loads(body)["rules"], "- web 规则\n")
+        # 空规则 = 删项目文件回默认。
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules", {**creds, "confirm": "RulesApp", "rules": "  "})
+        self.assertEqual(status, 200)
+        self.assertFalse(os.path.exists(rules_path))
+        # 超长 400。
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules",
+            {**creds, "confirm": "RulesApp", "rules": "x" * 20001})
+        self.assertEqual(status, 400)
+
+    def test_run_prompt_endpoint(self):
+        # SID 没有 prompt.md：由 runs/note.json 现拼。
+        status, body, _ = self.request("/api/runs/%s/prompt" % SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["source"], "built")
+        self.assertIn("这个按钮改成蓝色", data["prompt"])
+        self.assertIn("-----BEGIN USER ANNOTATION DATA-----", data["prompt"])
+        # 有 prompt.md 的会话直接返回落盘那份（manual 派活写入的）。
+        run2 = os.path.join(self.home, "runs", SID2)
+        with open(os.path.join(run2, "prompt.md"), "w", encoding="utf-8") as fh:
+            fh.write("FULL PROMPT FOR MANUAL DISPATCH\n")
+        status, body, _ = self.request("/api/runs/%s/prompt" % SID2)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["source"], "prompt.md")
+        self.assertIn("MANUAL DISPATCH", data["prompt"])
+        # 未知会话 404。
+        status, _, _ = self.request("/api/runs/missing-session/prompt")
+        self.assertEqual(status, 404)
+
+    def test_default_port_reads_config(self):
+        from core import bridge
+        saved_env = os.environ.get("DINGCODE_BRIDGE_PORT")
+        try:
+            os.environ.pop("DINGCODE_BRIDGE_PORT", None)
+            # 前面的用例可能在共享 home 里写过 port；先清回默认。
+            self._write(os.path.join(self.home, "config.json"), {"port": 0})
+            self.assertEqual(bridge.default_port(), 8763)
+            self._write(os.path.join(self.home, "config.json"), {"port": 9123})
+            self.assertEqual(bridge.default_port(), 9123)
+            self._write(os.path.join(self.home, "config.json"), {"port": 70000})
+            self.assertEqual(bridge.default_port(), 8763)
+            os.environ["DINGCODE_BRIDGE_PORT"] = "9200"
+            self.assertEqual(bridge.default_port(), 9200)
+        finally:
+            if saved_env is None:
+                os.environ.pop("DINGCODE_BRIDGE_PORT", None)
+            else:
+                os.environ["DINGCODE_BRIDGE_PORT"] = saved_env
+            self._write(os.path.join(self.home, "config.json"), {})
+
 
 if __name__ == "__main__":
     unittest.main()

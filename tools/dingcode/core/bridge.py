@@ -31,6 +31,10 @@ _UNSAFE = re.compile(r"[\r\n\x00,]")
 
 
 def config_dir():
+    """~/.dingcode, or DINGCODE_HOME when set (handoff.dot_dir 的同一套覆盖)."""
+    override = env("DINGCODE_HOME", "DINGAI_HOME")
+    if override:
+        return override
     return os.path.join(os.path.expanduser("~"), ".dingcode")
 
 
@@ -300,12 +304,27 @@ def make_server(port):
     return BridgeServer(("127.0.0.1", int(port)), BridgeHandler)
 
 
-def default_port():
-    raw = env("DINGCODE_BRIDGE_PORT", "DINGAI_BRIDGE_PORT", default="8763") or "8763"
+def config_port():
+    """config.json 里的 port（M6 设置页可改，重启生效）；没写或非法返回 0。"""
+    path = os.path.join(config_dir(), "config.json")
     try:
-        return int(raw)
-    except ValueError:
-        return 8763
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        port = int(data.get("port") or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+    return port if 1 <= port <= 65535 else 0
+
+
+def default_port():
+    # 环境变量优先（原生端显式传的端口不动），其次 config.json 的 port。
+    forced = env("DINGCODE_BRIDGE_PORT", "DINGAI_BRIDGE_PORT", default="") or ""
+    if forced:
+        try:
+            return int(forced)
+        except ValueError:
+            pass
+    return config_port() or 8763
 
 
 def serve_background(port=None):

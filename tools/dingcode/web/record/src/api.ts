@@ -143,12 +143,84 @@ export class ApiError extends Error {
   }
 }
 
+export interface AppConfig {
+  ok: boolean;
+  engine: string;
+  auto: boolean;
+  dispatch: "auto" | "manual";
+  setup_done: boolean;
+  engine_path: string;
+  port: number;
+  app_url?: string;
+}
+
+/** 项目绑定表的一行（M6 设置页）。exists/is_git 是后端实时探测的目录状态。 */
+export interface ProjectRow {
+  name: string;
+  folder: string;
+  exists: boolean;
+  is_git: boolean;
+}
+
+export interface ProjectRules {
+  ok: boolean;
+  name: string;
+  folder: string;
+  exists: boolean;
+  rules: string;
+  default: string;
+}
+
+/** 该会话的完整提示词（手动派活复制用）。source: prompt.md 落盘或现拼。 */
+export interface SessionPrompt {
+  ok: boolean;
+  session: string;
+  source: "prompt.md" | "built";
+  prompt: string;
+}
+
 export const api = {
   sessions: () =>
     get_json<{ ok: boolean; sessions: SessionSummary[] }>("/api/sessions"),
   run: (sid: string) => get_json<RunPayload>(`/api/runs/${sid}`),
   pinHistory: (sid: string, pid: string) =>
     get_json<PinHistory>(`/api/runs/${sid}/pins/${pid}`),
+  config: () => get_json<AppConfig>("/api/config"),
+  /** 保存设置（M6）：patch 里的字段会写进 config.json；setup_done: true 结束首次引导。 */
+  saveConfig: (patch: Partial<Omit<AppConfig, "ok" | "app_url">>) =>
+    post_json<AppConfig>("/api/config", { ...patch, confirm: "config" }),
+  projects: () =>
+    get_json<{ ok: boolean; projects: ProjectRow[] }>("/api/projects"),
+  /** 新增/更新绑定：同名即改。folder 必须是已存在的绝对路径。 */
+  saveProject: (name: string, folder: string) =>
+    post_json<{ ok: boolean; projects: ProjectRow[] }>("/api/projects", {
+      name,
+      folder,
+      confirm: "projects",
+    }),
+  deleteProject: (name: string) =>
+    post_json<{ ok: boolean; projects: ProjectRow[] }>("/api/projects", {
+      name,
+      delete: true,
+      confirm: "projects",
+    }),
+  projectRules: (name: string) =>
+    get_json<ProjectRules>(
+      `/api/projects/${encodeURIComponent(name)}/rules`,
+    ),
+  /** 保存项目的 handoff-rules.md；空串 = 删掉项目文件回到默认规则。 */
+  saveProjectRules: (name: string, rules: string) =>
+    post_json<{ ok: boolean; name: string }>(
+      `/api/projects/${encodeURIComponent(name)}/rules`,
+      { rules, confirm: name },
+    ),
+  sessionPrompt: async (sid: string): Promise<SessionPrompt | null> => {
+    try {
+      return await get_json<SessionPrompt>(`/api/runs/${sid}/prompt`);
+    } catch {
+      return null;
+    }
+  },
   round: (sid: string, n: number) =>
     get_json<RoundDetail>(`/api/runs/${sid}/rounds/${n}`),
   note: async (sid: string): Promise<NoteDoc | null> => {

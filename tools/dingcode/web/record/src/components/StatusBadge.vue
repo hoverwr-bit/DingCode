@@ -15,6 +15,8 @@ const label = computed(() => {
     running: "进行中",
     error: "出错",
     confirmed: "已确认",
+    manual: "待手动派",
+    failed: "失败",
   };
   return map[props.status] || props.status || "未知";
 });
@@ -29,6 +31,7 @@ const theme = computed(() => {
     error: "red",
     unsure: "orange",
     running: "blue",
+    manual: "orange",
     open: "gray",
   };
   return map[props.status] || "gray";
