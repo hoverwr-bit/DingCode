@@ -211,6 +211,44 @@ class RunsApiTests(unittest.TestCase):
                      "Origin": "http://127.0.0.1:%d" % self.port})
         self.assertEqual(status, 403)
 
+    def test_shell_forwarded_port(self):
+        # BK-02: 原生壳 DingCode.app 占 127.0.0.1:8763，把 /app、/api 原样转发
+        # 到内部 bridge（本测试服务器就在 8763 之外的其他端口）。转发保留
+        # Host 与 Origin，壳的公开端口要按本机页面放行。
+        public_host = "127.0.0.1:%d" % bridge.APP_PUBLIC_PORT
+        public_origin = "http://" + public_host
+        status, body, _ = self.request(
+            "/api/sessions", headers={"Host": public_host, "Origin": public_origin})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # 带 token+confirm 的写请求同样通过。
+        creds = self.creds()
+        payload = {**creds, "confirm": "p1", "note": "x"}
+        data = json.dumps(payload).encode("utf-8")
+        status, body, _ = self.request(
+            "/api/runs/%s/pins/p1/note" % SID, method="POST",
+            headers={"Host": public_host, "Origin": public_origin,
+                     "Content-Type": "application/json",
+                     "Content-Length": str(len(data))},
+            data=data)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # localhost 形式的公开端口也放行。
+        status, _, _ = self.request(
+            "/api/sessions",
+            headers={"Host": "localhost:%d" % bridge.APP_PUBLIC_PORT,
+                     "Origin": "http://localhost:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        # 其他非本机端口的 Host 仍拒绝。
+        status, _, _ = self.request(
+            "/api/sessions", headers={"Host": "127.0.0.1:9999", "Origin": public_origin})
+        self.assertEqual(status, 403)
+        # 外域 Origin 仍 403。
+        status, _, _ = self.request(
+            "/api/sessions",
+            headers={"Host": public_host, "Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+
     def test_post_is_405(self):
         # 只读路径不吃 POST：POST 只属于两个写路由，其余 /api 404，/app 405。
         status, _, _ = self.request("/api/sessions", method="POST",

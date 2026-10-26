@@ -29,6 +29,11 @@ from core.paths import env
 _EXT_ID = re.compile(r"^[a-p]{32}$")
 _UNSAFE = re.compile(r"[\r\n\x00,]")
 
+# DingCode.app 的公开端口：原生壳占 127.0.0.1:8763，把 /app、/api 原样转发到
+# 内部 bridge（bridge 自己可能跑在其他端口）。转发保留 Host 与 Origin 头，
+# 所以 Host/Origin 是壳的 8763 也视为本机页面（BK-02）。
+APP_PUBLIC_PORT = 8763
+
 
 def config_dir():
     """~/.dingcode, or DINGCODE_HOME when set (handoff.dot_dir 的同一套覆盖)."""
@@ -109,9 +114,10 @@ def classify_origin(origin, allow=None, port=None):
     origin is None when the request has no Origin header. That is the local
     CLI case: the token may be returned, and no CORS or private-network header
     is sent. A present Origin is echoed only when it is on the allowlist.
-    A loopback origin on this service's own port classifies as "self": the
-    record page served from /app. Same-origin requests need no CORS header,
-    so "self" never gets one.
+    A loopback origin on this service's own port (or the shell's
+    APP_PUBLIC_PORT, when the native shell forwards requests here) classifies
+    as "self": the record page served from /app. Same-origin requests need no
+    CORS header, so "self" never gets one.
     """
     if allow is None:
         allow = allowed_origins()
@@ -123,8 +129,9 @@ def classify_origin(origin, allow=None, port=None):
     if not norm:
         return "deny", None
     if port is not None:
+        ports = port if isinstance(port, (tuple, list, set)) else (port,)
         parsed = urlparse(norm)
-        if parsed.hostname in ("127.0.0.1", "localhost") and parsed.port == int(port):
+        if parsed.hostname in ("127.0.0.1", "localhost") and parsed.port in set(int(p) for p in ports):
             return "self", None
     if norm not in allow:
         return "deny", None
@@ -168,15 +175,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return self.headers.get("Origin")
 
     def _decision(self):
-        return classify_origin(self._origin(), allowed_origins(), self.server.server_address[1])
+        return classify_origin(self._origin(), allowed_origins(),
+                               (self.server.server_address[1], APP_PUBLIC_PORT))
 
     def _host_ok(self):
-        """DNS-rebinding guard for /api and /app: the Host must be loopback here."""
+        """DNS-rebinding guard for /api and /app: the Host must be loopback here.
+
+        The native shell forwards /app and /api from its own public port
+        (APP_PUBLIC_PORT) verbatim, Host header included, so that port counts
+        as loopback too.
+        """
         host = (self.headers.get("Host") or "").strip().lower()
         if not host:
             return False
         port = self.server.server_address[1]
-        return host in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+        return host in ("127.0.0.1:%d" % port, "localhost:%d" % port,
+                        "127.0.0.1:%d" % APP_PUBLIC_PORT, "localhost:%d" % APP_PUBLIC_PORT)
 
     def _query(self):
         parsed = urlparse(self.path)
