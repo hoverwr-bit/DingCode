@@ -1,4 +1,5 @@
-// 只读数据层：全部 GET /api/*，与 bridge（core/runs_api.py）对应。
+// 数据层：GET /api/* 读取，M2 写操作（改批注/单钉重跑）带 client/token + confirm。
+// 与 bridge（core/runs_api.py）对应。
 
 export interface SessionSummary {
   session: string;
@@ -88,6 +89,36 @@ async function get_json<T>(url: string): Promise<T> {
   return (await resp.json()) as T;
 }
 
+export interface RerunResult {
+  ok: boolean;
+  session: string;
+  pin: string;
+  round: number;
+}
+
+// /api/session 的 client/token，M2 写操作必带。整个页面生命周期缓存一份。
+let creds: { client: number; token: string } | null = null;
+async function auth(): Promise<{ client: number; token: string }> {
+  if (!creds) {
+    creds = await get_json<{ client: number; token: string }>("/api/session");
+  }
+  return creds;
+}
+
+async function post_json<T>(url: string, body: Record<string, unknown>): Promise<T> {
+  const { client, token } = await auth();
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ ...body, client, token }),
+  });
+  const data = (await resp.json().catch(() => ({}))) as { error?: string };
+  if (!resp.ok) {
+    throw new Error(data.error || `${url}: HTTP ${resp.status}`);
+  }
+  return data as T;
+}
+
 export const api = {
   sessions: () =>
     get_json<{ ok: boolean; sessions: SessionSummary[] }>("/api/sessions"),
@@ -105,6 +136,18 @@ export const api = {
       return null;
     }
   },
+  /** 修改单颗钉的批注：写源 note 文件，runs/note.json 不动。 */
+  editPinNote: (sid: string, pid: string, note: string) =>
+    post_json<{ ok: boolean; pin_id: string; note: string }>(
+      `/api/runs/${sid}/pins/${pid}/note`,
+      { confirm: pid, note },
+    ),
+  /** 单钉重跑：后台起 autofix --round N --pin pid，立即返回轮号，进度靠轮询。 */
+  rerunPin: (sid: string, pid: string, feedback = "") =>
+    post_json<RerunResult>(`/api/runs/${sid}/pins/${pid}/rerun`, {
+      confirm: pid,
+      ...(feedback ? { feedback } : {}),
+    }),
 };
 
 export function note_text(pin: NotePin | undefined): string {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api, note_text, type NoteDoc, type RunPayload } from "../api";
 import PinCard from "./PinCard.vue";
 import StatusBadge from "./StatusBadge.vue";
@@ -11,6 +11,8 @@ const payload = ref<RunPayload | null>(null);
 const noteDoc = ref<NoteDoc | null>(null);
 const error = ref("");
 const loading = ref(true);
+// 设计：SPA 每 1.5s 轮询 GET /api/runs/<sid>（运行中才有意义）。
+let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 async function load() {
   loading.value = true;
@@ -25,13 +27,49 @@ async function load() {
   }
 }
 
+async function poll() {
+  if (document.hidden) return;
+  try {
+    const fresh = await api.run(props.sid);
+    payload.value = fresh;
+    if (fresh.status !== "running" && pollTimer) {
+      // 这轮结束：拉一次全量（含各钉最新 summary），然后停表。
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  } catch {
+    // 轮询失败不打断页面，下一轮再试。
+  }
+}
+
+function syncPolling() {
+  const running = payload.value?.status === "running";
+  if (running && !pollTimer) {
+    pollTimer = setInterval(poll, 1500);
+  }
+}
+
 onMounted(load);
 watch(() => props.sid, load);
+watch(payload, syncPolling);
+onBeforeUnmount(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+});
 
 function noteOf(pid: string): string {
   const pins = noteDoc.value?.pins || [];
   const found = pins.find((p) => String(p.id) === pid);
   return note_text(found);
+}
+
+function onNoteSaved(pid: string, note: string) {
+  // runs/note.json 要等下次 autofix 才重写；先在本地把列表页批注同步掉。
+  const pins = noteDoc.value?.pins || [];
+  const found = pins.find((p) => String(p.id) === pid);
+  if (found) found.note = note;
 }
 </script>
 
@@ -71,6 +109,8 @@ function noteOf(pid: string): string {
           :sid="payload.session"
           :pin="pin"
           :note="noteOf(pin.id)"
+          :run-status="payload.status"
+          @note-saved="onNoteSaved"
         />
       </div>
     </template>

@@ -1,8 +1,9 @@
-"""Tests for the read-only record page surface (core/runs_api.py).
+"""Tests for the record page surface (core/runs_api.py): M1 reads, M2 writes.
 
 Starts a real bridge on an ephemeral port against a temp DINGCODE_HOME and a
 temp dist dir, then drives it with raw http.client so Host and Origin headers
-are under test control.
+are under test control. M2 write tests patch runs_api.spawn_autofix so a rerun
+request never starts a real engine process.
 
 Run: python3 ./core/test_runs_api.py  (or python3 -m core.test_runs_api)
 """
@@ -19,6 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import bridge  # noqa: E402
+from core import runs_api  # noqa: E402
 
 SID = "case-1"
 DIFF = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hello\n+world\n"
@@ -36,6 +38,13 @@ SUMMARY = {
 MANIFEST = {"kind": "git", "head": "abc1234", "folder": "/tmp/proj",
             "files_sha256": {"a.txt": "deadbeef"}}
 NOTE = {"pins": [{"id": "p1", "note": "这个按钮改成蓝色"}]}
+# 源 note 文件（M2 改批注/重跑都以它为准），status.json 的 note 字段指向它。
+SOURCE_NOTE = {
+    "pins": [
+        {"id": "p1", "status": "open", "note": "这个按钮改成蓝色"},
+        {"id": "p2", "status": "confirmed", "note": "已确认"},
+    ]
+}
 
 
 class RunsApiTests(unittest.TestCase):
@@ -45,12 +54,15 @@ class RunsApiTests(unittest.TestCase):
         cls.dist = tempfile.mkdtemp(prefix="dingcode-dist-")
         os.environ["DINGCODE_HOME"] = cls.home
         os.environ["DINGCODE_RECORD_DIST"] = cls.dist
+        cls.source_note = os.path.join(cls.home, "source-notes", "case-1.json")
+        os.makedirs(os.path.dirname(cls.source_note))
+        cls._write(cls.source_note, SOURCE_NOTE)
         run = os.path.join(cls.home, "runs", SID)
         round1 = os.path.join(run, "round-1")
         os.makedirs(round1)
         cls._write(os.path.join(run, "status.json"), {
             "status": "done", "round": 1, "summary_line": "修复了 1 颗钉",
-            "note": "", "finished": "2026-10-25T10:00:00Z",
+            "note": cls.source_note, "finished": "2026-10-25T10:00:00Z",
         })
         cls._write(os.path.join(run, "note.json"), NOTE)
         cls._write(os.path.join(round1, "summary.json"), SUMMARY)
@@ -80,7 +92,7 @@ class RunsApiTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False)
 
-    def request(self, path, method="GET", headers=None):
+    def request(self, path, method="GET", headers=None, data=b""):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
@@ -89,12 +101,36 @@ class RunsApiTests(unittest.TestCase):
             for key, value in merged.items():
                 conn.putheader(key, value)
             conn.endheaders()
+            if data:
+                conn.send(data)
             resp = conn.getresponse()
             body = resp.read()
             headers_out = dict((k.lower(), v) for k, v in resp.getheaders())
             return resp.status, body, headers_out
         finally:
             conn.close()
+
+    @property
+    def self_origin(self):
+        return "http://127.0.0.1:%d" % self.port
+
+    def post_write(self, path, obj, origin="self"):
+        """POST with JSON body; origin "self" by default, None = no Origin header."""
+        headers = {}
+        if origin == "self":
+            headers["Origin"] = self.self_origin
+        elif origin:
+            headers["Origin"] = origin
+        data = json.dumps(obj).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(data))
+        return self.request(path, method="POST", headers=headers, data=data)
+
+    def creds(self):
+        status, body, _ = self.request("/api/session")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        return {"client": data["client"], "token": data["token"]}
 
     # -- origin / Host 门禁 ------------------------------------------------
 
@@ -136,11 +172,14 @@ class RunsApiTests(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_post_is_405(self):
-        status, _, headers = self.request("/api/sessions", method="POST")
+        # 只读路径不吃 POST：POST 只属于两个写路由，其余 /api 404，/app 405。
+        status, _, _ = self.request("/api/sessions", method="POST",
+                                    headers={"Content-Length": "0"})
+        self.assertEqual(status, 404)
+        status, _, headers = self.request("/app/", method="POST",
+                                          headers={"Content-Length": "0"})
         self.assertEqual(status, 405)
         self.assertEqual(headers.get("allow"), "GET")
-        status, _, _ = self.request("/app/", method="POST")
-        self.assertEqual(status, 405)
 
     def test_bad_sid_rejected(self):
         status, _, _ = self.request("/api/runs/%2e%2e")
@@ -194,6 +233,149 @@ class RunsApiTests(unittest.TestCase):
         self.assertEqual(status, 404)
         status, _, _ = self.request("/api/runs/%s/rounds/9" % SID)
         self.assertEqual(status, 404)
+
+    # -- M2 写接口 ----------------------------------------------------------
+
+    def test_write_requires_self_origin(self):
+        creds = self.creds()
+        payload = {**creds, "confirm": "p1", "note": "x"}
+        # 无 Origin 的本地客户端只读：写必须来自页面自身的同源请求。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, payload, origin=None)
+        self.assertEqual(status, 403)
+        # 外域 Origin 在 bridge 层就被拒。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, payload,
+            origin="http://evil.example")
+        self.assertEqual(status, 403)
+
+    def test_write_requires_client_token(self):
+        # 缺 client/token → 401。
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, {"confirm": "p1", "note": "x"})
+        self.assertEqual(status, 401)
+        self.assertIn("client", json.loads(body)["error"])
+        # 错 token → 401。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {"client": 999, "token": "nope", "confirm": "p1", "note": "x"})
+        self.assertEqual(status, 401)
+
+    def test_write_confirm_mismatch_403(self):
+        creds = self.creds()
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p2", "note": "x"})
+        self.assertEqual(status, 403)
+        self.assertIn("confirm", json.loads(body)["error"])
+
+    def test_write_bad_pid_400(self):
+        creds = self.creds()
+        # %2e%2e 不被解码成 ..，但包含 % 不满足 pid 白名单。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%2e%%2e/note" % SID,
+            {**creds, "confirm": "..", "note": "x"})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%20/rerun" % SID,
+            {**creds, "confirm": "%20"})
+        self.assertEqual(status, 400)
+
+    def test_write_bad_json_and_too_large(self):
+        creds = self.creds()
+        status, _, _ = self.request(
+            "/api/runs/%s/pins/p1/note" % SID, method="POST",
+            headers={"Origin": self.self_origin, "Content-Type": "application/json",
+                     "Content-Length": "5"},
+            data=b"not{json")
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "长" * 40000})
+        self.assertEqual(status, 413)
+
+    def test_note_edit_saves_to_source_note(self):
+        creds = self.creds()
+        with open(self.source_note, encoding="utf-8") as fh:
+            before = fh.read()
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "改成绿色并加大字号"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["note"], "改成绿色并加大字号")
+        with open(self.source_note, encoding="utf-8") as fh:
+            after = json.load(fh)
+        self.assertEqual(after["pins"][0]["note"], "改成绿色并加大字号")
+        self.assertEqual(after["pins"][1]["note"], "已确认")  # 别的钉不动
+        with open(self.source_note + ".bak", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)  # .bak 是改前原文
+        # runs/note.json 不被手改。
+        status, body, _ = self.request("/api/runs/%s/note" % SID)
+        self.assertEqual(json.loads(body)["pins"][0]["note"], "这个按钮改成蓝色")
+
+    def test_note_edit_validations(self):
+        creds = self.creds()
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": 123})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "超" * 3000})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/zz/note" % SID, {**creds, "confirm": "zz", "note": "x"})
+        self.assertEqual(status, 404)
+
+    def test_rerun_enqueues_round(self):
+        creds = self.creds()
+        captured = []
+        original = runs_api.spawn_autofix
+        runs_api.spawn_autofix = lambda sid, n, pid, fb="": captured.append((sid, n, pid, fb))
+        try:
+            status, body, _ = self.post_write(
+                "/api/runs/%s/pins/p1/rerun" % SID,
+                {**creds, "confirm": "p1", "feedback": "再宽一点"})
+        finally:
+            runs_api.spawn_autofix = original
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["round"], 2)  # 已有 round-1，重跑入队 round-2
+        self.assertEqual(captured, [(SID, 2, "p1", "再宽一点")])
+
+    def test_rerun_validations(self):
+        creds = self.creds()
+        captured = []
+        original = runs_api.spawn_autofix
+        runs_api.spawn_autofix = lambda *a: captured.append(a)
+        try:
+            # 已确认的钉不重跑（open_pins_note 语义）。
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/p2/rerun" % SID, {**creds, "confirm": "p2"})
+            self.assertEqual(status, 400)
+            # 不存在的钉 404。
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/zz/rerun" % SID, {**creds, "confirm": "zz"})
+            self.assertEqual(status, 404)
+            self.assertEqual(captured, [])
+            # 已有运行在进行 → 409。
+            status_path = os.path.join(self.home, "runs", SID, "status.json")
+            with open(status_path, encoding="utf-8") as fh:
+                old = fh.read()
+            self._write(status_path, {"status": "running", "round": 2})
+            try:
+                status, _, _ = self.post_write(
+                    "/api/runs/%s/pins/p1/rerun" % SID, {**creds, "confirm": "p1"})
+                self.assertEqual(status, 409)
+            finally:
+                with open(status_path, "w", encoding="utf-8") as fh:
+                    fh.write(old)
+        finally:
+            runs_api.spawn_autofix = original
+        self.assertEqual(captured, [])
 
     # -- /app 静态服务 ------------------------------------------------------
 

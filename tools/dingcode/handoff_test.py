@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -378,6 +379,60 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(handoff.autofix_main(["handoff.py", "autofix", other]), 3)
         self.assertEqual(handoff.read_run_status("anno-2")["status"], "failed")
         self.assertEqual(handoff.read_run_status("anno-2")["error"], "unbound")
+
+    def test_pin_only_rerun_cap_and_summary_stamp(self):
+        folder = os.path.join(self.home, "pin-hub")
+        notes = os.path.join(self.home, "pin-notes")
+        os.makedirs(folder)
+        os.makedirs(notes)
+        handoff.bind_target("http://localhost:8090", folder)
+        note_path = os.path.join(notes, "anno-pin.json")
+        with open(note_path, "w", encoding="utf-8") as fh:
+            json.dump({"pins": [
+                {"id": 1, "status": "open", "note": "fix me",
+                 "page": {"url": "http://localhost:8090/app"}},
+            ]}, fh)
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"]), 0)
+        # 伪造该钉已有 3 次单钉重跑历史（round-2..4）。
+        for n in (2, 3, 4):
+            dest = handoff.round_dir("anno-pin", n)
+            os.makedirs(dest)
+            handoff._write_json(os.path.join(dest, "summary.json"), {
+                "pins": [{"id": "1", "status": "not-fixed", "summary_zh": "", "files": [],
+                          "pin_only": True, "pin": "1", "rerun": n - 1}],
+            })
+        self.assertEqual(handoff.pin_rerun_count("anno-pin", "1"), 3)
+        # --pin 豁免全局 3 轮上限（round 5 能走到），但触发每钉 3 次上限。
+        code = handoff.autofix_main(
+            ["handoff.py", "autofix", note_path, "--round", "5", "--pin", "1"])
+        self.assertEqual(code, 1)
+        self.assertEqual(handoff.read_run_status("anno-pin")["error"],
+                         "max 3 reruns for pin 1")
+        # 少一次历史 → 通过；summary.json 打上 pin_only/pin/rerun。
+        shutil.rmtree(handoff.round_dir("anno-pin", 4))
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "5", "--pin", "1"]),
+            0)
+        rows = handoff.load_round_summary("anno-pin", 5)
+        self.assertTrue(rows[0]["pin_only"])
+        self.assertEqual(rows[0]["pin"], "1")
+        self.assertEqual(rows[0]["rerun"], 3)
+        # 没有 --pin 的整轮 summary 不带这些字段。
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "2"]), 0)
+        rows = handoff.load_round_summary("anno-pin", 2)
+        self.assertNotIn("pin_only", rows[0])
+        # 状态已 confirmed 的钉被 --pin 过滤后走 no open pins。
+        with open(note_path, "w", encoding="utf-8") as fh:
+            json.dump({"pins": [
+                {"id": 1, "status": "confirmed", "note": "done",
+                 "page": {"url": "http://localhost:8090/app"}},
+            ]}, fh)
+        code = handoff.autofix_main(
+            ["handoff.py", "autofix", note_path, "--round", "6", "--pin", "1"])
+        self.assertEqual(code, 1)
+        self.assertEqual(handoff.read_run_status("anno-pin")["error"], "no open pins")
 
     def test_copy_snapshot_reverts_a_file(self):
         folder = os.path.join(self.home, "plain")

@@ -10,7 +10,9 @@ including "null", is 403 and the body has no token. The same check covers
 
 The session record page (core/runs_api.py) lives under /app and reads through
 /api/*. Those paths accept only a loopback Host plus the page's own origin
-(self) or a local no-Origin client, and never get CORS headers.
+(self) or a local no-Origin client, and never get CORS headers. Writes (M2)
+are POST under /api/runs/... and additionally require the page's own origin —
+a request with no Origin header is read-only.
 """
 
 import json
@@ -234,8 +236,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if decision[0] not in ("self", "cli") or not self._host_ok():
                 self._write(403, "forbidden", "text/plain; charset=utf-8", decision)
                 return
-            if self.command != "GET":
-                self._write(405, "method not allowed", "text/plain; charset=utf-8", decision, [("Allow", "GET")])
+            if path == "/api/desktop" or path.startswith("/api/desktop/"):
+                # Desktop-only surface: handled by the app's own server, never here.
+                self._write(501, "not implemented", "text/plain; charset=utf-8", decision)
+                return
+            if path == "/app" or path.startswith("/app/"):
+                if self.command != "GET":
+                    self._write(405, "method not allowed", "text/plain; charset=utf-8", decision, [("Allow", "GET")])
+                    return
+            elif self.command not in ("GET", "POST"):
+                self._write(405, "method not allowed", "text/plain; charset=utf-8", decision, [("Allow", "GET, POST")])
                 return
             from core import runs_api
             runs_api.handle(self, path, query, decision)

@@ -1,19 +1,28 @@
-"""Read-only HTTP endpoints for the session record page (design M1).
+"""HTTP endpoints for the session record page (design M1 read, M2 write).
 
-Served by core.bridge under /api/* and /app/*. Everything here is GET-only
-(bridge answers POST with 405 until M2) and expects the caller to be the page
-itself on loopback: bridge enforces the Host header and the self origin before
-dispatching, so no CORS headers are needed on any response. handoff.py is
-imported lazily so a bridge start never pays for it and no import cycle
-appears.
+Served by core.bridge under /api/* and /app/*. Reads are GET-only and expect
+the caller to be the page itself on loopback: bridge enforces the Host header
+and the self origin before dispatching, so no CORS headers are needed on any
+response. handoff.py is imported lazily so a bridge start never pays for it
+and no import cycle appears.
 
-/api/session   mint a client/token (same exposure as GET /ping, kept for M2 writes)
+M2 writes (POST) additionally require the page's own origin — a request with
+no Origin header (local CLI) stays read-only and must use the handoff.py CLI
+instead. Every write needs the three elements from the design: POST plus a
+client/token minted by /api/session (checked against BridgeState.client_ok)
+plus a confirm field equal to the target id in the URL. Bodies are capped and
+parsed as JSON objects.
+
+/api/session   mint a client/token (same exposure as GET /ping)
 /api/sessions  list runs/ sessions that have a status.json
 /api/runs/{sid}            result_payload from handoff (merged pins + rounds)
 /api/runs/{sid}/rounds/{n} summary + manifest digest for one round
 /api/runs/{sid}/rounds/{n}/files/{name}  raw round file, name whitelisted
 /api/runs/{sid}/note       raw runs note.json
 /api/runs/{sid}/pins/{pid} one pin: merged state + per-round history
+POST /api/runs/{sid}/pins/{pid}/note   edit that pin's note in the source note
+POST /api/runs/{sid}/pins/{pid}/rerun  spawn autofix --round N+1 --pin pid,
+                                       returns the round number immediately
 
 /app, /app/*   the prebuilt SPA in web/record/dist (suffix whitelist,
                explicit Content-Type, nosniff, realpath traversal guard)
@@ -22,6 +31,8 @@ appears.
 import json
 import os
 import re
+import subprocess
+import sys
 
 from core.paths import env
 
@@ -36,6 +47,12 @@ ROUND_FILES = {
 }
 
 RAW_LIMIT = 8 << 20  # same body cap bridge reads
+
+# M2 writes: annotation and feedback are short text, so a small cap is plenty.
+POST_LIMIT = 64 << 10
+NOTE_LIMIT = 2000       # handoff.PIN_TEXT_LIMIT
+FEEDBACK_LIMIT = 1000   # handoff.FEEDBACK_LIMIT
+MAX_RERUNS = 3          # per-pin cap, matches the global 3-round loop cap
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -95,6 +112,18 @@ def _read_capped(path, limit=RAW_LIMIT):
 def handle(handler, path, query, decision):
     if path == "/app" or path.startswith("/app/"):
         serve_static(handler, path, decision)
+        return
+    if handler.command != "GET":
+        # Reads are GET-only; POST reaches exactly the two write routes below.
+        match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/note", path)
+        if match:
+            pin_note_edit(handler, decision, match.group(1), match.group(2))
+            return
+        match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/rerun", path)
+        if match:
+            pin_rerun(handler, decision, match.group(1), match.group(2))
+            return
+        _error(handler, decision, 404, "not found")
         return
     if path == "/api/session":
         client, token = handler.server.state.register()
@@ -274,6 +303,185 @@ def pin_history(handler, decision, sid, pid):
         "pin": pin,
         "rounds": rounds,
     })
+
+
+# -- M2 写接口 -------------------------------------------------------------
+
+def _check_pid(handler, decision, pid):
+    if not _PIN.match(pid or ""):
+        _error(handler, decision, 400, "bad pin id")
+        return False
+    return True
+
+
+def _read_post(handler, decision):
+    """The JSON body of a write request, or None with the error already sent."""
+    try:
+        length = int(handler.headers.get("Content-Length") or "0")
+    except ValueError:
+        length = 0
+    if length > POST_LIMIT:
+        _error(handler, decision, 413, "body too large")
+        return None
+    data = handler._read_body()
+    if len(data) > POST_LIMIT:
+        _error(handler, decision, 413, "body too large")
+        return None
+    try:
+        obj = json.loads(data.decode("utf-8") or "{}")
+    except ValueError:
+        _error(handler, decision, 400, "bad json")
+        return None
+    if not isinstance(obj, dict):
+        _error(handler, decision, 400, "bad json")
+        return None
+    return obj
+
+
+def _check_write(handler, decision, body, target):
+    """Design's three write elements: self origin, client/token, confirm==target."""
+    if decision[0] != "self":
+        # Only the page itself may write; a local no-Origin client uses the CLI.
+        _error(handler, decision, 403, "self origin required")
+        return False
+    if not handler.server.state.client_ok(body.get("client"), body.get("token")):
+        _error(handler, decision, 401, "bad client or token")
+        return False
+    if str(body.get("confirm") or "") != str(target):
+        _error(handler, decision, 403, "confirm mismatch")
+        return False
+    return True
+
+
+def _source_note_path(handler, decision, sid):
+    import handoff
+
+    path = handoff.read_run_status(sid).get("note") or ""
+    if not path or not os.path.isfile(path):
+        _error(handler, decision, 400, "source note missing")
+        return ""
+    return path
+
+
+def _note_pin(note, pid):
+    for pin in (note.get("pins") if isinstance(note, dict) else None) or []:
+        if isinstance(pin, dict) and str(pin.get("id")) == str(pid):
+            return pin
+    return None
+
+
+def _write_note_atomic(path, note):
+    """Atomic write with a one-shot .bak, per the design (core/sync.py pattern)."""
+    try:
+        with open(path, "rb") as fh:
+            original = fh.read()
+    except OSError:
+        original = b""
+    if original:
+        try:
+            with open(path + ".bak", "wb") as fh:
+                fh.write(original)
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(note, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def pin_note_edit(handler, decision, sid, pid):
+    import handoff
+
+    if not _check_sid(handler, decision, sid) or not _check_pid(handler, decision, pid):
+        return
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, pid):
+        return
+    note_path = _source_note_path(handler, decision, sid)
+    if not note_path:
+        return
+    text = body.get("note")
+    if not isinstance(text, str):
+        _error(handler, decision, 400, "note must be a string")
+        return
+    text = text.strip()
+    if len(text) > NOTE_LIMIT:
+        _error(handler, decision, 400, "note too long (max %d)" % NOTE_LIMIT)
+        return
+    try:
+        note = json.loads(handoff.read_note(note_path) or "{}")
+    except ValueError:
+        _error(handler, decision, 400, "source note is not valid json")
+        return
+    pin = _note_pin(note if isinstance(note, dict) else {}, pid)
+    if pin is None:
+        _error(handler, decision, 404, "no such pin")
+        return
+    pin["note"] = text
+    _write_note_atomic(note_path, note)
+    _json(handler, decision, 200, {"ok": True, "pin_id": str(pid), "note": text})
+
+
+def pin_rerun(handler, decision, sid, pid):
+    import handoff
+
+    if not _check_sid(handler, decision, sid) or not _check_pid(handler, decision, pid):
+        return
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, pid):
+        return
+    if handoff.read_run_status(sid).get("status") == "running":
+        _error(handler, decision, 409, "a run is already in progress")
+        return
+    note_path = _source_note_path(handler, decision, sid)
+    if not note_path:
+        return
+    try:
+        note = json.loads(handoff.read_note(note_path) or "{}")
+    except ValueError:
+        _error(handler, decision, 400, "source note is not valid json")
+        return
+    pin = _note_pin(note if isinstance(note, dict) else {}, pid)
+    if pin is None:
+        _error(handler, decision, 404, "no such pin")
+        return
+    # open_pins_note semantics: confirmed pins are done and never rerun.
+    if pin.get("status") == "confirmed":
+        _error(handler, decision, 400, "pin already confirmed")
+        return
+    feedback = body.get("feedback")
+    feedback = feedback.strip() if isinstance(feedback, str) else ""
+    if len(feedback) > FEEDBACK_LIMIT:
+        feedback = feedback[:FEEDBACK_LIMIT]
+    numbers = handoff.round_numbers(sid)
+    round_n = (numbers[-1] + 1) if numbers else 1
+    spawn_autofix(sid, round_n, str(pid), feedback)
+    _json(handler, decision, 200, {"ok": True, "session": sid, "pin": str(pid), "round": round_n})
+
+
+def _spawn_autofix(session, round_n, pid, feedback=""):
+    """Run the normal autofix chain in the background; SPA polls status.json."""
+    import handoff
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    argv = [sys.executable or "python3", os.path.join(root, "handoff.py"),
+            "autofix", session, "--round", str(round_n), "--pin", pid]
+    if feedback:
+        argv += ["--feedback", feedback]
+    os.makedirs(handoff.run_dir(session), exist_ok=True)
+    log = open(os.path.join(handoff.run_dir(session), "log.txt"), "a", encoding="utf-8")
+    try:
+        subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    finally:
+        log.close()
+
+
+spawn_autofix = _spawn_autofix
 
 
 def serve_static(handler, path, decision):

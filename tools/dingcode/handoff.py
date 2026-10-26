@@ -1782,6 +1782,17 @@ def load_round_summary(session, round_n):
     return pins
 
 
+def pin_rerun_count(session, pid):
+    """How many pin-only rounds this pin already has (per-pin rerun cap)."""
+    count = 0
+    for number in round_numbers(session):
+        for entry in load_round_summary(session, number):
+            if (isinstance(entry, dict) and entry.get("pin_only")
+                    and str(entry.get("pin")) == str(pid)):
+                count += 1
+    return count
+
+
 def merged_pins(session):
     merged = []
     index = {}
@@ -1800,7 +1811,7 @@ def merged_pins(session):
     return merged
 
 
-def close_round(session, round_n, folder, dest, meta, note, shots, code):
+def close_round(session, round_n, folder, dest, meta, note, shots, code, pin_meta=None):
     os.makedirs(dest, exist_ok=True)
     if not meta:
         meta = {"kind": "none", "folder": folder}
@@ -1828,6 +1839,9 @@ def close_round(session, round_n, folder, dest, meta, note, shots, code):
     pins = parse_pin_summary((forced + "\n" + log_text) if forced else log_text, pin_ids_of(note))
     pins = assign_pin_diffs(pins, patch)
     pins = fill_pin_summaries(pins, bool(patch.strip()))
+    if pin_meta:
+        for pin in pins:
+            pin.update(pin_meta)
     counts = summary_counts(pins)
     body = {
         "round": round_n,
@@ -1920,7 +1934,7 @@ def run_engine(cmd, cwd, log_path):
 
 def autofix_main(argv):
     if len(argv) < 3:
-        sys.stderr.write("usage: handoff.py autofix <note.json|session> [--round N] [--feedback text]\n")
+        sys.stderr.write("usage: handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id]\n")
         return 2
     note_path, session = resolve_autofix_note(argv[2])
     if not note_path:
@@ -1931,8 +1945,9 @@ def autofix_main(argv):
     except ValueError:
         round_n = 1
     feedback = _flag(argv, "--feedback")
+    pin_only = _flag(argv, "--pin")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if round_n > 3:
+    if round_n > 3 and not pin_only:
         write_run_status(session, {
             "status": "failed", "round": round_n, "error": "max 3 rounds",
             "note": note_path, "finished": now,
@@ -1946,7 +1961,6 @@ def autofix_main(argv):
     if not isinstance(note, dict):
         note = {}
     kept = open_pins_note(note)
-    pin_only = _flag(argv, "--pin")
     if pin_only:
         kept["pins"] = [pin for pin in kept.get("pins") or [] if str(pin.get("id")) == str(pin_only)]
         kept["pin_count"] = len(kept["pins"])
@@ -1957,6 +1971,21 @@ def autofix_main(argv):
         })
         sys.stdout.write(json.dumps({"ok": False, "error": "no open pins", "session": session}) + "\n")
         return 1
+    rerun_k = 0
+    if pin_only:
+        # 3 轮上限只约束整轮自动循环；单钉重跑有自己的每钉上限。
+        rerun_k = pin_rerun_count(session, pin_only) + 1
+        if rerun_k > 3:
+            write_run_status(session, {
+                "status": "failed", "round": round_n,
+                "error": "max 3 reruns for pin %s" % pin_only,
+                "note": note_path, "finished": now,
+            })
+            sys.stdout.write(json.dumps({
+                "ok": False, "error": "max 3 reruns for pin %s" % pin_only,
+                "session": session,
+            }) + "\n")
+            return 1
     target = note_target(kept)
     folder = lookup_binding(target)
     if not folder:
@@ -2017,7 +2046,8 @@ def autofix_main(argv):
         sys.stdout.write(json.dumps({"ok": False, "session": session, "status": "failed", "error": reason}) + "\n")
         return 1
     try:
-        close_round(session, round_n, folder, round_dest, meta, kept, shots, code)
+        close_round(session, round_n, folder, round_dest, meta, kept, shots, code,
+                    pin_meta={"pin_only": True, "pin": str(pin_only), "rerun": rerun_k} if pin_only else None)
     except Exception as exc:
         write_run_status(session, {"status": "failed", "error": str(exc), "round": round_n, "finished": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         sys.stdout.write(json.dumps({"ok": False, "session": session, "status": "failed"}) + "\n")
