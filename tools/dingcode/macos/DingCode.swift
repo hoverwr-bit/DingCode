@@ -242,7 +242,27 @@ func bridgeClassifyOrigin(_ origin: String?) -> (allow: Bool, echo: String?) {
 
 final class BridgeServer {
     static let shared = BridgeServer()
-    static let port: UInt16 = 8763
+    // 公共端口(钉子同步):命令行 --port N > DINGCODE_APP_PORT > 8763(自测可覆盖)
+    static let port: UInt16 = {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--port"), i + 1 < args.count,
+           let p = UInt16(args[i + 1]), p > 0 { return p }
+        if let v = ProcessInfo.processInfo.environment["DINGCODE_APP_PORT"],
+           let p = UInt16(v), p > 0 { return p }
+        return 8763
+    }()
+    // 内部 python bridge 端口:命令行 --bridge-port N > DINGCODE_INTERNAL_PORT > 8764
+    static let bridgePort: UInt16 = {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--bridge-port"), i + 1 < args.count,
+           let p = UInt16(args[i + 1]), p > 0 { return p }
+        if let v = ProcessInfo.processInfo.environment["DINGCODE_INTERNAL_PORT"],
+           let p = UInt16(v), p > 0 { return p }
+        return 8764
+    }()
+    static let forwardMaxBody = 1 << 20        // 转发请求体上限 1 MiB
+    static let forwardMaxResponse = 32 << 20   // 转发响应上限 32 MiB
+    var forwardEnabled = true                  // 找不到 handoff.py 时由 App 置 false(钉子同步照常)
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "anno-bridge")
@@ -454,6 +474,22 @@ final class BridgeServer {
             guard let self else { conn.cancel(); return }
             var buf = data
             if let c = chunk { buf.append(c) }
+            // BK-02 转发层:DingCode.app 转发来的 /app、/api 请求原样转给内部 python bridge,
+            // 不走 origin 判定(鉴权由 Python 端负责)
+            switch self.forwardPlan(buf) {
+            case .tooLarge:
+                self.send(conn, Self.forwardStatus(413, "Payload Too Large"))
+                return
+            case .go(let raw):
+                self.forward(conn, request: raw)
+                return
+            case .wait:
+                if err != nil || done { conn.cancel(); return }   // 流断了,等不齐
+                self.recv(conn, data: buf)
+                return
+            case .local:
+                break
+            }
             if let req = Self.parseHttpRequest(buf) {
                 let (resp, keepAlive) = self.route(req)
                 if keepAlive {
@@ -469,6 +505,117 @@ final class BridgeServer {
                 self.recv(conn, data: buf)
             }
         }
+    }
+
+    // MARK: 转发层(BK-02):/app、/api 原样转给内部 python bridge
+
+    private enum ForwardPlan {
+        case wait        // 头已收齐、体没收齐,继续收
+        case tooLarge    // 超上限,413
+        case go(Data)    // 原样转发的请求字节
+        case local       // 非转发路径,走原有 route
+    }
+
+    static func isForwardPath(_ path: String) -> Bool {
+        path == "/app" || path.hasPrefix("/app/") || path.hasPrefix("/api/")
+    }
+
+    /// 头未收齐→.local(路径未知,交给原有逻辑,原 1 MiB 上限不变);
+    /// 头收齐后按路径与 Content-Length 判定,体超限立即 413 不再读
+    private func forwardPlan(_ buf: Data) -> ForwardPlan {
+        guard forwardEnabled else { return .local }
+        guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else { return .local }
+        let head = String(decoding: buf[..<headerEnd.lowerBound], as: UTF8.self)
+        let lines = head.components(separatedBy: "\r\n")
+        guard let first = lines.first else { return .local }
+        let parts = first.split(separator: " ")
+        guard parts.count >= 2 else { return .local }
+        let full = String(parts[1])
+        let path = full.firstIndex(of: "?").map { String(full[..<$0]) } ?? full
+        guard Self.isForwardPath(path) else { return .local }
+        var clen = -1
+        for l in lines.dropFirst() {
+            let kv = l.split(separator: ":", maxSplits: 1)
+            if kv.count == 2, kv[0].lowercased() == "content-length" {
+                clen = Int(kv[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        if clen > Self.forwardMaxBody { return .tooLarge }
+        if clen < 0 {
+            // 缺 Content-Length:头收齐即转发;已收到的数据若超 头+上限(边发边不给长度)也拒
+            if buf.count > headerEnd.upperBound + Self.forwardMaxBody { return .tooLarge }
+            return .go(buf)
+        }
+        let needed = headerEnd.upperBound + clen
+        if buf.count >= needed { return .go(Data(buf[..<needed])) }
+        return .wait
+    }
+
+    /// 转发层自答的状态行(不走 origin/CORS 逻辑)
+    static func forwardStatus(_ code: Int, _ msg: String) -> Data {
+        let body = Data(msg.utf8)
+        let s = "HTTP/1.1 \(code) \(msg)\r\nContent-Type: text/plain; charset=utf-8\r\n" +
+                "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        return Data(s.utf8)
+    }
+
+    /// 原样把请求字节(请求行、全部头含 Host/Origin、体)转给 127.0.0.1:<bridgePort>,
+    /// 上游响应原样回写后关闭。上游 python bridge 回 Connection: close,读到 EOF 即完整。
+    private func forward(_ client: NWConnection, request: Data) {
+        guard let port = NWEndpoint.Port(rawValue: Self.bridgePort) else {
+            send(client, Self.forwardStatus(502, "bad gateway"))
+            return
+        }
+        let upstream = NWConnection(host: .ipv4(.loopback), port: port, using: NWParameters.tcp)
+        var finished = false
+        var resp = Data()
+        var timeout: DispatchWorkItem?
+        func finish(_ reply: Data?) {          // reply=nil:直接断开
+            guard !finished else { return }
+            finished = true
+            timeout?.cancel()
+            upstream.cancel()
+            if let reply {
+                client.send(content: reply, completion: .contentProcessed { _ in client.cancel() })
+            } else {
+                client.cancel()
+            }
+        }
+        func pumpUpstream() {
+            upstream.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { chunk, _, done, err in
+                if let c = chunk {
+                    resp.append(c)
+                    if resp.count > Self.forwardMaxResponse {
+                        NSLog("anno-bridge: forward response over %ld bytes, dropping", Self.forwardMaxResponse)
+                        finish(nil)
+                        return
+                    }
+                }
+                if done || err != nil {
+                    finish(resp.isEmpty ? Self.forwardStatus(502, "bad gateway") : resp)
+                    return
+                }
+                pumpUpstream()
+            }
+        }
+        let t = DispatchWorkItem {
+            NSLog("anno-bridge: forward timeout to 127.0.0.1:\(Self.bridgePort)")
+            finish(Self.forwardStatus(504, "gateway timeout"))
+        }
+        timeout = t
+        queue.asyncAfter(deadline: .now() + 30, execute: t)   // 回调都在 queue 上,finished 无竞争
+        upstream.stateUpdateHandler = { st in
+            switch st {
+            case .ready:
+                upstream.send(content: request, completion: .contentProcessed { _ in pumpUpstream() })
+            case .failed(let e):
+                NSLog("anno-bridge: forward upstream failed: \(e)")
+                finish(Self.forwardStatus(502, "bad gateway"))
+            default:
+                break   // .waiting(连接被拒重试)等,交给超时兜底
+            }
+        }
+        upstream.start(queue: queue)
     }
 
     static func parseHttpRequest(_ buf: Data) -> (method: String, path: String,
@@ -743,6 +890,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     var autofixBeforeFull: CGImage?
     var autofixAfter: CGImage?
     var autofixPins: [[String: Any]] = []
+    var bridgeShProc: Process?             // 内部 python bridge 看护进程(/bin/sh 包装,BK-02)
+    var bridgeRestartTimes: [Date] = []
+    var bridgeQuitting = false
     var autofixCursor = 0
     var sendBackField: NSTextField?
     var autofixBeforeView: NSImageView?
@@ -780,6 +930,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         BridgeServer.shared.onTrack = { rows in
             AnnoController.shared.overlay?.annoView.applyWeb(rows)
         }
+        startInternalBridge()   // /app、/api 转发的上游(BK-02);找不到 handoff.py 则禁用转发
         if CommandLine.arguments.contains("--auto-test") {
             perform(#selector(autoTestBegin), with: nil, afterDelay: 0.8)
         }
@@ -2208,20 +2359,29 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         return url.path
     }
 
+    /// handoff.py 形式的命令(/usr/bin/python3 + handoff.py 路径);handoffCommand 与
+    /// 内部 bridge 启动共用(BK-02)。找不到返回 nil。
+    func handoffPythonCommand() -> (String, [String])? {
+        let exe = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
+        let dir = (exe as NSString).deletingLastPathComponent
+        for raw in ["../handoff.py", "../../../../handoff.py"] {
+            let path = ((dir as NSString).appendingPathComponent(raw) as NSString).standardizingPath
+            if FileManager.default.fileExists(atPath: path) {
+                return ("/usr/bin/python3", [path])
+            }
+        }
+        return nil
+    }
+
     func handoffCommand() -> (String, [String])? {
         if let cached = cliCache { return cached }
         if let cli = dingcodeEnv("CLI"), FileManager.default.isExecutableFile(atPath: cli) {
             cliCache = (cli, [])
             return cliCache
         }
-        let exe = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
-        let dir = (exe as NSString).deletingLastPathComponent
-        for raw in ["../handoff.py", "../../../../handoff.py"] {
-            let path = ((dir as NSString).appendingPathComponent(raw) as NSString).standardizingPath
-            if FileManager.default.fileExists(atPath: path) {
-                cliCache = ("/usr/bin/python3", [path])
-                return cliCache
-            }
+        if let py = handoffPythonCommand() {
+            cliCache = py
+            return cliCache
         }
         let home = NSHomeDirectory()
         for bin in ["\(home)/.local/bin", "/opt/homebrew/bin", "\(home)/.npm-global/bin", "\(home)/.claude/local", "/usr/local/bin"] {
@@ -2247,6 +2407,92 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             }
         }
         return nil
+    }
+
+    // MARK: 内部 python bridge 子进程(BK-02):/app、/api 转发的上游
+
+    /// handoff.py 不在→禁用公共端口转发并 NSLog(钉子同步照常)
+    func startInternalBridge() {
+        guard let cmd = handoffPythonCommand() else {
+            NSLog("dingcode: handoff.py not found, /app forwarding disabled")
+            BridgeServer.shared.forwardEnabled = false
+            return
+        }
+        BridgeServer.shared.forwardEnabled = true
+        launchInternalBridge(cmd)
+    }
+
+    /// 用 /bin/sh 看护包装拉起 python bridge:App 被强杀时看护循环 1s 内带走 python;
+    /// python 退出 sh 也退出,由 terminationHandler 触发 Swift 侧重启。
+    /// 路径用位置参数 "$1" "$2" 传入,不拼接;端口/App pid 是数字。
+    func launchInternalBridge(_ cmd: (String, [String])) {
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        let script = "\"$1\" \"$2\" bridge --port \(BridgeServer.bridgePort) & child=$!; " +
+            "while kill -0 \(myPid) 2>/dev/null && kill -0 $child 2>/dev/null; do sleep 1; done; " +
+            "kill $child 2>/dev/null; wait $child"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", script, "sh", cmd.0, cmd.1[0]]
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "DINGCODE_BRIDGE_PORT")   // 端口已用 --port 显式传,环境变量不能另指
+        env.removeValue(forKey: "DINGAI_BRIDGE_PORT")
+        proc.environment = env
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        proc.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.bridgeExited() }
+        }
+        do { try proc.run() } catch {
+            NSLog("dingcode: internal bridge launch failed: \(error.localizedDescription)")
+            return
+        }
+        bridgeShProc = proc
+    }
+
+    /// sh(连带 python)退出:App 退出中不重启;2s 后重启;1 分钟内超过 5 次放弃并 NSLog
+    func bridgeExited() {
+        guard !bridgeQuitting else { return }
+        let now = Date()
+        bridgeRestartTimes.removeAll { now.timeIntervalSince($0) > 60 }
+        bridgeRestartTimes.append(now)
+        if bridgeRestartTimes.count > 5 {
+            NSLog("dingcode: internal bridge exited 5+ times in 60s, not restarting")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, !self.bridgeQuitting else { return }
+            guard let cmd = self.handoffPythonCommand() else {
+                BridgeServer.shared.forwardEnabled = false
+                return
+            }
+            self.launchInternalBridge(cmd)
+        }
+    }
+
+    /// 收尾:结束 sh 和它拉起的 python(python 是 sh 的后台子进程 $!,须按 pid 补杀)
+    func applicationWillTerminate(_ notification: Notification) {
+        bridgeQuitting = true
+        guard let sh = bridgeShProc, sh.isRunning else { return }
+        let shPid = sh.processIdentifier
+        var pyPid: pid_t = 0
+        let pg = Process()
+        pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pg.arguments = ["-P", String(shPid)]
+        let pipe = Pipe()
+        pg.standardOutput = pipe
+        pg.standardError = FileHandle.nullDevice
+        if (try? pg.run()) != nil {
+            pg.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            pyPid = out.split(whereSeparator: \.isNewline).compactMap { pid_t($0) }.first ?? 0
+        }
+        if pyPid != 0 { kill(pyPid, SIGTERM) }   // sh 看护循环发现 $child 没了,1s 内自行退出
+        let deadline = Date().addingTimeInterval(2)
+        while sh.isRunning && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        if sh.isRunning { kill(shPid, SIGKILL) }
+        if pyPid != 0, kill(pyPid, 0) == 0 { kill(pyPid, SIGKILL) }
     }
 
     func notifyUser(_ title: String, _ body: String) {
