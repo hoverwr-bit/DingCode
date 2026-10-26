@@ -12,6 +12,10 @@ os.environ.setdefault("DINGAI_SESSIONS", "0")
 
 import handoff
 
+# Windows 实机可能没装 git：需要 git 建仓的用例 skip，不需要的绝不依赖它。
+HAVE_GIT = shutil.which("git") is not None
+requires_git = unittest.skipUnless(HAVE_GIT, "git not available")
+
 
 class HandoffTests(unittest.TestCase):
     def test_default_rules_cover_the_owner_list(self):
@@ -28,8 +32,11 @@ class HandoffTests(unittest.TestCase):
             with open(os.path.join(project, ".dingcode", "handoff-rules.md"), "w", encoding="utf-8") as fh:
                 fh.write("project rule\n")
             old_home = os.environ.get("HOME")
+            old_profile = os.environ.get("USERPROFILE")
             old_project = os.environ.get("DINGAI_PROJECT")
+            # Windows 的 expanduser 只认 USERPROFILE；不重定向就会读写真实用户目录。
             os.environ["HOME"] = home
+            os.environ["USERPROFILE"] = home
             os.environ["DINGAI_PROJECT"] = project
             try:
                 self.assertEqual(handoff.load_rules(), "project rule")
@@ -40,6 +47,10 @@ class HandoffTests(unittest.TestCase):
                     os.environ.pop("HOME", None)
                 else:
                     os.environ["HOME"] = old_home
+                if old_profile is None:
+                    os.environ.pop("USERPROFILE", None)
+                else:
+                    os.environ["USERPROFILE"] = old_profile
                 if old_project is None:
                     os.environ.pop("DINGAI_PROJECT", None)
                 else:
@@ -150,6 +161,7 @@ class HandoffTests(unittest.TestCase):
                         os.environ[key] = value
 
 
+@requires_git
 class ScopeTests(unittest.TestCase):
     def git(self, cwd, *args):
         subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
@@ -230,8 +242,10 @@ class AutofixTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = self.tmp.name
-        self.old = {key: os.environ.get(key) for key in ("HOME", "DINGCODE_ENGINE_PATH", "DINGCODE_AUTOFIX_DRY")}
+        self.old = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE", "DINGCODE_ENGINE_PATH", "DINGCODE_AUTOFIX_DRY")}
+        # Windows 的 expanduser 只认 USERPROFILE；两个都重定向，测试绝不碰真实用户目录。
         os.environ["HOME"] = self.home
+        os.environ["USERPROFILE"] = self.home
         bindir = os.path.join(self.home, "bin")
         os.makedirs(bindir)
         for name in ("claude", "codex"):
@@ -272,7 +286,8 @@ class AutofixTests(unittest.TestCase):
         prompt = handoff.build_autofix_prompt(
             '{"pins":[{"id":7}]}', folder, ["/tmp/before.png"], feedback="too wide")
         argv, cwd = handoff.engine_command("claude", prompt, folder)
-        self.assertTrue(argv[0].endswith("/claude"))
+        # basename 而非 "/claude"：Windows 的路径分隔符是反斜杠。
+        self.assertEqual(os.path.basename(argv[0]), "claude")
         self.assertEqual(argv[1], "-p")
         body = argv[-1]
         self.assertTrue(body.startswith("DingCode task:\n"))
@@ -305,7 +320,7 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(handoff.current_engine(), "claude")
         self.assertTrue(handoff.set_engine("codex"))
         codex, codex_cwd = handoff.engine_command(handoff.current_engine(), "P", folder)
-        self.assertTrue(codex[0].endswith("/codex"))
+        self.assertEqual(os.path.basename(codex[0]), "codex")
         self.assertEqual(codex[1:-1], [
             "exec", "--sandbox", "workspace-write",
             "-c", "sandbox_workspace_write.network_access=false",
@@ -457,6 +472,7 @@ class AutofixTests(unittest.TestCase):
             self.assertEqual(fh.read(), "hello\n")
         self.assertFalse(os.path.exists(os.path.join(folder, "g.txt")))
 
+    @requires_git
     def test_round_summary_diff_result_and_revert(self):
         folder = os.path.join(self.home, "proj")
         os.makedirs(os.path.join(folder, "src"))
@@ -503,6 +519,7 @@ class AutofixTests(unittest.TestCase):
         saved = handoff._read_json(os.path.join(handoff.round_dir("anno-3", 1), "summary.json"), {})
         self.assertTrue(saved.get("reverted"))
 
+    @requires_git
     def test_outside_change_reverts_and_fails(self):
         repo = os.path.join(self.home, "repo")
         folder = os.path.join(repo, "app")
@@ -543,6 +560,7 @@ class AutofixTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(folder, "local.txt")))
         self.assertFalse(os.path.exists(os.path.join(repo, "other", "x.txt")))
 
+    @requires_git
     def test_symlinked_tmpdir_like_macos_private_var(self):
         # macOS tempfile is /var/folders, and /var -> /private/var. Git's
         # toplevel is the real path. This alias reproduces that on Linux CI.
@@ -605,8 +623,10 @@ class PinRevertTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = self.tmp.name
-        self.old = {key: os.environ.get(key) for key in ("HOME", "DINGCODE_ENGINE_PATH", "DINGCODE_AUTOFIX_DRY")}
+        self.old = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE", "DINGCODE_ENGINE_PATH", "DINGCODE_AUTOFIX_DRY")}
+        # Windows 的 expanduser 只认 USERPROFILE；两个都重定向，测试绝不碰真实用户目录。
         os.environ["HOME"] = self.home
+        os.environ["USERPROFILE"] = self.home
         bindir = os.path.join(self.home, "bin")
         os.makedirs(bindir)
         for name in ("claude", "codex"):
@@ -662,6 +682,7 @@ class PinRevertTests(unittest.TestCase):
     def manifest_of(self, session, round_n):
         return handoff._read_json(os.path.join(handoff.round_dir(session, round_n), "manifest.json"), {})
 
+    @requires_git
     def test_per_pin_mode_gives_each_pin_a_round(self):
         self.repo()
         note_path = self.note_for("anno-pp")
@@ -680,6 +701,7 @@ class PinRevertTests(unittest.TestCase):
         self.assertEqual([row["pin"] for row in status["per_pin"]], ["1", "2"])
         self.assertTrue(all(row["ok"] for row in status["per_pin"]))
 
+    @requires_git
     def test_pin_only_round_captures_post_and_sha256(self):
         folder = self.repo()
         note_path = self.note_for("anno-cap")
@@ -696,6 +718,7 @@ class PinRevertTests(unittest.TestCase):
         self.assertEqual(sha_map["a.txt"]["pre"], hashlib.sha256(b"l1\nl2\nl3\n").hexdigest())
         self.assertEqual(sha_map["a.txt"]["post"], hashlib.sha256(b"l1\nX\nl3\n").hexdigest())
 
+    @requires_git
     def test_revert_pin_three_way_merge_with_later_round(self):
         folder = self.repo()
         note_path = self.note_for("anno-rev")
@@ -721,6 +744,7 @@ class PinRevertTests(unittest.TestCase):
         self.assertEqual(status["reverted_pin"], "1")
         self.assertEqual(status["reverted_round"], 1)
 
+    @requires_git
     def test_revert_pin_marks_later_rounds_of_same_pin_stale(self):
         folder = self.repo()
         note_path = self.note_for("anno-stale")
@@ -750,6 +774,7 @@ class PinRevertTests(unittest.TestCase):
         with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "l1\nl2\nl3\n")
 
+    @requires_git
     def test_revert_pin_conflict_touches_nothing(self):
         folder = self.repo()
         note_path = self.note_for("anno-conflict")
@@ -774,6 +799,7 @@ class PinRevertTests(unittest.TestCase):
         self.assertNotIn("reverted", self.summary_of("anno-conflict", 1))
         self.assertNotIn("reverted_pin", handoff.read_run_status("anno-conflict"))
 
+    @requires_git
     def test_revert_pin_fast_path_removes_new_file_even_without_post_copy(self):
         folder = self.repo()
         note_path = self.note_for("anno-fast")
@@ -791,6 +817,7 @@ class PinRevertTests(unittest.TestCase):
         self.assertEqual(result["removed"], ["new.txt"])
         self.assertFalse(os.path.exists(os.path.join(folder, "new.txt")))
 
+    @requires_git
     def test_revert_pin_without_post_snapshot_refuses(self):
         folder = self.repo()
         # 手工造一个只有 pin_only summary、没有 post//sha256 的轮。
@@ -809,6 +836,7 @@ class PinRevertTests(unittest.TestCase):
         with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "changed\n")
 
+    @requires_git
     def test_revert_pin_unknown_pin_is_an_error(self):
         self.repo()
         note_path = self.note_for("anno-none")
@@ -821,6 +849,7 @@ class PinRevertTests(unittest.TestCase):
 
     # -- 跨平台（M5）：CRLF 字节与 git 缺失降级 ------------------------------
 
+    @requires_git
     def test_revert_pin_three_way_merge_keeps_crlf_bytes(self):
         folder = self.repo("l1\r\nl2\r\nl3\r\n")
         note_path = self.note_for("anno-crlf")
@@ -840,6 +869,7 @@ class PinRevertTests(unittest.TestCase):
         with open(os.path.join(folder, "a.txt"), "rb") as fh:
             self.assertEqual(fh.read(), b"l1\r\nl2\r\nl3\r\nY\r\n")
 
+    @requires_git
     def test_revert_pin_without_git_refuses_unreadable_base(self):
         folder = self.repo()
         note_path = self.note_for("anno-nogit")
@@ -894,6 +924,7 @@ class PinRevertTests(unittest.TestCase):
         with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "l1\nl2\nl3\n")
 
+    @requires_git
     def test_revert_pin_without_git_conflicts_cleanly(self):
         folder = self.repo()
         note_path = self.note_for("anno-nogit2")

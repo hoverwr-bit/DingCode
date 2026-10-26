@@ -70,9 +70,11 @@ class RunsApiTests(unittest.TestCase):
         cls._write(os.path.join(run, "note.json"), NOTE)
         cls._write(os.path.join(round1, "summary.json"), SUMMARY)
         cls._write(os.path.join(round1, "manifest.json"), MANIFEST)
-        with open(os.path.join(round1, "diff.patch"), "w", encoding="utf-8") as fh:
+        # newline=""：磁盘字节固定 LF，否则 Windows 文本模式写出 CRLF，
+        # 服务的 diff 就不再是 DIFF 原文。
+        with open(os.path.join(round1, "diff.patch"), "w", encoding="utf-8", newline="") as fh:
             fh.write(DIFF)
-        with open(os.path.join(round1, "pre.diff"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(round1, "pre.diff"), "w", encoding="utf-8", newline="") as fh:
             fh.write(DIFF)
         with open(os.path.join(cls.dist, "index.html"), "w", encoding="utf-8") as fh:
             fh.write("<!doctype html><html><body>record</body></html>")
@@ -417,7 +419,9 @@ class RunsApiTests(unittest.TestCase):
 
     def _case2_file(self, text):
         path = os.path.join(self.folder2, "a.txt")
-        with open(path, "w", encoding="utf-8") as fh:
+        # newline=""：字节与 post 快照完全一致（Windows 文本模式会 \n→\r\n，
+        # sha256 对不上就会走合并路径而不是快路径）。
+        with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         return path
 

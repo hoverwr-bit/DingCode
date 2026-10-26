@@ -1913,7 +1913,8 @@ def close_round(session, round_n, folder, dest, meta, note, shots, code, pin_met
             patch = diff_since(folder, dest, meta)
         except Exception:
             patch = ""
-    with open(os.path.join(dest, "diff.patch"), "w", encoding="utf-8") as fh:
+    # newline=""：diff 字节固定 LF，记录页与三方合并读到的才是同一份。
+    with open(os.path.join(dest, "diff.patch"), "w", encoding="utf-8", newline="") as fh:
         fh.write(patch)
     if shots and os.path.isfile(shots[0]):
         try:

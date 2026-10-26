@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -8,6 +9,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+HAVE_GIT = shutil.which("git") is not None
+requires_git = unittest.skipUnless(HAVE_GIT, "git not available")
 
 from core.diff import compare_png, write_diff
 from core.export import EXPORTERS, export_note, register_exporter
@@ -192,6 +196,7 @@ class CollisionTests(unittest.TestCase):
             self.assertIn("src/erp", ended["overlaps"][0]["diff"])
             self.assertEqual(len([row for row in list_sessions(root) if row["id"] == first["session"]["id"]]), 0)
 
+    @requires_git
     def test_isolate_creates_a_worktree(self):
         import subprocess
         from core.collide import choose, register
@@ -329,9 +334,16 @@ class GuideTests(unittest.TestCase):
 class VoiceTests(unittest.TestCase):
     def test_transcribe_uses_a_local_binary_for_zh_en_vi(self):
         with tempfile.TemporaryDirectory() as tmp:
-            binary = os.path.join(tmp, "whisper-cli")
-            with open(binary, "w", encoding="utf-8") as fh:
-                fh.write("#!/bin/sh\nprintf '%s' \"$6\"\n")
+            # 伪 whisper 二进制：whisper 的第 6 个参数是 -l 的语言值，原样回显。
+            # Windows 不能直接 exec sh 脚本（WinError 193），换成 .bat（%6 同义）。
+            if os.name == "nt":
+                binary = os.path.join(tmp, "whisper-cli.bat")
+                with open(binary, "w", encoding="ascii", newline="") as fh:
+                    fh.write("@echo %6\r\n")
+            else:
+                binary = os.path.join(tmp, "whisper-cli")
+                with open(binary, "w", encoding="utf-8") as fh:
+                    fh.write("#!/bin/sh\nprintf '%s' \"$6\"\n")
             os.chmod(binary, 0o755)
             wav = os.path.join(tmp, "in.wav")
             with open(wav, "wb") as fh:
@@ -357,10 +369,13 @@ class VoiceTests(unittest.TestCase):
 class PathTests(unittest.TestCase):
     def test_old_home_moves_and_old_env_is_read(self):
         from core.paths import data_home, env, project_root_name
-        saved = {key: os.environ.get(key) for key in ("HOME", "DINGCODE_HOME", "DINGAI_HOME", "DINGCODE_LANG", "DINGAI_LANG")}
+        saved = {key: os.environ.get(key) for key in ("HOME", "USERPROFILE", "DINGCODE_HOME", "DINGAI_HOME", "DINGCODE_LANG", "DINGAI_LANG")}
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                # Windows 的 expanduser/Path.home 只认 USERPROFILE，不认 HOME；
+                # 两个都指到 tmp 才保证测试绝不碰真实用户目录。
                 os.environ["HOME"] = tmp
+                os.environ["USERPROFILE"] = tmp
                 for key in ("DINGCODE_HOME", "DINGAI_HOME", "DINGCODE_LANG", "DINGAI_LANG"):
                     os.environ.pop(key, None)
                 marker = Path(tmp) / "DingAI" / "marker.txt"
@@ -393,9 +408,11 @@ class BridgeOriginTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {
             "HOME": os.environ.get("HOME"),
+            "USERPROFILE": os.environ.get("USERPROFILE"),
             "DINGCODE_EXTENSION_ID": os.environ.get("DINGCODE_EXTENSION_ID"),
         }
         os.environ["HOME"] = self.tmp.name
+        os.environ["USERPROFILE"] = self.tmp.name
         os.environ["DINGCODE_EXTENSION_ID"] = "a" * 32
         dot = os.path.join(self.tmp.name, ".dingcode")
         os.makedirs(dot)
