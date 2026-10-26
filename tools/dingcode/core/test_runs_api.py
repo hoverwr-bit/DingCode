@@ -334,8 +334,6 @@ class RunsApiTests(unittest.TestCase):
 
     def test_note_edit_saves_to_source_note(self):
         creds = self.creds()
-        with open(self.source_note, encoding="utf-8") as fh:
-            before = fh.read()
         status, body, _ = self.post_write(
             "/api/runs/%s/pins/p1/note" % SID,
             {**creds, "confirm": "p1", "note": "改成绿色并加大字号"})
@@ -347,8 +345,8 @@ class RunsApiTests(unittest.TestCase):
             after = json.load(fh)
         self.assertEqual(after["pins"][0]["note"], "改成绿色并加大字号")
         self.assertEqual(after["pins"][1]["note"], "已确认")  # 别的钉不动
-        with open(self.source_note + ".bak", encoding="utf-8") as fh:
-            self.assertEqual(fh.read(), before)  # .bak 是改前原文
+        # P-20261026-DB-04: 版本由 git 管，改批注不再产生 .bak。
+        self.assertFalse(os.path.exists(self.source_note + ".bak"))
         # runs/note.json 不被手改。
         status, body, _ = self.request("/api/runs/%s/note" % SID)
         self.assertEqual(json.loads(body)["pins"][0]["note"], "这个按钮改成蓝色")

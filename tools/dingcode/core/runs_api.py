@@ -391,23 +391,12 @@ def _replace_file(tmp, path, tries=3):
 
 
 def _write_note_atomic(path, note):
-    """Atomic write with a one-shot .bak, per the design (core/sync.py pattern).
+    """Atomic write, no .bak — versions are managed by git (P-20261026-DB-04).
 
     Returns False when the final replace fails — on Windows os.replace raises
     PermissionError while another process holds the target open (editor, AV
     scan); the caller answers 409 instead of crashing the handler thread.
     """
-    try:
-        with open(path, "rb") as fh:
-            original = fh.read()
-    except OSError:
-        original = b""
-    if original:
-        try:
-            with open(path + ".bak", "wb") as fh:
-                fh.write(original)
-        except OSError:
-            pass
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(note, fh, ensure_ascii=False, indent=2)
