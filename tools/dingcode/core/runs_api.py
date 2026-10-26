@@ -585,8 +585,16 @@ spawn_autofix = _spawn_autofix
 # -- M6 设置接口 -----------------------------------------------------------
 
 def config_read(handler, decision):
-    import bridge
     import handoff
+
+    # handoff.py 把本服务作为 core.bridge 包模块启动，裸 import bridge 会失败；
+    # 模块此刻必然已加载（请求正是它分发的），从 sys.modules 取即可。
+    bridge = sys.modules.get("core.bridge") or sys.modules.get("bridge")
+    if bridge is None:
+        try:
+            import core.bridge as bridge
+        except ImportError:
+            import bridge as bridge
 
     cfg = handoff.load_config()
     # 经 DingCode.app 转发的请求保留公开端口的 Host（_host_ok 放行的那两个值），

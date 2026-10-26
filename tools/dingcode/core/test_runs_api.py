@@ -13,9 +13,12 @@ import http.client
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -814,6 +817,92 @@ class RunsApiTests(unittest.TestCase):
             else:
                 os.environ["DINGCODE_BRIDGE_PORT"] = saved_env
             self._write(os.path.join(self.home, "config.json"), {})
+
+
+class BridgeSubprocessTests(unittest.TestCase):
+    """以真实方式启动的 /api/config 回归。
+
+    handoff.py 经 `from core.bridge import main` 把 bridge 作为包模块加载，
+    config_read 里的裸 `import bridge` 会 ModuleNotFoundError（P-20261026-LOG-52
+    之后的回归）。这里不 mock：subprocess 起 `python3 handoff.py bridge --port N`，
+    用默认 Host 和壳转发的公开端口 Host 各打一次 /api/config。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = tempfile.mkdtemp(prefix="dingcode-sub-")
+        cls.dist = tempfile.mkdtemp(prefix="dingcode-sub-dist-")
+        with open(os.path.join(cls.dist, "index.html"), "w", encoding="utf-8") as fh:
+            fh.write("<!doctype html>record")
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env["DINGCODE_HOME"] = cls.home
+        env["DINGCODE_RECORD_DIST"] = cls.dist
+        env.pop("DINGCODE_BRIDGE_PORT", None)
+        cls.proc = subprocess.Popen(
+            [sys.executable, os.path.join(root, "handoff.py"),
+             "bridge", "--port", str(cls.port)],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, env=env)
+
+        def _cleanup():
+            if cls.proc.poll() is None:
+                cls.proc.terminate()
+                try:
+                    cls.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    cls.proc.kill()
+                    cls.proc.wait(timeout=10)
+            cls.proc.stdout.close()
+            shutil.rmtree(cls.home, ignore_errors=True)
+            shutil.rmtree(cls.dist, ignore_errors=True)
+
+        cls.addClassCleanup(_cleanup)
+        # 等服务就绪；提前退出则把日志带进报错。
+        deadline = time.time() + 30
+        while True:
+            if cls.proc.poll() is not None:
+                out = cls.proc.stdout.read().decode("utf-8", "replace")
+                raise AssertionError("bridge exited early:\n" + out)
+            try:
+                status, _ = cls._get("/api/config")
+                if status == 200:
+                    return
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise AssertionError("bridge never answered /api/config")
+            time.sleep(0.1)
+
+    @classmethod
+    def _get(cls, path, host=None):
+        conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=10)
+        try:
+            headers = {"Host": host} if host else {}
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_config_via_real_startup(self):
+        # 直连（默认 Host）→ 200，app_url 指向实际监听端口。
+        status, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["app_url"], "http://127.0.0.1:%d/app/" % self.port)
+        # 壳转发的公开端口 Host 同样 200，app_url 指回 8763。
+        status, body = self._get(
+            "/api/config", host="127.0.0.1:%d" % bridge.APP_PUBLIC_PORT)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body)["app_url"],
+            "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
 
 
 if __name__ == "__main__":
