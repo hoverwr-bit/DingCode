@@ -585,10 +585,18 @@ spawn_autofix = _spawn_autofix
 # -- M6 设置接口 -----------------------------------------------------------
 
 def config_read(handler, decision):
+    import bridge
     import handoff
 
     cfg = handoff.load_config()
-    cfg["app_url"] = "http://127.0.0.1:%d/app/" % (handler.server.server_address[1])
+    # 经 DingCode.app 转发的请求保留公开端口的 Host（_host_ok 放行的那两个值），
+    # 此时页面地址应指回壳的公开端口；其余情况（含直连）用本服务端口。
+    host = (handler.headers.get("Host") or "").strip().lower()
+    public = "127.0.0.1:%d" % bridge.APP_PUBLIC_PORT
+    if host in (public, "localhost:%d" % bridge.APP_PUBLIC_PORT):
+        cfg["app_url"] = "http://%s/app/" % public
+    else:
+        cfg["app_url"] = "http://127.0.0.1:%d/app/" % (handler.server.server_address[1])
     _json(handler, decision, 200, {"ok": True, **cfg})
 
 

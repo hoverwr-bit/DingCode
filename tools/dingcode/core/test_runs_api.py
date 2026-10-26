@@ -611,6 +611,26 @@ class RunsApiTests(unittest.TestCase):
         self.assertEqual(data["engine"], "claude")
         self.assertIn("/app/", data["app_url"])
 
+    def test_config_app_url_follows_public_host(self):
+        # BK-02: 壳转发保留公开端口的 Host（仅 _host_ok 放行的两种写法），
+        # 此时 app_url 指回 DingCode.app 的公开地址；直连时保持本端口地址。
+        status, body, _ = self.request(
+            "/api/config",
+            headers={"Host": "127.0.0.1:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
+        status, body, _ = self.request(
+            "/api/config",
+            headers={"Host": "localhost:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
+        # 直连内部端口（默认 Host）仍是本端口地址，不受 8763 影响。
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % self.port)
+
     def test_config_write_auth(self):
         status, _, _ = self.post_write("/api/config", {"dispatch": "manual"}, origin=None)
         self.assertEqual(status, 403)
