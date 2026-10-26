@@ -16,6 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot   # repo root (parent of windows\)
 Set-Location $root
 $env:PYTHONIOENCODING = "utf-8"            # tests assert Chinese text
 $env:PYTHONUTF8 = "1"                      # force UTF-8 mode in child python
+$env:PYTHONUNBUFFERED = "1"                # child logs must reach the redirect files
 
 if (-not $Python) { $Python = $env:DINGCODE_PYTHON }
 if (-not $Python) {
@@ -54,6 +55,8 @@ $proc = Start-Process -FilePath $Python `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
 
 $ok = $false
+$appErr = "not attempted"
+$apiErr = "not attempted"
 try {
     for ($i = 0; $i -lt 30; $i++) {
         if ($proc.HasExited) { break }
@@ -61,12 +64,29 @@ try {
         $apiOk = $false
         try {
             $app = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/app/" -TimeoutSec 3
-            $appOk = ($app.StatusCode -eq 200 -and $app.Content -match "record")
-        } catch {}
+            # The built index.html is a minimal SPA shell: its title is
+            # Chinese and the literal "record" never appears in it. What is
+            # stable across rebuilds: the #app mount node and /app/assets/.
+            if ($app.StatusCode -eq 200 -and
+                $app.Content -match 'id="app"' -and
+                $app.Content -match "/app/assets/") {
+                $appOk = $true
+            } else {
+                $appErr = "HTTP $($app.StatusCode), content check failed (body length $($app.Content.Length))"
+            }
+        } catch {
+            $appErr = $_.Exception.Message
+        }
         try {
             $sessions = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/sessions" -TimeoutSec 3
-            $apiOk = ($sessions.StatusCode -eq 200 -and $sessions.Content -match '"ok"\s*:\s*true')
-        } catch {}
+            if ($sessions.StatusCode -eq 200 -and $sessions.Content -match '"ok"\s*:\s*true') {
+                $apiOk = $true
+            } else {
+                $apiErr = "HTTP $($sessions.StatusCode), body: $($sessions.Content)"
+            }
+        } catch {
+            $apiErr = $_.Exception.Message
+        }
         if ($appOk -and $apiOk) { $ok = $true; break }
         Start-Sleep -Milliseconds 500
     }
@@ -82,7 +102,15 @@ if ($ok) {
     exit 0
 }
 Write-Host ""
-Write-Host "FAIL: bridge check failed (process exit code $($proc.ExitCode))"
+if ($proc.HasExited) {
+    Write-Host "FAIL: bridge check failed (bridge exited with code $($proc.ExitCode))"
+} else {
+    Write-Host "FAIL: bridge check failed (bridge still running after $((30 * 0.5))s of polling; not a crash)"
+}
+Write-Host "--- last /app/ error ---"
+Write-Host $appErr
+Write-Host "--- last /api/sessions error ---"
+Write-Host $apiErr
 Write-Host "--- stdout ($outLog) ---";  Get-Content $outLog -ErrorAction SilentlyContinue
 Write-Host "--- stderr ($errLog) ---";  Get-Content $errLog -ErrorAction SilentlyContinue
 exit 1
