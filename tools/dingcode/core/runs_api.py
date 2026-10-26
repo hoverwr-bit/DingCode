@@ -23,6 +23,9 @@ parsed as JSON objects.
 POST /api/runs/{sid}/pins/{pid}/note   edit that pin's note in the source note
 POST /api/runs/{sid}/pins/{pid}/rerun  spawn autofix --round N+1 --pin pid,
                                        returns the round number immediately
+POST /api/runs/{sid}/pins/{pid}/revert per-pin revert (three-way merge);
+                                       a merge conflict is 409 + conflict files
+                                       and nothing on disk is touched
 
 /app, /app/*   the prebuilt SPA in web/record/dist (suffix whitelist,
                explicit Content-Type, nosniff, realpath traversal guard)
@@ -122,6 +125,10 @@ def handle(handler, path, query, decision):
         match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/rerun", path)
         if match:
             pin_rerun(handler, decision, match.group(1), match.group(2))
+            return
+        match = re.fullmatch(r"/api/runs/([^/]+)/pins/([^/]+)/revert", path)
+        if match:
+            pin_revert(handler, decision, match.group(1), match.group(2))
             return
         _error(handler, decision, 404, "not found")
         return
@@ -462,6 +469,36 @@ def pin_rerun(handler, decision, sid, pid):
     round_n = (numbers[-1] + 1) if numbers else 1
     spawn_autofix(sid, round_n, str(pid), feedback)
     _json(handler, decision, 200, {"ok": True, "session": sid, "pin": str(pid), "round": round_n})
+
+
+def pin_revert(handler, decision, sid, pid):
+    """逐颗撤回：冲突 409 + 冲突文件列表，磁盘与元数据零改动（设计 §3）。"""
+    import handoff
+
+    if not _check_sid(handler, decision, sid) or not _check_pid(handler, decision, pid):
+        return
+    body = _read_post(handler, decision)
+    if body is None:
+        return
+    if not _check_write(handler, decision, body, pid):
+        return
+    if handoff.read_run_status(sid).get("status") == "running":
+        _error(handler, decision, 409, "a run is already in progress")
+        return
+    result = handoff.revert_pin(sid, str(pid))
+    if result.get("ok"):
+        _json(handler, decision, 200, result)
+        return
+    error = result.get("error") or ""
+    if error == "merge conflict":
+        _json(handler, decision, 409, {
+            "ok": False,
+            "error": "merge conflict",
+            "conflicts": result.get("conflicts") or [],
+            "round": result.get("round"),
+        })
+        return
+    _error(handler, decision, 404 if "no pin-only round" in error else 409, error)
 
 
 def _spawn_autofix(session, round_n, pid, feedback=""):

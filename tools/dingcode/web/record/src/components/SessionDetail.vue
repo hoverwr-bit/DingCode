@@ -71,6 +71,11 @@ function onNoteSaved(pid: string, note: string) {
   const found = pins.find((p) => String(p.id) === pid);
   if (found) found.note = note;
 }
+
+function onReverted(_pid: string) {
+  // 逐颗撤回改了磁盘与各轮 summary：拉一次全量刷新合并态。
+  load();
+}
 </script>
 
 <template>
@@ -111,6 +116,7 @@ function onNoteSaved(pid: string, note: string) {
           :note="noteOf(pin.id)"
           :run-status="payload.status"
           @note-saved="onNoteSaved"
+          @reverted="onReverted"
         />
       </div>
     </template>

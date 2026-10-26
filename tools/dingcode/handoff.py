@@ -32,18 +32,20 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py bindings
   python3 handoff.py config engine claude|codex
   python3 handoff.py config auto on|off
-  python3 handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id]
+  python3 handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id] [--per-pin]
   python3 handoff.py result <session>
   python3 handoff.py revert <session> [round]
   python3 handoff.py bridge [--port N]
 """
 
 import difflib
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 from core.paths import data_home, env, project_file, project_root_name, state_dir
@@ -1811,6 +1813,41 @@ def merged_pins(session):
     return merged
 
 
+def _capture_pin_post(folder, dest, meta, pins, patch):
+    """逐颗模式：touched 文件的运行后字节存 post/，manifest 记 pre/post sha256。
+
+    touched 集 = diff 的文件 ∪ 该钉自报的 files。超过 2MB 或读取失败的文件没有
+    post/ 副本，撤回时只剩 sha256 快路径（revert_pin 的规则 3）。
+    """
+    touched = set(split_patch(patch))
+    for pin in pins or []:
+        for name in pin.get("files") or []:
+            key = name[2:] if isinstance(name, str) and name.startswith("./") else name
+            if isinstance(key, str) and key:
+                touched.add(key)
+    touched = {rel for rel in touched if not _rel_escapes(rel)}
+    if not touched:
+        return
+    sha_map = {}
+    for rel in sorted(touched):
+        src = os.path.join(folder, rel)
+        if not os.path.isfile(src):
+            continue
+        if not _copy_rel(folder, os.path.join(dest, "post"), rel):
+            continue
+        current = _read_file(src) or b""
+        before = pre_bytes(dest, meta, rel)
+        sha_map[rel] = {
+            "pre": hashlib.sha256(before).hexdigest() if before is not None else None,
+            "post": hashlib.sha256(current).hexdigest(),
+        }
+    if not sha_map:
+        return
+    stored = _read_json(os.path.join(dest, "manifest.json"), {}) or dict(meta)
+    stored["files_sha256"] = sha_map
+    _write_json(os.path.join(dest, "manifest.json"), stored)
+
+
 def close_round(session, round_n, folder, dest, meta, note, shots, code, pin_meta=None):
     os.makedirs(dest, exist_ok=True)
     if not meta:
@@ -1842,6 +1879,11 @@ def close_round(session, round_n, folder, dest, meta, note, shots, code, pin_met
     if pin_meta:
         for pin in pins:
             pin.update(pin_meta)
+        if pin_meta.get("pin_only"):
+            try:
+                _capture_pin_post(folder, dest, meta, pins, patch)
+            except Exception:
+                pass
     counts = summary_counts(pins)
     body = {
         "round": round_n,
@@ -1912,6 +1954,137 @@ def revert_round(session, round_n=None):
     return result
 
 
+def _merge_file(current, base, other):
+    """git merge-file：以 base 为共同祖先，把 base→other 的改动合进 current。
+
+    逐颗撤回时 base=该钉的 post、other=该钉的 pre，即"撤销这颗钉"合到当前磁盘。
+    冲突（exit > 0）返回 None，调用方保持磁盘零改动。返回的字节带冲突标记与否
+    由 exit 0 保证：0 才是干净合并。
+    """
+    with tempfile.TemporaryDirectory(prefix="dingcode-merge-") as tmp:
+        paths = {}
+        for name, data in (("current", current), ("base", base), ("other", other)):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as fh:
+                fh.write(data if data is not None else b"")
+            paths[name] = path
+        try:
+            proc = subprocess.run(
+                ["git", "merge-file", "-p",
+                 "-L", "current", "-L", "pin-post", "-L", "pin-before",
+                 paths["current"], paths["base"], paths["other"]],
+                capture_output=True)
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+
+
+def revert_pin(session, pid):
+    """逐颗撤回（设计 §3）：撤回一颗钉最新的未撤回 pin_only 轮。
+
+    快路径：磁盘字节 == 该轮 post sha256 → 直接写回 pre（新增文件则删除）。
+    否则 git merge-file 三方合并；任一文件冲突就整体放弃，磁盘与元数据零改动。
+    不改 revert_snapshot / revert_round 的语义。
+    """
+    target = None
+    for number in reversed(round_numbers(session)):
+        body = _read_json(os.path.join(round_dir(session, number), "summary.json"), {})
+        if body.get("reverted"):
+            # 该轮已撤回过（逐颗或整轮），它的改动已不在磁盘上。
+            continue
+        for entry in body.get("pins") or []:
+            if (isinstance(entry, dict) and entry.get("pin_only")
+                    and str(entry.get("pin")) == str(pid)):
+                target = number
+                break
+        if target is not None:
+            break
+    if target is None:
+        return {"ok": False, "error": "no pin-only round to revert for pin %s" % pid}
+    dest = round_dir(session, target)
+    meta = _read_json(os.path.join(dest, "manifest.json"), {})
+    folder = meta.get("folder") or read_run_status(session).get("folder") or ""
+    if not meta or not folder or not os.path.isdir(folder):
+        return {"ok": False, "error": "folder missing", "round": target}
+    sha_map = meta.get("files_sha256") or {}
+    if not sha_map:
+        return {"ok": False, "error": "no per-pin snapshot (post/ missing)", "round": target}
+    folder = os.path.realpath(folder)
+    plan = []
+    conflicts = []
+    for rel in sorted(sha_map):
+        if _rel_escapes(rel):
+            continue
+        entry = sha_map[rel] or {}
+        base = pre_bytes(dest, meta, rel)
+        current = _read_file(os.path.join(folder, rel))
+        post = _read_file(os.path.join(dest, "post", rel))
+        post_sha = entry.get("post") or ""
+        current_sha = hashlib.sha256(current or b"").hexdigest()
+        if post_sha and current_sha == post_sha:
+            # 快路径：磁盘就是这颗钉改完的样子（post/ 副本缺失也认 sha256）。
+            plan.append((rel, "remove" if base is None else "write",
+                         None if base is None else base))
+            continue
+        if base is None or post is None:
+            # 新增文件、或 post/ 缺失（2MB 上限/旧数据）：只允许快路径。
+            conflicts.append(rel)
+            continue
+        merged = _merge_file(current, post, base)
+        if merged is None:
+            conflicts.append(rel)
+        else:
+            plan.append((rel, "write", merged))
+    if conflicts:
+        return {"ok": False, "error": "merge conflict", "conflicts": conflicts, "round": target}
+    restored = []
+    removed = []
+    for rel, action, data in plan:
+        abs_path = os.path.join(folder, rel)
+        if action == "remove":
+            try:
+                if os.path.isfile(abs_path) or os.path.islink(abs_path):
+                    os.remove(abs_path)
+                    removed.append(rel)
+            except OSError:
+                pass
+            continue
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            with open(abs_path, "wb") as fh:
+                fh.write(data or b"")
+            restored.append(rel)
+        except OSError:
+            pass
+    summary = _read_json(os.path.join(dest, "summary.json"), {})
+    if summary:
+        summary["reverted"] = True
+        _write_json(os.path.join(dest, "summary.json"), summary)
+    stale = []
+    for number in round_numbers(session):
+        if number <= target:
+            continue
+        path = os.path.join(round_dir(session, number), "summary.json")
+        data = _read_json(path, {})
+        rows = data.get("pins") if isinstance(data.get("pins"), list) else []
+        changed = False
+        for row in rows:
+            if (isinstance(row, dict) and row.get("pin_only")
+                    and str(row.get("pin")) == str(pid) and not row.get("stale")):
+                row["stale"] = True
+                changed = True
+        if changed:
+            _write_json(path, data)
+            stale.append(number)
+    write_run_status(session, {"reverted_pin": str(pid), "reverted_round": target})
+    return {"ok": True, "restored": restored, "removed": removed, "stale": stale,
+            "round": target, "session": session}
+
+
 def run_engine(cmd, cwd, log_path):
     with open(log_path, "a", encoding="utf-8") as log:
         shown = list(cmd)
@@ -1932,14 +2105,72 @@ def run_engine(cmd, cwd, log_path):
         return proc.returncode
 
 
+def autofix_per_pin(note_path, session):
+    """逐颗模式：对每颗 open 钉依次起 autofix --pin 子进程，一颗失败不中断后续。
+
+    每钉占一个 round-N（复用 autofix_main 全链路，pin_only 轮会捕获 post/ 与
+    files_sha256，revert_pin 才有独立的改前/改后字节）。结束写 status.json 汇总。
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        note = json.loads(read_note(note_path) or "{}")
+    except ValueError:
+        note = {}
+    kept = open_pins_note(note if isinstance(note, dict) else {})
+    ids = pin_ids_of(kept)
+    folder_run = run_dir(session)
+    os.makedirs(folder_run, exist_ok=True)
+    if not ids:
+        write_run_status(session, {
+            "status": "failed", "error": "no open pins", "note": note_path,
+            "finished": now,
+        })
+        sys.stdout.write(json.dumps({"ok": False, "error": "no open pins", "session": session}) + "\n")
+        return 1
+    # 子进程必须从源 note 出发：autofix 每轮会把过滤后的钉写回 runs/<sid>/note.json，
+    # 若传 session 名，第二颗钉会读到只剩第一颗的 note 而报 no open pins。
+    script = os.path.abspath(__file__)
+    results = []
+    with open(os.path.join(folder_run, "log.txt"), "a", encoding="utf-8") as log:
+        for pid in ids:
+            numbers = round_numbers(session)
+            round_n = (numbers[-1] + 1) if numbers else 1
+            cmd = [sys.executable or "python3", script, "autofix", note_path,
+                   "--round", str(round_n), "--pin", str(pid)]
+            log.write("per-pin %s round %s\n" % (pid, round_n))
+            log.flush()
+            try:
+                proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL)
+                ok = proc.returncode == 0
+            except OSError as exc:
+                log.write("error %s\n" % exc)
+                ok = False
+            results.append({"pin": str(pid), "round": round_n, "ok": ok})
+    failed = [row["pin"] for row in results if not row["ok"]]
+    finished = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    write_run_status(session, {
+        "status": "done" if not failed else "failed",
+        "error": "" if not failed else "per-pin failed: %s" % ", ".join(failed),
+        "round": results[-1]["round"] if results else 0,
+        "note": note_path, "finished": finished, "per_pin": results,
+    })
+    sys.stdout.write(json.dumps({
+        "ok": not failed, "session": session, "per_pin": results,
+    }, ensure_ascii=False) + "\n")
+    return 0 if not failed else 1
+
+
 def autofix_main(argv):
     if len(argv) < 3:
-        sys.stderr.write("usage: handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id]\n")
+        sys.stderr.write("usage: handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id] [--per-pin]\n")
         return 2
     note_path, session = resolve_autofix_note(argv[2])
     if not note_path:
         sys.stderr.write("note or session not found\n")
         return 2
+    if "--per-pin" in argv:
+        return autofix_per_pin(note_path, session)
     try:
         round_n = int(_flag(argv, "--round") or "1")
     except ValueError:

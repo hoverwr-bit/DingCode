@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -595,6 +596,226 @@ class AutofixTests(unittest.TestCase):
         self.assertIn("outside", status["error"])
         with open(secret, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "original\n")
+
+
+class PinRevertTests(unittest.TestCase):
+    """M3 逐颗模式：close_round 的 post//sha256 捕获、revert_pin 三方合并、--per-pin。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.old = {key: os.environ.get(key) for key in ("HOME", "DINGCODE_ENGINE_PATH", "DINGCODE_AUTOFIX_DRY")}
+        os.environ["HOME"] = self.home
+        bindir = os.path.join(self.home, "bin")
+        os.makedirs(bindir)
+        for name in ("claude", "codex"):
+            path = os.path.join(bindir, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        os.environ["DINGCODE_ENGINE_PATH"] = bindir
+        os.environ["DINGCODE_AUTOFIX_DRY"] = "1"
+
+    def tearDown(self):
+        for key, value in self.old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def repo(self):
+        folder = os.path.join(self.home, "repo")
+        os.makedirs(folder)
+        subprocess.run(["git", "init", "-q"], cwd=folder, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "dingcode@example.com"], cwd=folder, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "DingCode"], cwd=folder, check=True, capture_output=True)
+        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("l1\nl2\nl3\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=folder, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=folder, check=True, capture_output=True)
+        return folder
+
+    def engine(self, body):
+        script = os.path.join(self.home, "bin", "claude")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(script, 0o755)
+
+    def note_for(self, name):
+        handoff.bind_target("http://localhost:8090", os.path.join(self.home, "repo"))
+        notes = os.path.join(self.home, "notes")
+        os.makedirs(notes, exist_ok=True)
+        note_path = os.path.join(notes, name + ".json")
+        with open(note_path, "w", encoding="utf-8") as fh:
+            json.dump({"pins": [
+                {"id": 1, "status": "open", "note": "改第 2 行", "page": {"url": "http://localhost:8090/a"}},
+                {"id": 2, "status": "open", "note": "动末尾", "page": {"url": "http://localhost:8090/a"}},
+            ]}, fh)
+        return note_path
+
+    def summary_of(self, session, round_n):
+        return handoff._read_json(os.path.join(handoff.round_dir(session, round_n), "summary.json"), {})
+
+    def manifest_of(self, session, round_n):
+        return handoff._read_json(os.path.join(handoff.round_dir(session, round_n), "manifest.json"), {})
+
+    def test_per_pin_mode_gives_each_pin_a_round(self):
+        self.repo()
+        note_path = self.note_for("anno-pp")
+        code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--per-pin"])
+        self.assertEqual(code, 0)
+        # 逐颗模式：每颗钉一个 round，且都打上 pin_only/pin。
+        self.assertEqual(handoff.round_numbers("anno-pp"), [1, 2])
+        rows1 = handoff.load_round_summary("anno-pp", 1)
+        self.assertTrue(rows1[0]["pin_only"])
+        self.assertEqual(rows1[0]["pin"], "1")
+        rows2 = handoff.load_round_summary("anno-pp", 2)
+        self.assertTrue(rows2[0]["pin_only"])
+        self.assertEqual(rows2[0]["pin"], "2")
+        status = handoff.read_run_status("anno-pp")
+        self.assertEqual(status["status"], "done")
+        self.assertEqual([row["pin"] for row in status["per_pin"]], ["1", "2"])
+        self.assertTrue(all(row["ok"] for row in status["per_pin"]))
+
+    def test_pin_only_round_captures_post_and_sha256(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-cap")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        dest = handoff.round_dir("anno-cap", 1)
+        with open(os.path.join(dest, "post", "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nX\nl3\n")
+        sha_map = self.manifest_of("anno-cap", 1)["files_sha256"]
+        self.assertEqual(sorted(sha_map), ["a.txt"])
+        self.assertEqual(sha_map["a.txt"]["pre"], hashlib.sha256(b"l1\nl2\nl3\n").hexdigest())
+        self.assertEqual(sha_map["a.txt"]["post"], hashlib.sha256(b"l1\nX\nl3\n").hexdigest())
+
+    def test_revert_pin_three_way_merge_with_later_round(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-rev")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        # round-1：pin 1 改 l2→X；round-2：pin 2 在末尾追加 Y（不同 hunk）。
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\nY\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"2\",\"status\":\"fixed\",\"summary_zh\":\"追加末行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "2", "--pin", "2"]), 0)
+        result = handoff.revert_pin("anno-rev", "1")
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["restored"], ["a.txt"])
+        # 三方合并：pin 1 的改动被撤销，pin 2 的追加保留。
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nl2\nl3\nY\n")
+        self.assertTrue(self.summary_of("anno-rev", 1).get("reverted"))
+        self.assertEqual(result["stale"], [])  # 后续轮是别的钉的，不标 stale
+        status = handoff.read_run_status("anno-rev")
+        self.assertEqual(status["reverted_pin"], "1")
+        self.assertEqual(status["reverted_round"], 1)
+
+    def test_revert_pin_marks_later_rounds_of_same_pin_stale(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-stale")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        # 同一颗钉两轮：round-1 改 l2→X，round-2 再改 X→X2。
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        self.engine("#!/bin/sh\nprintf 'l1\\nX2\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"再改\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "2", "--pin", "1"]), 0)
+        # 第一次撤回的是最新轮（round-2），没有更晚的轮可标 stale。
+        first = handoff.revert_pin("anno-stale", "1")
+        self.assertTrue(first.get("ok"), first)
+        self.assertEqual(first["round"], 2)
+        self.assertEqual(first["stale"], [])
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nX\nl3\n")
+        # 第二次撤回 round-1；round-2 已在撤回状态，被标 stale 提示重跑。
+        second = handoff.revert_pin("anno-stale", "1")
+        self.assertTrue(second.get("ok"), second)
+        self.assertEqual(second["round"], 1)
+        self.assertEqual(second["stale"], [2])
+        self.assertTrue(self.summary_of("anno-stale", 2)["pins"][0].get("stale"))
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nl2\nl3\n")
+
+    def test_revert_pin_conflict_touches_nothing(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-conflict")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        # round-1：pin 1 改 l2→X；round-2：pin 2 改同一行 X→Z（同 hunk）。
+        self.engine("#!/bin/sh\nprintf 'l1\\nX\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        self.engine("#!/bin/sh\nprintf 'l1\\nZ\\nl3\\n' > a.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"2\",\"status\":\"fixed\",\"summary_zh\":\"又改第2行\",\"files\":[\"a.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "2", "--pin", "2"]), 0)
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            before = fh.read()
+        result = handoff.revert_pin("anno-conflict", "1")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("conflicts"), ["a.txt"])
+        # 磁盘与元数据零改动。
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertNotIn("reverted", self.summary_of("anno-conflict", 1))
+        self.assertNotIn("reverted_pin", handoff.read_run_status("anno-conflict"))
+
+    def test_revert_pin_fast_path_removes_new_file_even_without_post_copy(self):
+        folder = self.repo()
+        note_path = self.note_for("anno-fast")
+        os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        # pin 1 新建 new.txt：pre 不存在 → 撤回 = 删除；post/ 副本缺失时仍认 sha256。
+        self.engine("#!/bin/sh\nprintf 'fresh\\n' > new.txt\n"
+                    "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"新增文件\",\"files\":[\"new.txt\"]}]}'\n")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1", "--pin", "1"]), 0)
+        sha_map = self.manifest_of("anno-fast", 1)["files_sha256"]
+        self.assertIsNone(sha_map["new.txt"]["pre"])
+        os.remove(os.path.join(handoff.round_dir("anno-fast", 1), "post", "new.txt"))
+        result = handoff.revert_pin("anno-fast", "1")
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["removed"], ["new.txt"])
+        self.assertFalse(os.path.exists(os.path.join(folder, "new.txt")))
+
+    def test_revert_pin_without_post_snapshot_refuses(self):
+        folder = self.repo()
+        # 手工造一个只有 pin_only summary、没有 post//sha256 的轮。
+        dest = handoff.round_dir("anno-nopost", 1)
+        os.makedirs(dest)
+        handoff._write_json(os.path.join(dest, "manifest.json"),
+                            {"kind": "copy", "folder": folder, "copied": ["a.txt"]})
+        handoff._write_json(os.path.join(dest, "summary.json"), {
+            "pins": [{"id": "1", "status": "fixed", "pin_only": True, "pin": "1", "rerun": 1}],
+        })
+        with open(os.path.join(folder, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("changed\n")
+        result = handoff.revert_pin("anno-nopost", "1")
+        self.assertFalse(result.get("ok"))
+        self.assertIn("snapshot", result.get("error") or "")
+        with open(os.path.join(folder, "a.txt"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "changed\n")
+
+    def test_revert_pin_unknown_pin_is_an_error(self):
+        self.repo()
+        note_path = self.note_for("anno-none")
+        self.assertEqual(
+            handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"]), 0)
+        # 整轮 summary 不带 pin_only → 没有可逐颗撤回的轮。
+        result = handoff.revert_pin("anno-none", "1")
+        self.assertFalse(result.get("ok"))
+        self.assertIn("no pin-only round", result.get("error") or "")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { api, type Pin, type PinHistory } from "../api";
+import { ApiError, api, type Pin, type PinHistory } from "../api";
 import DiffView from "./DiffView.vue";
 import StatusBadge from "./StatusBadge.vue";
 
 // 一颗钉：批注 + 状态 + summary_zh + diff。展开后拉取该钉各轮历史。
 // M2：可编辑批注（写源 note 文件）、单钉重跑（后台轮次，进度靠父级轮询）。
+// M3：逐颗撤回（三方合并，冲突 409 时提示先重跑或整轮回滚）。
 const props = defineProps<{
   sid: string;
   pin: Pin;
@@ -13,7 +14,10 @@ const props = defineProps<{
   /** 整个会话的运行状态（running 时按钮禁用并显示进度）。 */
   runStatus: string;
 }>();
-const emit = defineEmits<{ (e: "note-saved", pid: string, note: string): void }>();
+const emit = defineEmits<{
+  (e: "note-saved", pid: string, note: string): void;
+  (e: "reverted", pid: string): void;
+}>();
 
 const open = ref(false);
 const loading = ref(false);
@@ -91,6 +95,45 @@ async function rerun() {
   }
 }
 
+// 撤回这颗：二次确认；409 冲突时按设计提示「先重跑或整轮回滚」并列出冲突文件。
+const reverting = ref(false);
+const revertConfirming = ref(false);
+const revertDone = ref(false);
+const revertError = ref("");
+
+async function revert() {
+  if (revertDone.value) return;
+  if (!revertConfirming.value) {
+    revertConfirming.value = true;
+    return;
+  }
+  reverting.value = true;
+  revertError.value = "";
+  try {
+    await api.revertPin(props.sid, props.pin.id);
+    revertConfirming.value = false;
+    revertDone.value = true;
+    // 重拉该钉各轮历史：reverted / stale 立即反映到轮次列表。
+    history.value = await api.pinHistory(props.sid, props.pin.id);
+    emit("reverted", props.pin.id);
+  } catch (err) {
+    revertError.value = revertMessage(err);
+    revertConfirming.value = false;
+  } finally {
+    reverting.value = false;
+  }
+}
+
+function revertMessage(err: unknown): string {
+  if (err instanceof ApiError && err.status === 409) {
+    const conflicts = (err.data.conflicts as string[] | undefined) || [];
+    const files = conflicts.length ? "（冲突文件：" + conflicts.join("、") + "）" : "";
+    return "撤回冲突：后续轮次改动了相同区域" + files
+      + "，无法自动合并，未改动任何文件。请先重跑这颗钉，或使用整轮回滚。";
+  }
+  return "撤回失败：" + String(err instanceof Error ? err.message : err);
+}
+
 const busy = () => props.runStatus === "running";
 
 function roundLabel(h: PinHistory["rounds"][number]): string {
@@ -125,7 +168,7 @@ function roundLabel(h: PinHistory["rounds"][number]): string {
     </header>
 
     <div v-if="open" class="border-t border-slate-100 px-4 py-3">
-      <!-- M2 操作区：编辑批注 + 重跑这颗 -->
+      <!-- M2 操作区：编辑批注 + 重跑这颗；M3 加撤回这颗 -->
       <div class="mb-4 space-y-2">
         <div v-if="!editing" class="flex items-center gap-2">
           <button
@@ -149,6 +192,13 @@ function roundLabel(h: PinHistory["rounds"][number]): string {
             class="w-48 rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
             @click.stop
           />
+          <button
+            class="rounded border border-orange-300 px-2 py-1 text-xs text-orange-700 hover:bg-orange-50 disabled:opacity-50"
+            :disabled="reverting || revertDone || busy()"
+            @click="revert"
+          >
+            {{ revertDone ? "已撤回" : revertConfirming ? "确认撤回？" : "撤回这颗" }}
+          </button>
           <span v-if="busy()" class="text-xs text-blue-600">
             正在运行，等待轮询结果…
           </span>
@@ -156,6 +206,7 @@ function roundLabel(h: PinHistory["rounds"][number]): string {
             已发起第 {{ rerunRound }} 轮单钉重跑
           </span>
           <span v-if="rerunError" class="text-xs text-red-600">{{ rerunError }}</span>
+          <span v-if="revertError" class="text-xs text-red-600">{{ revertError }}</span>
         </div>
         <template v-else>
           <textarea

@@ -96,6 +96,16 @@ export interface RerunResult {
   round: number;
 }
 
+/** 撤回单颗钉的返回：restored/removed 是被写回/删除的文件，stale 是被标记的后续轮。 */
+export interface RevertResult {
+  ok: boolean;
+  restored?: string[];
+  removed?: string[];
+  stale?: number[];
+  round?: number;
+  conflicts?: string[];
+}
+
 // /api/session 的 client/token，M2 写操作必带。整个页面生命周期缓存一份。
 let creds: { client: number; token: string } | null = null;
 async function auth(): Promise<{ client: number; token: string }> {
@@ -114,9 +124,23 @@ async function post_json<T>(url: string, body: Record<string, unknown>): Promise
   });
   const data = (await resp.json().catch(() => ({}))) as { error?: string };
   if (!resp.ok) {
-    throw new Error(data.error || `${url}: HTTP ${resp.status}`);
+    // 带上 status 和完整响应体：撤回冲突（409）要展示冲突文件列表。
+    throw new ApiError(data.error || `${url}: HTTP ${resp.status}`, resp.status, data);
   }
   return data as T;
+}
+
+/** 非 2xx 的写接口响应。message 之外保留 status 与 body 供调用方细分提示。 */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly data: Record<string, unknown>;
+
+  constructor(message: string, status: number, data: Record<string, unknown>) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
+  }
 }
 
 export const api = {
@@ -148,6 +172,9 @@ export const api = {
       confirm: pid,
       ...(feedback ? { feedback } : {}),
     }),
+  /** 逐颗撤回：三方合并；409 = 冲突，data.conflicts 是冲突文件列表，磁盘未动。 */
+  revertPin: (sid: string, pid: string) =>
+    post_json<RevertResult>(`/api/runs/${sid}/pins/${pid}/revert`, { confirm: pid }),
 };
 
 export function note_text(pin: NotePin | undefined): string {

@@ -8,6 +8,7 @@ request never starts a real engine process.
 Run: python3 ./core/test_runs_api.py  (or python3 -m core.test_runs_api)
 """
 
+import hashlib
 import http.client
 import json
 import os
@@ -23,6 +24,7 @@ from core import bridge  # noqa: E402
 from core import runs_api  # noqa: E402
 
 SID = "case-1"
+SID2 = "case-2"
 DIFF = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hello\n+world\n"
 SUMMARY = {
     "pins": [
@@ -73,6 +75,7 @@ class RunsApiTests(unittest.TestCase):
             fh.write(DIFF)
         with open(os.path.join(cls.dist, "index.html"), "w", encoding="utf-8") as fh:
             fh.write("<!doctype html><html><body>record</body></html>")
+        cls._fixture_case2()
         cls.httpd = bridge.make_server(0)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
@@ -91,6 +94,40 @@ class RunsApiTests(unittest.TestCase):
     def _write(path, obj):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, ensure_ascii=False)
+
+    @classmethod
+    def _fixture_case2(cls):
+        """逐颗撤回（M3）的夹具：一颗 pin_only 轮，带 pre/、post/ 和 files_sha256。"""
+        cls.folder2 = os.path.join(cls.home, "proj-case2")
+        os.makedirs(cls.folder2)
+        run = os.path.join(cls.home, "runs", SID2)
+        round1 = os.path.join(run, "round-1")
+        os.makedirs(os.path.join(round1, "pre"))
+        os.makedirs(os.path.join(round1, "post"))
+        base = b"l1\nl2\nl3\n"
+        pinned = b"l1\nX\nl3\n"
+        with open(os.path.join(round1, "pre", "a.txt"), "wb") as fh:
+            fh.write(base)
+        with open(os.path.join(round1, "post", "a.txt"), "wb") as fh:
+            fh.write(pinned)
+        cls._write(os.path.join(run, "status.json"), {
+            "status": "done", "round": 1, "summary_line": "修复了 1 颗钉",
+            "note": cls.source_note, "folder": cls.folder2,
+            "finished": "2026-10-26T10:00:00Z",
+        })
+        cls._write(os.path.join(round1, "summary.json"), {
+            "pins": [{
+                "id": "p1", "status": "fixed", "summary_zh": "改了 a.txt 第 2 行",
+                "files": ["a.txt"], "pin_only": True, "pin": "p1", "rerun": 1,
+            }]
+        })
+        cls._write(os.path.join(round1, "manifest.json"), {
+            "kind": "copy", "folder": cls.folder2, "copied": ["a.txt"],
+            "files_sha256": {"a.txt": {
+                "pre": hashlib.sha256(base).hexdigest(),
+                "post": hashlib.sha256(pinned).hexdigest(),
+            }},
+        })
 
     def request(self, path, method="GET", headers=None, data=b""):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -376,6 +413,97 @@ class RunsApiTests(unittest.TestCase):
         finally:
             runs_api.spawn_autofix = original
         self.assertEqual(captured, [])
+
+    # -- M3 逐颗撤回 ---------------------------------------------------------
+
+    def _case2_file(self, text):
+        path = os.path.join(self.folder2, "a.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _case2_summary(self):
+        path = os.path.join(self.home, "runs", SID2, "round-1", "summary.json")
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_revert_success_restores_the_pin_before(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nX\nl3\n")  # 磁盘 == post → 快路径
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["restored"], ["a.txt"])
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nl2\nl3\n")  # 写回改前字节
+        self.assertTrue(self._case2_summary().get("reverted"))
+
+    def test_revert_conflict_is_409_and_disk_untouched(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nZ\nl3\n")  # 后续轮改了同一行 → 同 hunk 冲突
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+        self.assertEqual(status, 409)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["conflicts"], ["a.txt"])
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nZ\nl3\n")  # 磁盘未动
+        self.assertNotIn("reverted", self._case2_summary())
+        with open(os.path.join(self.home, "runs", SID2, "status.json"), encoding="utf-8") as fh:
+            self.assertNotIn("reverted_pin", json.load(fh))
+
+    def test_revert_rejections(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nX\nl3\n")
+        # 无 Origin（本地客户端）只读：写必须来自页面同源。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"}, origin=None)
+        self.assertEqual(status, 403)
+        # 外域 Origin 在 bridge 层就被拒。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"},
+            origin="http://evil.example")
+        self.assertEqual(status, 403)
+        # 缺/错 client+token → 401。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {"confirm": "p1"})
+        self.assertEqual(status, 401)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {"client": 999, "token": "x", "confirm": "p1"})
+        self.assertEqual(status, 401)
+        # confirm 不是这个钉 → 403。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p2"})
+        self.assertEqual(status, 403)
+        # 非法 pid → 400。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%2e%%2e/revert" % SID2, {**creds, "confirm": ".."})
+        self.assertEqual(status, 400)
+        # 没有可撤回 pin_only 轮的钉 → 404。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p2/revert" % SID2, {**creds, "confirm": "p2"})
+        self.assertEqual(status, 404)
+        # 全部拒绝路径磁盘都不动。
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nX\nl3\n")
+
+    def test_revert_refuses_while_running(self):
+        creds = self.creds()
+        status_path = os.path.join(self.home, "runs", SID2, "status.json")
+        with open(status_path, encoding="utf-8") as fh:
+            old = fh.read()
+        self._write(status_path, {"status": "running", "round": 1, "note": self.source_note,
+                                  "folder": self.folder2})
+        try:
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+            self.assertEqual(status, 409)
+        finally:
+            with open(status_path, "w", encoding="utf-8") as fh:
+                fh.write(old)
 
     # -- /app 静态服务 ------------------------------------------------------
 
