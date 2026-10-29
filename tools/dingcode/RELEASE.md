@@ -4,7 +4,7 @@ No certificate, password, or token belongs in this repository. CI reads them fro
 
 ## Version
 
-`tools/dingcode/VERSION` is the current version. The macOS bundle short version matches it. An update check runs only when `DINGCODE_UPDATE=1`. It GETs the public GitHub releases API for `DINGCODE_UPDATE_REPO` (default `hoverwr-bit/AI-toolbox`) and prints the result. It does not send a machine id and it does not download the asset.
+`tools/dingcode/VERSION` is the current version. The macOS bundle short version matches it. An update check runs only when `DINGCODE_UPDATE=1`. It GETs the public GitHub releases API for `DINGCODE_UPDATE_REPO` (default `hoverwr-bit/DingCode`) and prints the result. It does not send a machine id and it does not download the asset.
 
 ```
 DINGCODE_UPDATE=1 python3 tools/dingcode/dingcode update

@@ -1,12 +1,43 @@
-# AI-toolbox
+# DingCode
 
-A toolbox of local helpers for AI coding agents. The first tool is **DingCode** (formerly DingAI / AnnoOverlay / anno): point at the screen, and the agent receives machine-readable JSON instead of a one-line description.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**DingCode = pin annotations for vibe coding (钉给 vibe coding 用的批注工具).**
+**DingCode pins visual annotations onto any app or web page and hands your AI coding agent machine-readable JSON — not "fix the button in the top left".**
 
-**给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingCode**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
+DingCode is a local-first annotation and handoff tool for AI coding agents. Drop pins on a live overlay — the app underneath keeps working — and Esc exports structured JSON with app, window, and pixel coordinates, nearby OCR text, and, inside a browser, the DOM element under the pin, next to a screenshot taken when the session ends. One handoff prompt or MCP call passes all of it to Claude Code, Codex, or any other agent, which can then fix each pin and report back. Everything runs on your machine: screenshots and notes stay on disk, and the only network is your own loopback bridge plus opt-in team upload or release checks. The CLI, MCP server, and Python core are covered by unit tests in CI; several desktop UI paths are implemented but have not yet been through real-device acceptance — see [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md).
+
+**中文：把屏幕批注钉给 AI 编程代理的本地工具。**
+
+DingCode 在任何应用或网页上打「钉子」，导出机器可读的 JSON：应用、窗口、像素坐标、附近 OCR 文本，浏览器里还有钉子所在的 DOM 元素，并附上一张会话结束时截取的屏幕图。一条交接提示词或一次 MCP 调用就能交给 Claude Code、Codex 等代理逐颗修复。全部在本地运行：截图和笔记留在磁盘上，只有本机回环桥接，以及可选的团队上传和更新检查才会联网。CLI、MCP 服务器和 Python 核心有单元测试覆盖；部分桌面界面路径已实现但还没做过真机验收，见 [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md)。
 
 Languages are Chinese, English, and Vietnamese (`DINGCODE_LANG=zh|en|vi`). Signing, notarization, and packaged releases are described in `tools/dingcode/RELEASE.md`. An update check runs only when `DINGCODE_UPDATE=1`.
+
+## Features
+
+- **Live overlay annotation** on macOS (menu-bar app, `⌥⌘A`), Windows (`Ctrl+Alt+A`), and Linux X11: pins, arrows, boxes, ellipse, spotlight, and text, with the app underneath still usable; the screenshot is taken when the session ends, so pin coordinates match the PNG.
+- **Structured JSON export** (`dingcode-desktop-v1`): `x_px`/`y_px`, `window_nx`/`window_ny`, `ocr_nearby`, optional window and page info, pin type (`bug`/`change`/`question`) and status (`open`/`ai-fixed`/`confirmed`).
+- **In-page annotation**: `web/anno.js` pins anchor to DOM elements and follow scrolling; the Chrome/Edge extension injects the same script and talks to the desktop app on `127.0.0.1:8763`.
+- **CLI and MCP handoff**: `dingcode prompt` builds the handoff prompt; `dingcode mcp` speaks MCP on stdio (`dingcode_handoff`, `dingcode_list_pins`, `dingcode_mark_fixed` with a verification PNG) for Claude Code, Codex, and Cursor.
+- **Auto-fix with per-round revert**: after Send, the Mac app runs a headless agent (Claude Code or Codex engine) in the bound project folder; each round is snapshotted to `~/.dingcode/runs/` and can be reverted if it changes paths outside the folder.
+- **Session record page** (`web/record`, Vue 3, served by the bridge under `/app`): per-pin history, note edit, rerun (next round), and per-pin three-way revert — implemented in `core/runs_api.py`.
+- **Release review**: `dingcode release open/publish` gates publishing on every pin being reviewed; rejects and overrides land in `releases/audit.jsonl`, and rollback points at the previous release.
+- **Session collision warnings** (CLI, team board, desktop banners) and a **scope check** that warns about paths outside `.dingcode/scope.txt` and can reject out-of-scope changes.
+- **Optional self-hosted team server**: accounts, projects, pins, comments, and a review board (SQLite, Docker); no telemetry.
+- **Voice notes and step recording** (local whisper.cpp transcription, `sop.md` + `repro.json`) — implemented, not yet verified on real devices.
+- **Languages**: Chinese, English, and Vietnamese (`DINGCODE_LANG=zh|en|vi`).
+- **Local-first, no telemetry**: notes and screenshots are written to disk on your machine; the bridge listens on `127.0.0.1` only, and the update check runs only when `DINGCODE_UPDATE=1`.
+
+## Quick start
+
+1. **Build the desktop app.** macOS 14+: `cd tools/dingcode/macos && ./build.sh`, then copy `DingCode.app` to `/Applications` and grant Screen Recording. Windows: `cd tools/dingcode/windows && dotnet build`. Linux (X11): `python3 tools/dingcode/linux/dingcode_linux.py` (`--check` shows what is available).
+2. **Annotate.** `⌥⌘A` (macOS) or `Ctrl+Alt+A` (Windows) starts a live session; drop pins (B / C / Q set bug / change / question) and press Esc to write the JSON note and screenshot under `~/DingCode`. In a browser, load `tools/dingcode/web/anno.js` or install the Chrome/Edge extension.
+3. **Connect your agent.** `claude mcp add -s user dingcode -- dingcode mcp`, or add `dingcode mcp` to `~/.codex/config.toml` / `~/.cursor/mcp.json`. No MCP client? Paste the handoff prompt from `python3 tools/dingcode/dingcode prompt <note.json>`.
+4. **(Optional) Let the agent fix the pins.** `python3 tools/dingcode/dingcode bind <url-or-window> <project-folder>`, pick the engine with `dingcode config engine claude|codex`, and Send runs the headless fix; `dingcode result <session>` and `dingcode revert <session>` review or undo a round.
+5. **(Optional) Share with a team.** Self-host the board: `docker compose -f tools/dingcode/team-server/compose.yaml up --build -d` (see [tools/dingcode/team-server/DEPLOY.md](tools/dingcode/team-server/DEPLOY.md)).
+
+Tutorial: [tools/dingcode/docs/TUTORIAL.md](tools/dingcode/docs/TUTORIAL.md)
+
+Keywords: UI annotation, pin comments, visual feedback for AI coding agents, AI coding agent handoff, Claude Code, Codex, MCP, vibe coding, local-first, no telemetry, open source, MIT, macOS, Windows, Linux, Vue
 
 DingCode drops pins on any app or web page and exports JSON: app, window, pixel coordinates, nearby OCR text and, inside a browser, the DOM element and field under the pin. Paste that into Claude Code, Codex or any other agent.
 
@@ -17,7 +48,9 @@ DingCode drops pins on any app or web page and exports JSON: app, window, pixel 
 | `tools/dingcode/macos/` | DingCode menu-bar app (Swift, AppKit, ScreenCaptureKit, Vision). Live overlay: the app underneath stays usable; the screenshot is taken when you finish |
 | `tools/dingcode/windows/` | DingCode. Live overlay by default, UI Automation anchors, same JSON contract |
 | `tools/dingcode/linux/` | Linux session. X11 toolbar, optional grim / Tesseract / AT-SPI |
+| `tools/dingcode/handoff.py` | The `dingcode` CLI and stdio MCP server: handoff prompt, pins, mark-fixed, autofix, scope, release, sessions |
 | `tools/dingcode/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
+| `tools/dingcode/web/record/` | Vue 3 session record page, served by the bridge under `/app` (per-pin history, edit, rerun, revert) |
 | `tools/dingcode/core/` | Python standard library: note schema, label placement, folder and server sync. Used by Linux and `handoff.py` |
 | `tools/dingcode/team-server/` | Optional self-hosted board. Accounts, SQLite, Docker. No telemetry |
 | `tools/dingcode/probes/` | Diagnostic probes (display, capture, OCR, red-pixel scans) |

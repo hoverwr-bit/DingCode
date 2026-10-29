@@ -2,7 +2,7 @@
 """DingCode handoff: rules on the prompt, plus a stdio MCP server.
 
 No third-party packages. The desktop and page clients copy a prompt themselves;
-this script is the CLI and the MCP server (nothing else in the toolbox speaks MCP).
+this script is the CLI and the MCP server (no other component of DingCode speaks MCP).
 
   python3 handoff.py rules
   python3 handoff.py prompt [note.json]     # stdin when the path is omitted
