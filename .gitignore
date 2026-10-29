@@ -11,3 +11,10 @@ shots/
 *.cer
 __pycache__/
 *.pyc
+*.log
+*.bak
+.env*
+*.key
+*.pfx
+*.db
+*.sqlite

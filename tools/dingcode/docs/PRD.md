@@ -18,7 +18,7 @@
 真机记录（写状态时以此为准）：
 
 - Mac 上的自动修复以无头方式实测过（绑定目录、调用引擎、轮次、结果文件）。菜单栏图标、系统通知、改前改后对比窗没有实测。
-- Windows 机器 FTM1000 上用 .NET SDK 8.0.425 编译过，并在该机验证过本机 `GET /ping`。托盘和叠层界面没有实测。
+- Windows 测试机上用 .NET SDK 8.0.425 编译过，并在该机验证过本机 `GET /ping`。托盘和叠层界面没有实测。
 - 浏览器扩展没有在 Chrome 或 Edge 里加载过。whisper.cpp 语音没有用真实麦克风和模型跑过。团队服务器没有按部署文档在一台对外（或内网）机器上架通过。
 
 ## 1. 产品定位与目标用户
@@ -93,7 +93,7 @@ DingCode 是本地工具。人在正在看的界面上做标记，Claude Code �
 | 编号 | 功能 | 平台 | 状态 | 验收标准 |
 |---|---|---|---|---|
 | F01 | 实时叠层：点、箭头、框、椭圆、聚光、文字、选择、撤销。下层应用仍可滚动；按住修饰键把点击交回去。结束时才截图，坐标与 PNG 一致 | Mac | 未实测 | `⌥⌘A` 开始，Esc 写出 `dingcode-desktop-v1` 笔记和 PNG。选择能移动和改大小。代码在 `macos/DingCode.swift`。菜单栏和叠层没有在真机上点过 |
-| F02 | 同上，热键 `Ctrl+Alt+A`，按住 Alt 穿透。锚点来自 UI Automation。`DINGCODE_LIVE=0` 改为先冻截图 | Win | 未实测 | 笔记字段与 Mac 相同。FTM1000 编过并验证 `/ping`，托盘和画布没有点过 |
+| F02 | 同上，热键 `Ctrl+Alt+A`，按住 Alt 穿透。锚点来自 UI Automation。`DINGCODE_LIVE=0` 改为先冻截图 | Win | 未实测 | 笔记字段与 Mac 相同。Windows 测试机上编过并验证 `/ping`，托盘和画布没有点过 |
 | F03 | X11 工具栏批注。Wayland 仅在有 `grim` 时做静态截图。OCR 调用本机 `tesseract`。锚点来自 AT-SPI（会话总线可用时） | Linux | 未实测 | `dingcode_linux.py --check` 打印 X11、grim、Tesseract、AT-SPI 是否存在。`linux.test_linux` 通过。交互工具栏没有当真机验收 |
 | F04 | 页面批注层：钉子锚在 DOM 上，随滚动重绘。工具含 select、point、arrow、box、ellipse、spot、text。`localStorage` 键 `anno-v7:` + 路径 | 扩展 | 未实测 | `node web/anno-layout.test.js`、`anno-source.test.js`、`anno-i18n.test.js` 和 `node --check web/anno.js` 通过。没有在浏览器里打开过 |
 | F05 | Manifest V3 扩展，只把请求发到 `http://127.0.0.1:8763/`。`pack.sh` 把 `anno.js` 拷进 `extension/dist`（该目录不进 git） | 扩展 | 未实测 | `node --check` 通过 `background.js` 和 `content.js`。没有在 `chrome://extensions` 或 Edge 里「加载已解压」 |
@@ -101,7 +101,7 @@ DingCode 是本地工具。人在正在看的界面上做标记，Claude Code �
 | F07 | Windows 钉子记录源文件和行号 | Win | 未做 | 没有实现。Windows 桥不把 DOM 答案写成 `pins[].source` |
 | F08 | 桌面笔记契约：`pins`、`arrows`、`boxes`、可选 `labels`、`screen`、`window`、`screenshot`。`x_px` / `y_px` 为截图像素、左上角原点。`window.frame_px` 是点、左上角、当前屏幕 | CLI | 已完成 | `core/schema.py` 把类型和状态收成允许的集合。`core.test_core` 通过 |
 | F09 | 本机页面桥，只绑 `127.0.0.1`，默认端口 8763。Mac 有 `GET /ping`、`/pending`、`/events`，`POST /answer`、`/track`、`/voice`。`/voice` 会把上传的音频交给本机 whisper（必要时先用 ffmpeg 转成 wav） | Mac | 未实测 | 手写 HTTP/1.1（`NWListener`）。`/pending` 会把未取走的 `elementFromPoint` 请求交回页面。本环境没有 `swiftc`，真机浏览器没打过这条桥 |
-| F10 | Windows 本机 `GET /ping`。同进程还有 `/pending`、`/answer`、`/voice`，没有 `/events` 和 `/track` | Win | 已实测 | FTM1000 上验证过 `/ping`。源码里 `/pending` 恒为 `{"seq":0,"requests":[]}`，`/answer` 校验通过后只返回 `{"ok":1}`，`/voice` 返回空正文。这三条没有在 FTM1000 上逐条打过 |
+| F10 | Windows 本机 `GET /ping`。同进程还有 `/pending`、`/answer`、`/voice`，没有 `/events` 和 `/track` | Win | 已实测 | Windows 测试机上验证过 `/ping`。源码里 `/pending` 恒为 `{"seq":0,"requests":[]}`，`/answer` 校验通过后只返回 `{"ok":1}`，`/voice` 返回空正文。这三条没有在 Windows 测试机上逐条打过 |
 | F11 | Python 桥（Linux 会话在有 `DISPLAY` 时后台启动；也可 `dingcode_linux.py bridge` 或 `handoff.py bridge`）：路径与 Windows 相同，`/pending` 恒空，`/voice` 恒空 | Linux、CLI | 已完成 | `core.test_core` 对 `Origin: https://evil.example` 得到 403、正文无 token、无 `Access-Control-Allow-Origin`。`scripts/probe_bridge_origin.sh` 用 curl 做同样的检查。它不把页面钉子接成 DOM。没有在日常 Linux 桌面上当产品点过 |
 | F12 | 白名单：无 `Origin` 的本机客户端拿到 token，且不回 CORS、不回 Private-Network。允许的 Origin 被原样回显，并带 `Access-Control-Allow-Private-Network`。其它 Origin（含 `null`、`*`、带 CR/LF/逗号的头）403，正文 `forbidden`，无 token | CLI、Mac、Win | 已完成 | 扩展 id 为 `^[a-p]{32}$`，来自 `DINGCODE_EXTENSION_ID` 或 `config.json` 的 `extension_id`。绑定里的 `http`/`https` origin（如 `http://localhost:8090`）也允许。Python 单测覆盖。Mac/Win 源码对齐，除 F10 的 `/ping` 外没有再在真机上分 Origin 打过 |
 | F13 | 目标绑定到文件夹；列出绑定；引擎 claude\|codex；自动模式 on\|off | CLI、Mac | 已实测 | `dingcode bind`、`bindings`、`config`。缺省引擎 claude，缺省自动模式开。Mac 无头路径在真机跑过。第一次发送弹出的文件夹面板属于界面，未实测 |
@@ -131,7 +131,7 @@ DingCode 是本地工具。人在正在看的界面上做标记，Claude Code �
 | F37 | 三种模式：`local`（默认，含设置文件缺失）、`folder`、`server` | CLI、Mac、Win、Linux | 已完成 | `~/DingCode/settings.json`，环境变量覆盖文件。页面不能读这个文件。单测读设置。三种模式没有在真机上切换过 |
 | F38 | 版本检查 | CLI、Linux | 已完成 | 仅 `DINGCODE_UPDATE=1` 时请求 GitHub Releases（`DINGCODE_UPDATE_REPO`，默认与发布说明一致）。不发送机器 id，不下载。未设置时 `checked: false`。本环境跑过这条 |
 | F39 | 安装包签名与公证 | Mac、Win | 已完成 | 本地 `build.sh` 顺序：DingCode Dev、DingAI Dev、AnnoOverlay Dev、ad-hoc。GitHub Actions 仅在 `RELEASE.md` 列出的 secrets 齐全时签名和公证。仓库里无证书。没有用真实证书跑过 |
-| F40 | Windows 工程能在 .NET 8 上编译 | Win | 已实测 | FTM1000、SDK 8.0.425 上编译过，并验证 `/ping`。其后同一 SDK 对当时源码报过 10 个错误：`Native` 不存在（`mciSendString` 六处）、`Rectangle` 不能接受 `uint`（人脸框四处）。当前源码改为 `Win32.mciSendString`（`winmm.dll` 已有 DllImport），人脸框四字段转为 `int`，并去掉无法解析的 `UIAutomationClient` / `UIAutomationTypes` 引用（`UseWPF` 已打开）。本文不把「FTM1000 已用修复后的源码复编」写成事实。`.github/workflows/dingcode.yml` 已有 `windows-latest` 的 `dotnet build` |
+| F40 | Windows 工程能在 .NET 8 上编译 | Win | 已实测 | Windows 测试机、SDK 8.0.425 上编译过，并验证 `/ping`。其后同一 SDK 对当时源码报过 10 个错误：`Native` 不存在（`mciSendString` 六处）、`Rectangle` 不能接受 `uint`（人脸框四处）。当前源码改为 `Win32.mciSendString`（`winmm.dll` 已有 DllImport），人脸框四字段转为 `int`，并去掉无法解析的 `UIAutomationClient` / `UIAutomationTypes` 引用（`UseWPF` 已打开）。本文不把「Windows 测试机 已用修复后的源码复编」写成事实。`.github/workflows/dingcode.yml` 已有 `windows-latest` 的 `dotnet build` |
 | F41 | Mac App 最低系统 14.0，`build.sh` 使用 `-target $(uname -m)-apple-macos14.0` | Mac | 已完成 | 曾在 macOS 27 上因默认真机目标过高导致 LaunchServices -10825，已改构建脚本。本文没有在本环境运行 `swiftc`（没有该编译器）。真机上的无头修复不依赖重新编译 App，只要 App 调用的是这份 `handoff.py` |
 | F42 | CI | CLI、Win、Mac、团队服务器 | 已完成 | `dingcode.yml`：Ubuntu 上 Python 单测、node 检查、团队服务器镜像；`windows-latest` 上 `dotnet build`；`macos-latest` 上 `build.sh`。`release.yml` 在标签 `v*` 时打包。本环境跑过 Python 与团队服务器单测，没有跑 Actions |
 
@@ -287,7 +287,7 @@ Mac App 查找 CLI 的顺序：`DINGCODE_CLI`、App 相对路径上的 `handoff.
 | 只有 Mac 桥会把页面钉子排进 `/pending` 并在 `/voice` 里转写。Python 桥和 Windows 桥的 `/pending` 恒为空列表，`/answer` 不落盘，`/voice` 返回空正文。Windows 另没有 `/events`、`/track`、`pins[].source` 和复核截图 | 页面批注接到桌面钉子、页面语音、源码定位，不能把 Windows 或 Linux 桥当成和 Mac 桥同等 |
 | 扩展 id 不在 manifest 里 | 不设 `DINGCODE_EXTENSION_ID` 时，扩展的 Origin 会被 403，页面拿不到 token |
 | `claude -p` 曾把以 `- ` 开头的规则当成未知选项 | 源码已加 `DingCode task:` 和 `--`。单测通过。真机复跑没有记在「已实测」里 |
-| FTM1000 上 SDK 8.0.425 曾对修复前源码报 CS0103 六处、CS1503 四处 | 源码已改。是否已用当前提交在该机复编，本文不声称 |
+| Windows 测试机上 SDK 8.0.425 曾对修复前源码报 CS0103 六处、CS1503 四处 | 源码已改。是否已用当前提交在该机复编，本文不声称 |
 | Docker 卷 `dingcode-data` 不迁移 `dingai-data` | 旧数据要自己拷 |
 | `NSImage.lockFocus` 在新系统上过时 | 不影响当前最低系统声明，但是后续 SDK 可能告警 |
 | 更新检查不安装 | `DINGCODE_UPDATE=1` 只打印是否有新版本 |
@@ -302,7 +302,7 @@ Mac App 查找 CLI 的顺序：`DINGCODE_CLI`、App 相对路径上的 `handoff.
 | 个人 / 高级 / 团队是否分版，高级包含哪些功能 | 待确认 |
 | 团队版仅内部、不对外发放 | 待确认（本文按此书写，代码尚未加门禁） |
 | 在 Mac 上复跑以 `-` 开头的自动修复提示词 | 未做。单测已有 |
-| 在 FTM1000 上用当前源码重新 `dotnet build`，并再看一次 `/ping` | 未做。CI 的 windows-latest 会编 |
+| 在 Windows 测试机上用当前源码重新 `dotnet build`，并再看一次 `/ping` | 未做。CI 的 windows-latest 会编 |
 | 真机点菜单栏图标、系统通知、对比窗（确认 / 打回 / 打开文件） | 未做 |
 | 在 Chrome 或 Edge 加载扩展，并用白名单 Origin 走通 `/ping` | 未做 |
 | 用本机 whisper.cpp 模型走通按住说话 | 未做 |

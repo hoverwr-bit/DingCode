@@ -23,7 +23,7 @@ def check_update():
     current = current_version()
     if env("DINGCODE_UPDATE", "DINGAI_UPDATE") != "1":
         return {"ok": True, "checked": False, "current": current}
-    repo = env("DINGCODE_UPDATE_REPO", "DINGAI_UPDATE_REPO") or "hoverwr-bit/AI-toolbox"
+    repo = env("DINGCODE_UPDATE_REPO", "DINGAI_UPDATE_REPO") or "hoverwr-bit/DingCode"
     req = urllib.request.Request(
         "https://api.github.com/repos/%s/releases/latest" % repo,
         headers={"User-Agent": "dingcode", "Accept": "application/vnd.github+json"},
