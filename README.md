@@ -4,11 +4,11 @@
 
 **DingCode pins visual annotations onto any app or web page and hands your AI coding agent machine-readable JSON — not "fix the button in the top left".**
 
-DingCode is a local-first annotation and handoff tool for AI coding agents. Drop pins on a live overlay — the app underneath keeps working — and Esc exports structured JSON with app, window, and pixel coordinates, nearby OCR text, and, inside a browser, the DOM element under the pin, next to a screenshot taken when the session ends. One handoff prompt or MCP call passes all of it to Claude Code, Codex, or any other agent, which can then fix each pin and report back. Everything runs on your machine: screenshots and notes stay on disk, and the only network is your own loopback bridge plus opt-in team upload or release checks. The CLI, MCP server, and Python core are covered by unit tests in CI; several desktop UI paths are implemented but have not yet been through real-device acceptance — see [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md).
+DingCode is a local-first annotation and handoff tool for AI coding agents. Drop pins on a live overlay — the app underneath keeps working — and Esc exports structured JSON with app, window, and pixel coordinates, nearby OCR text, and, inside a browser, the DOM element under the pin, next to a screenshot taken when the session ends. One handoff prompt or MCP call passes all of it to Claude Code, Codex, or any other agent, which can then fix each pin and report back. Everything runs on your machine: screenshots and notes stay on disk, and the only network is your own loopback bridge plus opt-in team upload or release checks. The CLI, MCP server, and Python core are covered by unit tests in CI; several desktop UI paths are implemented but have not yet been through real-device acceptance — see the project's feature status notes.
 
 **中文：把屏幕批注钉给 AI 编程代理的本地工具。**
 
-DingCode 在任何应用或网页上打「钉子」，导出机器可读的 JSON：应用、窗口、像素坐标、附近 OCR 文本，浏览器里还有钉子所在的 DOM 元素，并附上一张会话结束时截取的屏幕图。一条交接提示词或一次 MCP 调用就能交给 Claude Code、Codex 等代理逐颗修复。全部在本地运行：截图和笔记留在磁盘上，只有本机回环桥接，以及可选的团队上传和更新检查才会联网。CLI、MCP 服务器和 Python 核心有单元测试覆盖；部分桌面界面路径已实现但还没做过真机验收，见 [tools/dingcode/docs/PRD.md](tools/dingcode/docs/PRD.md)。
+DingCode 在任何应用或网页上打「钉子」，导出机器可读的 JSON：应用、窗口、像素坐标、附近 OCR 文本，浏览器里还有钉子所在的 DOM 元素，并附上一张会话结束时截取的屏幕图。一条交接提示词或一次 MCP 调用就能交给 Claude Code、Codex 等代理逐颗修复。全部在本地运行：截图和笔记留在磁盘上，只有本机回环桥接，以及可选的团队上传和更新检查才会联网。CLI、MCP 服务器和 Python 核心有单元测试覆盖；部分桌面界面路径已实现但还没做过真机验收，详见项目的功能状态记录。
 
 Languages are Chinese, English, and Vietnamese (`DINGCODE_LANG=zh|en|vi`). Signing, notarization, and packaged releases are described in `tools/dingcode/RELEASE.md`. An update check runs only when `DINGCODE_UPDATE=1`.
 
@@ -83,10 +83,10 @@ GitHub Actions (`.github/workflows/dingcode.yml`) runs the Python and page check
 
 Auto mode is on by default. After Send (Esc or 完成), the Mac app binds the target and runs a headless agent in that project. Turn it off in the menu (自动模式:关) and Send goes back to copying the handoff prompt.
 
-The target is the page origin (`http://localhost:8090`) when a pin has a page URL, otherwise the window title, otherwise the app name. The first Send for an unbound target asks for a folder and stores it in `~/.dingcode/projects.json`.
+The target is the page origin (`http://localhost:3000`) when a pin has a page URL, otherwise the window title, otherwise the app name. The first Send for an unbound target asks for a folder and stores it in `~/.dingcode/projects.json`.
 
 ```
-python3 tools/dingcode/dingcode bind http://localhost:8090 ~/personal-hub
+python3 tools/dingcode/dingcode bind http://localhost:3000 ~/my-project
 python3 tools/dingcode/dingcode bindings
 python3 tools/dingcode/dingcode config engine claude
 python3 tools/dingcode/dingcode config engine codex
@@ -105,13 +105,13 @@ python3 tools/dingcode/dingcode revert <session> [round]
 
 自动模式默认开启。在 Mac 上点发送（Esc 或「完成」）之后，DingCode 把当前目标绑到一个本地项目，并在那个目录里跑无头编程代理，不用再把提示词粘贴到对话框。菜单里关掉「自动模式」后，发送恢复成原来的复制交接提示。
 
-目标优先用页面 origin（例如 `http://localhost:8090`），没有页面地址时用窗口标题，再没有就用 App 名。某个目标第一次发送时会弹出文件夹选择，并写进 `~/.dingcode/projects.json`。
+目标优先用页面 origin（例如 `http://localhost:3000`），没有页面地址时用窗口标题，再没有就用 App 名。某个目标第一次发送时会弹出文件夹选择，并写进 `~/.dingcode/projects.json`。
 
 默认引擎是 Claude Code（`claude -p`，`--permission-mode acceptEdits`，工具只允许 Read、Edit、Write、Glob、Grep，并禁止 Bash、WebFetch、WebSearch）。菜单「引擎」可以改成 Codex（`codex exec --sandbox workspace-write`，并且关闭网络）。两条命令都在绑定的项目目录里执行。钉子里的文字被包在数据块里，不当成指令。如果这一轮改到了绑定目录之外（含符号链接指出去的路径），DingCode 会撤回这一轮并标为失败。提示词要求：只改这个目录里的文件、改动尽量小、不重构、不加框架、按钉子 id 处理，并用 JSON 交回每颗钉子的 `status`（fixed / not-fixed / unsure）、一句中文 `summary_zh`（改了什么、哪个文件第几行）和 `files`。开跑前先记下目录现状，不用 stash：是 git 仓库就记下提交号和 `git diff`，并复制已经改过的文件；不是仓库就把文件复制下来。菜单栏图标分空闲、进行中、待确认、失败。通知类似 `1 pin fixed, 1 not fixed`。结果窗口按钉子显示这句中文、改前/改后截图、绿增红删的差异，可以打开文件、确认修好，或写一句说明只打回这一颗。全部确认后这一轮才算结束。每一轮保存在 `~/.dingcode/runs/<session>/round-N/`（summary.json、diff.patch、截图）。「撤回本轮」把项目恢复到这一轮开始之前。`dingcode result <session>` 查看结果，`dingcode revert <session> [round]` 撤回。
 
 ## Desktop ↔ page bridge
 
-The desktop apps listen on `127.0.0.1:8763` only. A page that has loaded `anno.js` answers `elementFromPoint` so a desktop pin landing in a browser can record the DOM field. `GET /ping` returns the session token only when the request has no `Origin` (a local client) or the `Origin` is allowlisted: `chrome-extension://` plus `DINGCODE_EXTENSION_ID` (or `extension_id` in `~/.dingcode/config.json`), and the `http`/`https` keys in `~/.dingcode/projects.json` such as `http://localhost:8090`. The response echoes that origin. `Access-Control-Allow-Private-Network` is sent only for an allowlisted origin. Any other origin, including `https://evil.example` and `null`, gets 403 and no token. `/pending`, `/answer`, and `/voice` use the same check. `/voice` also requires the client id from `/ping`. Linux starts the same bridge with the session, or `python3 tools/dingcode/linux/dingcode_linux.py bridge`. Nothing else is contacted unless team upload is configured.
+The desktop apps listen on `127.0.0.1:8763` only. A page that has loaded `anno.js` answers `elementFromPoint` so a desktop pin landing in a browser can record the DOM field. `GET /ping` returns the session token only when the request has no `Origin` (a local client) or the `Origin` is allowlisted: `chrome-extension://` plus `DINGCODE_EXTENSION_ID` (or `extension_id` in `~/.dingcode/config.json`), and the `http`/`https` keys in `~/.dingcode/projects.json` such as `http://localhost:3000`. The response echoes that origin. `Access-Control-Allow-Private-Network` is sent only for an allowlisted origin. Any other origin, including `https://evil.example` and `null`, gets 403 and no token. `/pending`, `/answer`, and `/voice` use the same check. `/voice` also requires the client id from `/ping`. Linux starts the same bridge with the session, or `python3 tools/dingcode/linux/dingcode_linux.py bridge`. Nothing else is contacted unless team upload is configured.
 
 ## Configuration / 配置
 
@@ -145,6 +145,7 @@ A shared folder is one directory on a NAS or a synced drive. Each pin is its own
 | `DINGCODE_TEAM_REQUIRE_AUTH` | `1` rejects anonymous upload. The Docker image sets this | off for a local process |
 | `DINGCODE_TEAM_ADMIN_TOKEN` | first admin token. If unset, the process prints one random token once | unset |
 | `DINGCODE_TEAM_ROOT` | SQLite, notes, and screenshots | `~/anno-team` |
+| `DINGCODE_TEAM_CORS_ORIGINS` | server only. Exact origins allowed to call the API from a browser, comma-separated. Unset = no CORS headers, never `*` | unset |
 
 ## Handoff rules
 

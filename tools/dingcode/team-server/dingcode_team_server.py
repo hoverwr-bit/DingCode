@@ -160,6 +160,13 @@ def verification_name(row):
     return ""
 
 
+def cors_origins():
+    raw = env("DINGCODE_TEAM_CORS_ORIGINS", "DINGAI_TEAM_CORS_ORIGINS")
+    if not raw:
+        return set()
+    return {origin.strip() for origin in raw.split(",") if origin.strip()}
+
+
 def root_dir():
     chosen = env("DINGCODE_TEAM_ROOT", "DINGAI_TEAM_ROOT")
     return Path(chosen) if chosen else Path.home() / "anno-team"
@@ -251,9 +258,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed = self._cors_origin()
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(data)
+
+    def _cors_origin(self):
+        # Default: no CORS headers at all (same-origin only; the built-in
+        # board at '/' is served by this server and keeps working).
+        origins = cors_origins()
+        if not origins:
+            return None
+        origin = self.headers.get("Origin", "")
+        return origin if origin in origins else None
 
     def _json(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -276,9 +295,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        allowed = self._cors_origin()
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 
     def do_GET(self):

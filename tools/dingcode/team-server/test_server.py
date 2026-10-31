@@ -17,6 +17,8 @@ class ServerTests(unittest.TestCase):
         os.environ["DINGAI_TEAM_ROOT"] = self._td.name
         os.environ["DINGAI_TEAM_ADMIN_TOKEN"] = "test-admin-token"
         os.environ.pop("DINGAI_TEAM_REQUIRE_AUTH", None)
+        os.environ.pop("DINGCODE_TEAM_CORS_ORIGINS", None)
+        os.environ.pop("DINGAI_TEAM_CORS_ORIGINS", None)
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.port = httpd.server_address[1]
         self.thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -50,6 +52,38 @@ class ServerTests(unittest.TestCase):
             except ValueError:
                 parsed = raw
             return exc.code, parsed
+
+    def resp_headers(self, method, path, origin=None):
+        headers = {"Origin": origin} if origin else {}
+        request = urllib.request.Request(self.base + path, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            return resp.status, resp.headers
+
+    def test_cors_disabled_by_default(self):
+        for method, path in (("GET", "/"), ("POST", "/api/note")):
+            status, headers = self.resp_headers(method, path)
+            self.assertEqual(status, 200)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+        status, headers = self.resp_headers("OPTIONS", "/api/pins", origin="https://board.example.com")
+        self.assertEqual(status, 204)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        self.assertNotIn("Access-Control-Allow-Methods", headers)
+
+    def test_cors_allowlist_echoes_exact_origin_only(self):
+        os.environ["DINGCODE_TEAM_CORS_ORIGINS"] = "https://board.example.com"
+        self.addCleanup(os.environ.pop, "DINGCODE_TEAM_CORS_ORIGINS", None)
+        status, headers = self.resp_headers("GET", "/", origin="https://board.example.com")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://board.example.com")
+        self.assertEqual(headers["Vary"], "Origin")
+        status, headers = self.resp_headers("GET", "/", origin="https://evil.example.com")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        status, headers = self.resp_headers("OPTIONS", "/api/pins", origin="https://board.example.com")
+        self.assertEqual(status, 204)
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://board.example.com")
+        self.assertIn("Authorization, Content-Type", headers["Access-Control-Allow-Headers"])
+        self.assertNotIn("*", headers["Access-Control-Allow-Origin"])
 
     def test_note_becomes_filterable_pins(self):
         code, _ = self.req("POST", "/api/note", {

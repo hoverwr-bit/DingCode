@@ -262,7 +262,7 @@ async function copy(text: string, tag: string) {
         <input
           v-model="bindName"
           type="text"
-          placeholder="应用名或网址，如 Notes 或 http://localhost:8090"
+          placeholder="应用名或网址，如 Notes 或 http://localhost:3000"
           class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1"
         />
         <input

@@ -756,11 +756,11 @@ class RunsApiTests(unittest.TestCase):
         # 绑定键是网址时走 percent-encoding。
         folder2 = os.path.join(self.home, "rules-web")
         os.makedirs(folder2)
-        bind_target("http://localhost:8090", folder2)
-        encoded = "http%3A%2F%2Flocalhost%3A8090"
+        bind_target("http://localhost:3000", folder2)
+        encoded = "http%3A%2F%2Flocalhost%3A3000"
         status, _, _ = self.post_write(
             "/api/projects/%s/rules" % encoded,
-            {**creds, "confirm": "http://localhost:8090", "rules": "- web 规则"})
+            {**creds, "confirm": "http://localhost:3000", "rules": "- web 规则"})
         self.assertEqual(status, 200)
         status, body, _ = self.request("/api/projects/%s/rules" % encoded)
         self.assertEqual(json.loads(body)["rules"], "- web 规则\n")

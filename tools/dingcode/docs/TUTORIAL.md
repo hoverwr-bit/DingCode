@@ -1,6 +1,6 @@
 # DingCode Tutorial / 教程
 
-A hands-on guide for a developer who found this repo. Every command, flag, path, and UI string below is copied from the code and docs in this repository (`README.md`, `tools/dingcode/ARCHITECTURE.md`, `tools/dingcode/docs/PRD.md`, `macos/DingCode.swift`, `core/bridge.py`, `core/runs_api.py`, `handoff.py`, `web/record/src/`). Steps that are implemented but not yet verified on real devices are marked **[Unverified / 未验证]** and collected at the end.
+A hands-on guide for a developer who found this repo. Every command, flag, path, and UI string below is copied from the code and docs in this repository (`README.md`, `tools/dingcode/ARCHITECTURE.md`, `macos/DingCode.swift`, `core/bridge.py`, `core/runs_api.py`, `handoff.py`, `web/record/src/`). Steps that are implemented but not yet verified on real devices are marked **[Unverified / 未验证]** and collected at the end.
 
 本指南面向在 GitHub 上找到本仓库的开发者。所有命令、参数、路径和界面文字都来自仓库里的代码与文档。已实现但未在真机上验证的步骤会标 **[Unverified / 未验证]**，并在文末汇总。
 
@@ -280,7 +280,7 @@ Whole-round revert stays on the CLI: `dingcode revert <session> [round]`. `dingc
 
 - **派活方式** (`dispatch`): 「自动派给 CLI」(`auto`) runs the engine on 完成 when the target is bound; 「复制提示词，我手动派」(`manual`) only copies the handoff prompt.
 - **执行工具** (`engine`): a select with `claude` / `codex`, plus 「自定义命令路径」(`engine_path`) — an absolute path (supports `~`), which must be an **existing file** or the API rejects it (`400 "engine_path must be an existing file"`). Leave empty for the default command.
-- **项目绑定** (`GET`/`POST /api/projects`, `confirm: "projects"`): maps a target (app name or URL, e.g. `http://localhost:8090`) to a code folder. The folder must be an existing absolute directory. The table shows 「目录不存在」/「目录存在」 plus `· git` / `· 非 git 仓库`; rows can be 「编辑」(fills the form back) and 「删除」. Same-name save = update (「更新绑定」).
+- **项目绑定** (`GET`/`POST /api/projects`, `confirm: "projects"`): maps a target (app name or URL, e.g. `http://localhost:3000`) to a code folder. The folder must be an existing absolute directory. The table shows 「目录不存在」/「目录存在」 plus `· git` / `· 非 git 仓库`; rows can be 「编辑」(fills the form back) and 「删除」. Same-name save = update (「更新绑定」).
 - **项目提示规则（handoff-rules.md）**: per-project rules read/written via `GET`/`POST /api/projects/{name}/rules` (`confirm` = project name). Saving an empty string deletes the project file, falling back to the default rules.
 - **记录页地址** (`app_url` from `GET /api/config`) and **端口** (`port`; `0` = default. The hint reads 「0 = 默认端口；改完保存，重启 DingCode 后生效。」).
 
@@ -292,7 +292,7 @@ Whole-round revert stays on the CLI: `dingcode revert <session> [round]`. `dingc
 
 - **派活方式**（`dispatch`）：「自动派给 CLI」（`auto`）——目标已绑定时点完成后直接跑引擎；「复制提示词，我手动派」（`manual`）——只复制交接提示词。
 - **执行工具**（`engine`）：下拉选 `claude` / `codex`，加「自定义命令路径」（`engine_path`）—— 绝对路径（支持 `~`），必须是**已存在的文件**，否则接口拒绝（`400 "engine_path must be an existing file"`）。留空用默认命令。
-- **项目绑定**（`GET`/`POST /api/projects`，`confirm: "projects"`）：把目标（应用名或网址，如 `http://localhost:8090`）映射到代码目录，目录必须是已存在的绝对路径。表格显示「目录不存在」/「目录存在」和 `· git` / `· 非 git 仓库`；每行可「编辑」（填回表单）和「删除」。同名保存即更新（「更新绑定」）。
+- **项目绑定**（`GET`/`POST /api/projects`，`confirm: "projects"`）：把目标（应用名或网址，如 `http://localhost:3000`）映射到代码目录，目录必须是已存在的绝对路径。表格显示「目录不存在」/「目录存在」和 `· git` / `· 非 git 仓库`；每行可「编辑」（填回表单）和「删除」。同名保存即更新（「更新绑定」）。
 - **项目提示规则（handoff-rules.md）**：通过 `GET`/`POST /api/projects/{name}/rules` 读写（`confirm` = 项目名）。存空字符串等于删掉项目文件，落回默认规则。
 - **记录页地址**（`app_url`，来自 `GET /api/config`）和**端口**（`port`；`0` = 默认。提示原文：「0 = 默认端口；改完保存，重启 DingCode 后生效。」）。
 
@@ -308,7 +308,7 @@ Whole-round revert stays on the CLI: `dingcode revert <session> [round]`. `dingc
 - Tray menu items (from `Program.cs`): 「DingCode 开始批注  Ctrl+Alt+A」, 「检查本次改动」, 「导出 GitHub Issue」, 「退出」; double-clicking the tray icon toggles a session.
 - The Windows bridge serves `/ping`, `/pending`, `/answer`, `/voice` on `127.0.0.1:8763` — no `/events`/`/track`, and `/pending` always returns `{"seq": 0, "requests": []}`.
 - Smoke test: `powershell -ExecutionPolicy Bypass -File windows\test-record.ps1 [-Python C:\path\python.exe] [-Port 8764]` — runs the three Python suites (`core\test_runs_api.py`, `core\test_core.py`, `handoff_test.py`), starts `handoff.py bridge --port 8764`, and checks `GET /app/` (looks for `id="app"` and `/app/assets/`) and `GET /api/sessions`. The script sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` because the tests assert Chinese text; it is kept pure ASCII because Windows PowerShell 5.1 reads a BOM-less `.ps1` as ANSI and Chinese comments then break the parser. In your own PowerShell, `chcp 65001` / `$OutputEncoding` matter the same way when piping Chinese output.
-- PRD status: the project compiled with .NET SDK 8.0.425 on a test machine and native `GET /ping` was verified there (F40/F10); the tray and overlay UI are marked 未实测 — nobody has clicked through them on a real Windows device. The native `/pending`/`/answer`/`/voice` trio was not exercised individually either.
+- Windows status: the project compiled with .NET SDK 8.0.425 on a test machine and native `GET /ping` was verified there; the tray and overlay UI are marked 未实测 — nobody has clicked through them on a real Windows device. The native `/pending`/`/answer`/`/voice` trio was not exercised individually either.
 
 **中文**
 
@@ -316,7 +316,7 @@ Whole-round revert stays on the CLI: `dingcode revert <session> [round]`. `dingc
 - 托盘菜单项（来自 `Program.cs`）：「DingCode 开始批注  Ctrl+Alt+A」、「检查本次改动」、「导出 GitHub Issue」、「退出」；双击托盘图标开始/结束一次会话。
 - Windows 桥在 `127.0.0.1:8763` 提供 `/ping`、`/pending`、`/answer`、`/voice` —— 没有 `/events`/`/track`，且 `/pending` 恒返回 `{"seq": 0, "requests": []}`。
 - 冒烟测试：`powershell -ExecutionPolicy Bypass -File windows\test-record.ps1 [-Python C:\path\python.exe] [-Port 8764]` —— 跑三个 Python 套件（`core\test_runs_api.py`、`core\test_core.py`、`handoff_test.py`），启动 `handoff.py bridge --port 8764`，检查 `GET /app/`（找 `id="app"` 和 `/app/assets/`）和 `GET /api/sessions`。脚本设置了 `PYTHONIOENCODING=utf-8` 和 `PYTHONUTF8=1`，因为测试断言中文文本；脚本本身保持纯 ASCII，因为 Windows PowerShell 5.1 会把无 BOM 的 `.ps1` 当 ANSI 读，中文注释会让解析器报错。你自己在 PowerShell 里管道传中文时，`chcp 65001` / `$OutputEncoding` 同理需要注意。
-- PRD 状态：项目在测试机上用 .NET SDK 8.0.425 编译过、原生 `GET /ping` 验证过（F40/F10）；托盘和叠层界面标为未实测 —— 没人在真机上点过。原生 `/pending`/`/answer`/`/voice` 三条也没有逐条打过。
+- Windows 现状：项目在测试机上用 .NET SDK 8.0.425 编译过、原生 `GET /ping` 验证过；托盘和叠层界面标为未实测 —— 没人在真机上点过。原生 `/pending`/`/answer`/`/voice` 三条也没有逐条打过。
 
 ---
 
@@ -344,29 +344,29 @@ Whole-round revert stays on the CLI: `dingcode revert <session> [round]`. `dingc
 
 ## Unverified items / 未验证事项
 
-Marked **[Unverified / 未验证]** above or worth calling out. Source: `docs/PRD.md` (feature table F01–F42, status vocabulary 已实测/已完成/未实测/未做) and what cannot be confirmed from code alone.
+Marked **[Unverified / 未验证]** above or worth calling out. Source: the project's feature status notes (status vocabulary 已实测/已完成/未实测/未做) and what cannot be confirmed from code alone.
 
-上文标注 **[Unverified / 未验证]** 或需要特别说明的事项。依据是 `docs/PRD.md`（功能表 F01–F42，状态词 已实测/已完成/未实测/未做）以及仅凭代码无法确认的部分。
+上文标注 **[Unverified / 未验证]** 或需要特别说明的事项。依据是项目的功能状态记录（状态词 已实测/已完成/未实测/未做）以及仅凭代码无法确认的部分。
 
-1. **macOS overlay, menu-bar icon states, system notifications, and the result window** (确认修好 / 打回并再修 / 打开文件 / 撤回本轮, F01, F16–F18, F29): implemented in `DingCode.swift`, PRD marks them 未实测 — never clicked through on a real Mac.
-   **macOS 叠层、菜单栏图标状态、系统通知、结果窗口**（确认修好 / 打回并再修 / 打开文件 / 撤回本轮，F01、F16–F18、F29）：代码在 `DingCode.swift`，PRD 标未实测。
-2. **The folder picker on the first Send for an unbound target** (F13, partial): the headless bind/auto-fix path is 已实测, the picker UI is not.
-   **未绑定目标第一次发送时弹出的文件夹选择面板**（F13 部分）：无头绑定/自动修复路径已实测，弹窗界面未实测。
-3. **macOS `/app` + `/api` forwarding end-to-end on a real device**: implemented in `DingCode.swift` (forward, 1 MiB / 32 MiB / 16-connection caps, 502/503/504) and covered by Python unit/subprocess tests, but no PRD real-device acceptance of the full `8763 → 8764` path in a browser.
-   **macOS `/app` + `/api` 转发的真机端到端**：转发与上限（1 MiB / 32 MiB / 16 并发、502/503/504）在 `DingCode.swift` 实现，Python 有单测/子进程测试，但没有 PRD 层面在真机浏览器里对 `8763 → 8764` 全链路的验收。
-4. **The record page UI on a real browser** (`web/record`): the API layer is covered by `core/test_runs_api.py` and `dist/` is prebuilt, but the SPA itself (list → detail → edit/rerun/revert flows) has no real-device acceptance record in the PRD (the PRD predates M1–M6).
-   **记录页 UI 的真机浏览**（`web/record`）：API 层有 `core/test_runs_api.py` 覆盖，`dist/` 已预构建，但 SPA 本身（列表 → 详情 → 改批注/重跑/撤回流程）在 PRD 里没有真机验收记录（PRD 早于 M1–M6）。
-5. **Windows tray and overlay UI** (F02): 未实测 — compiled with .NET SDK 8.0.425 and native `GET /ping` verified, the rest not; and the current source has not been re-compiled on that machine after the fixes (F40).
-   **Windows 托盘和叠层界面**（F02）：未实测 —— 用 SDK 8.0.425 编译并验证过 `GET /ping`，其余没有；修复后的源码也未在该机复编（F40）。
-6. **Chrome/Edge extension** (F04/F05): `node --check` passes, never loaded via 「加载已解压」 in a real browser.
-   **Chrome/Edge 扩展**（F04/F05）：`node --check` 通过，没有在真浏览器里「加载已解压」过。
-7. **MCP `initialize`/`tools/list` in Claude Code, Codex, or Cursor's UI** (F24): stdio behavior has unit tests; no "Connected" acceptance in any client UI.
-   **在 Claude Code / Codex / Cursor 界面里确认 MCP 已连接**（F24）：stdio 行为有单测，没有客户端界面的「已连接」验收。
-8. **Linux interactive toolbar on a real desktop** (F03): `linux.test_linux` passes; the toolbar session has not had real-device acceptance.
-   **Linux 交互工具栏在真实桌面上**（F03）：`linux.test_linux` 通过，工具栏会话没有真机验收。
-9. **Voice notes (whisper.cpp) and step-recording keys/buttons** (F26, F27): implemented, never run with a real microphone and model.
-   **语音（whisper.cpp）和步骤录制的按键/按钮**（F26、F27）：已实现，没用真实麦克风和模型跑过。
-10. **Team server deployment per `team-server/DEPLOY.md`** (F35): tests pass in-tree; never deployed to a reachable machine.
-    **团队服务器按 `team-server/DEPLOY.md` 部署**（F35）：树内测试通过，没有部署到可达机器。
+1. **macOS overlay, menu-bar icon states, system notifications, and the result window** (确认修好 / 打回并再修 / 打开文件 / 撤回本轮): implemented in `DingCode.swift`, marked 未实测 in the status notes — never clicked through on a real Mac.
+   **macOS 叠层、菜单栏图标状态、系统通知、结果窗口**（确认修好 / 打回并再修 / 打开文件 / 撤回本轮）：代码在 `DingCode.swift`，状态记录标为未实测。
+2. **The folder picker on the first Send for an unbound target** (picker UI only): the headless bind/auto-fix path is 已实测, the picker UI is not.
+   **未绑定目标第一次发送时弹出的文件夹选择面板**（仅弹窗界面部分）：无头绑定/自动修复路径已实测，弹窗界面未实测。
+3. **macOS `/app` + `/api` forwarding end-to-end on a real device**: implemented in `DingCode.swift` (forward, 1 MiB / 32 MiB / 16-connection caps, 502/503/504) and covered by Python unit/subprocess tests, but no real-device acceptance of the full `8763 → 8764` path in a browser.
+   **macOS `/app` + `/api` 转发的真机端到端**：转发与上限（1 MiB / 32 MiB / 16 并发、502/503/504）在 `DingCode.swift` 实现，Python 有单测/子进程测试，但没有在真机浏览器里对 `8763 → 8764` 全链路的验收。
+4. **The record page UI on a real browser** (`web/record`): the API layer is covered by `core/test_runs_api.py` and `dist/` is prebuilt, but the SPA itself (list → detail → edit/rerun/revert flows) has no real-device acceptance record.
+   **记录页 UI 的真机浏览**（`web/record`）：API 层有 `core/test_runs_api.py` 覆盖，`dist/` 已预构建，但 SPA 本身（列表 → 详情 → 改批注/重跑/撤回流程）没有真机验收记录。
+5. **Windows tray and overlay UI**: 未实测 — compiled with .NET SDK 8.0.425 and native `GET /ping` verified, the rest not; and the current source has not been re-compiled on that machine after the fixes.
+   **Windows 托盘和叠层界面**：未实测 —— 用 SDK 8.0.425 编译并验证过 `GET /ping`，其余没有；修复后的源码也未在该机复编。
+6. **Chrome/Edge extension**: `node --check` passes, never loaded via 「加载已解压」 in a real browser.
+   **Chrome/Edge 扩展**：`node --check` 通过，没有在真浏览器里「加载已解压」过。
+7. **MCP `initialize`/`tools/list` in Claude Code, Codex, or Cursor's UI**: stdio behavior has unit tests; no "Connected" acceptance in any client UI.
+   **在 Claude Code / Codex / Cursor 界面里确认 MCP 已连接**：stdio 行为有单测，没有客户端界面的「已连接」验收。
+8. **Linux interactive toolbar on a real desktop**: `linux.test_linux` passes; the toolbar session has not had real-device acceptance.
+   **Linux 交互工具栏在真实桌面上**：`linux.test_linux` 通过，工具栏会话没有真机验收。
+9. **Voice notes (whisper.cpp) and step-recording keys/buttons**: implemented, never run with a real microphone and model.
+   **语音（whisper.cpp）和步骤录制的按键/按钮**：已实现，没用真实麦克风和模型跑过。
+10. **Team server deployment per `team-server/DEPLOY.md`**: tests pass in-tree; never deployed to a reachable machine.
+    **团队服务器按 `team-server/DEPLOY.md` 部署**：树内测试通过，没有部署到可达机器。
 11. **The step-by-step commands in this tutorial were not each executed end-to-end** — before publishing, the three Python suites (`core/test_runs_api.py`, `core/test_core.py`, `handoff_test.py`) were run and passed (39 and 18 tests; `handoff_test.py` exit 0), but the remaining commands (building the apps, UI flows) were not run individually; all commands are taken from the sources named throughout (`build.sh`, `handoff.py`, `bridge.py`, `runs_api.py`, the Vue sources, and the scripts).
     **本教程的分步命令未逐条端到端执行** —— 发布前已运行并通过三个 Python 套件（`core/test_runs_api.py`、`core/test_core.py`、`handoff_test.py`，分别为 39、18 个测试，`handoff_test.py` 退出码 0），其余命令（构建应用、界面流程）未逐条运行；所有命令均取自文中所注来源（`build.sh`、`handoff.py`、`bridge.py`、`runs_api.py`、Vue 源码和脚本）。

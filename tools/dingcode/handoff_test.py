@@ -267,13 +267,13 @@ class AutofixTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_binding_lookup(self):
-        folder = os.path.join(self.home, "personal-hub")
+        folder = os.path.join(self.home, "my-project")
         os.makedirs(folder)
-        key = handoff.bind_target("http://localhost:8090/hub", folder)
-        self.assertEqual(key, "http://localhost:8090")
-        self.assertEqual(handoff.lookup_binding("http://localhost:8090/other"), folder)
-        web = {"pins": [{"page": {"url": "http://localhost:8090/a"}}], "window": {"title": "Browser"}, "app": {"name": "Safari"}}
-        self.assertEqual(handoff.note_target(web), "http://localhost:8090")
+        key = handoff.bind_target("http://localhost:3000/hub", folder)
+        self.assertEqual(key, "http://localhost:3000")
+        self.assertEqual(handoff.lookup_binding("http://localhost:3000/other"), folder)
+        web = {"pins": [{"page": {"url": "http://localhost:3000/a"}}], "window": {"title": "Browser"}, "app": {"name": "Safari"}}
+        self.assertEqual(handoff.note_target(web), "http://localhost:3000")
         self.assertEqual(handoff.lookup_binding(handoff.note_target(web)), folder)
         notes = os.path.join(self.home, "NotesApp")
         os.makedirs(notes)
@@ -283,7 +283,7 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(handoff.note_target({"pins": [], "app": {"name": "Xcode"}}), "Xcode")
         self.assertEqual(handoff.lookup_binding("http://127.0.0.1:1"), "")
 
-    def _gate_note(self, name, url="http://localhost:8090/app"):
+    def _gate_note(self, name, url="http://localhost:3000/app"):
         notes = os.path.join(self.home, "gate-notes")
         os.makedirs(notes, exist_ok=True)
         path = os.path.join(notes, name + ".json")
@@ -296,7 +296,7 @@ class AutofixTests(unittest.TestCase):
         # M6 首次判定：config.json 没有 setup_done 时 auto 派活不启动。
         folder = os.path.join(self.home, "gate-hub")
         os.makedirs(folder)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         handoff.save_config({"dispatch": "auto", "setup_done": False})
         note_path = self._gate_note("anno-gate")
         code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"])
@@ -314,7 +314,7 @@ class AutofixTests(unittest.TestCase):
         # M6 手动派活：只生成提示词并记录，不启动任何 CLI。
         folder = os.path.join(self.home, "manual-hub")
         os.makedirs(folder)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         handoff.save_config({"dispatch": "manual", "setup_done": True})
         note_path = self._gate_note("anno-manual")
         code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"])
@@ -480,17 +480,17 @@ class AutofixTests(unittest.TestCase):
         self.assertLess(codex.index("--"), len(codex) - 1)
 
     def test_status_file(self):
-        folder = os.path.join(self.home, "personal-hub")
+        folder = os.path.join(self.home, "my-project")
         notes = os.path.join(self.home, "notes")
         os.makedirs(folder)
         os.makedirs(notes)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         note_path = os.path.join(notes, "anno-1.json")
         note = {
             "screenshot": "anno.png",
             "pins": [
-                {"id": 1, "status": "confirmed", "note": "UNIQUE-CONFIRMED", "page": {"url": "http://localhost:8090/old"}},
-                {"id": 2, "status": "open", "note": "UNIQUE-OPEN", "page": {"url": "http://localhost:8090/app"}},
+                {"id": 1, "status": "confirmed", "note": "UNIQUE-CONFIRMED", "page": {"url": "http://localhost:3000/old"}},
+                {"id": 2, "status": "open", "note": "UNIQUE-OPEN", "page": {"url": "http://localhost:3000/app"}},
             ],
         }
         with open(note_path, "w", encoding="utf-8") as fh:
@@ -502,7 +502,7 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(status["round"], 1)
         self.assertEqual(status["engine"], "claude")
         self.assertEqual(status["folder"], folder)
-        self.assertEqual(status["target"], "http://localhost:8090")
+        self.assertEqual(status["target"], "http://localhost:3000")
         run = handoff.run_dir("anno-1")
         self.assertTrue(os.path.isfile(os.path.join(run, "log.txt")))
         with open(os.path.join(run, "log.txt"), encoding="utf-8") as fh:
@@ -527,12 +527,12 @@ class AutofixTests(unittest.TestCase):
         notes = os.path.join(self.home, "pin-notes")
         os.makedirs(folder)
         os.makedirs(notes)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         note_path = os.path.join(notes, "anno-pin.json")
         with open(note_path, "w", encoding="utf-8") as fh:
             json.dump({"pins": [
                 {"id": 1, "status": "open", "note": "fix me",
-                 "page": {"url": "http://localhost:8090/app"}},
+                 "page": {"url": "http://localhost:3000/app"}},
             ]}, fh)
         self.assertEqual(
             handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"]), 0)
@@ -569,7 +569,7 @@ class AutofixTests(unittest.TestCase):
         with open(note_path, "w", encoding="utf-8") as fh:
             json.dump({"pins": [
                 {"id": 1, "status": "confirmed", "note": "done",
-                 "page": {"url": "http://localhost:8090/app"}},
+                 "page": {"url": "http://localhost:3000/app"}},
             ]}, fh)
         code = handoff.autofix_main(
             ["handoff.py", "autofix", note_path, "--round", "6", "--pin", "1"])
@@ -614,13 +614,13 @@ class AutofixTests(unittest.TestCase):
                      "printf '%s\\n' '{\"pins\":[{\"id\":\"2\",\"status\":\"fixed\",\"summary_zh\":\"改了 src/a.txt 第1行\",\"files\":[\"src/a.txt\"]},{\"id\":\"3\",\"status\":\"not-fixed\",\"summary_zh\":\"没动到这颗钉子\",\"files\":[]}]}'\n")
         os.chmod(script, 0o755)
         os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         notes = os.path.join(self.home, "notes")
         os.makedirs(notes, exist_ok=True)
         note_path = os.path.join(notes, "anno-3.json")
         with open(note_path, "w", encoding="utf-8") as fh:
             json.dump({"pins": [
-                {"id": 2, "page": {"url": "http://localhost:8090/a"}},
+                {"id": 2, "page": {"url": "http://localhost:3000/a"}},
                 {"id": 3, "note": "leave"},
             ]}, fh)
         code = handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"])
@@ -669,12 +669,12 @@ class AutofixTests(unittest.TestCase):
                      "printf '%s\\n' '{\"pins\":[{\"id\":\"1\",\"status\":\"fixed\",\"summary_zh\":\"改了\",\"files\":[\"local.txt\"]}]}'\n")
         os.chmod(script, 0o755)
         os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         notes = os.path.join(self.home, "notes")
         os.makedirs(notes, exist_ok=True)
         note_path = os.path.join(notes, "anno-out.json")
         with open(note_path, "w", encoding="utf-8") as fh:
-            json.dump({"pins": [{"id": 1, "note": "n", "page": {"url": "http://localhost:8090/a"}}]}, fh)
+            json.dump({"pins": [{"id": 1, "note": "n", "page": {"url": "http://localhost:3000/a"}}]}, fh)
         code = handoff.autofix_main(["handoff.py", "autofix", note_path])
         self.assertEqual(code, 1)
         status = handoff.read_run_status("anno-out")
@@ -711,12 +711,12 @@ class AutofixTests(unittest.TestCase):
                      "printf '%s\\n' '{\"pins\":[{\"id\":\"2\",\"status\":\"fixed\",\"summary_zh\":\"改了 src/a.txt 第1行\",\"files\":[\"src/a.txt\"]}]}'\n")
         os.chmod(script, 0o755)
         os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
-        handoff.bind_target("http://localhost:8090", folder)
+        handoff.bind_target("http://localhost:3000", folder)
         notes = os.path.join(self.home, "notes")
         os.makedirs(notes, exist_ok=True)
         note_path = os.path.join(notes, "anno-alias.json")
         with open(note_path, "w", encoding="utf-8") as fh:
-            json.dump({"pins": [{"id": 2, "page": {"url": "http://localhost:8090/a"}}]}, fh)
+            json.dump({"pins": [{"id": 2, "page": {"url": "http://localhost:3000/a"}}]}, fh)
         self.assertEqual(handoff.autofix_main(["handoff.py", "autofix", note_path]), 0)
         summary = handoff.load_round_summary("anno-alias", 1)
         self.assertIn("+new", summary[0]["diff"])
@@ -733,7 +733,7 @@ class AutofixTests(unittest.TestCase):
         os.chmod(script, 0o755)
         note_path = os.path.join(notes, "anno-alias-out.json")
         with open(note_path, "w", encoding="utf-8") as fh:
-            json.dump({"pins": [{"id": 2, "page": {"url": "http://localhost:8090/a"}}]}, fh)
+            json.dump({"pins": [{"id": 2, "page": {"url": "http://localhost:3000/a"}}]}, fh)
         self.assertEqual(handoff.autofix_main(["handoff.py", "autofix", note_path, "--round", "1"]), 1)
         status = handoff.read_run_status("anno-alias-out")
         self.assertEqual(status["status"], "failed")
@@ -792,14 +792,14 @@ class PinRevertTests(unittest.TestCase):
         os.chmod(script, 0o755)
 
     def note_for(self, name):
-        handoff.bind_target("http://localhost:8090", os.path.join(self.home, "repo"))
+        handoff.bind_target("http://localhost:3000", os.path.join(self.home, "repo"))
         notes = os.path.join(self.home, "notes")
         os.makedirs(notes, exist_ok=True)
         note_path = os.path.join(notes, name + ".json")
         with open(note_path, "w", encoding="utf-8") as fh:
             json.dump({"pins": [
-                {"id": 1, "status": "open", "note": "改第 2 行", "page": {"url": "http://localhost:8090/a"}},
-                {"id": 2, "status": "open", "note": "动末尾", "page": {"url": "http://localhost:8090/a"}},
+                {"id": 1, "status": "open", "note": "改第 2 行", "page": {"url": "http://localhost:3000/a"}},
+                {"id": 2, "status": "open", "note": "动末尾", "page": {"url": "http://localhost:3000/a"}},
             ]}, fh)
         return note_path
 

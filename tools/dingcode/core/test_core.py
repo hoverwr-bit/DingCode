@@ -417,7 +417,7 @@ class BridgeOriginTests(unittest.TestCase):
         dot = os.path.join(self.tmp.name, ".dingcode")
         os.makedirs(dot)
         with open(os.path.join(dot, "projects.json"), "w", encoding="utf-8") as fh:
-            json.dump({"bindings": {"http://localhost:8090": self.tmp.name}}, fh)
+            json.dump({"bindings": {"http://localhost:3000": self.tmp.name}}, fh)
 
     def tearDown(self):
         for key, value in self.saved.items():
@@ -430,14 +430,14 @@ class BridgeOriginTests(unittest.TestCase):
     def test_allowlist_rejects_an_external_origin(self):
         from core.bridge import allowed_origins, classify_origin
         allow = allowed_origins()
-        self.assertIn("http://localhost:8090", allow)
+        self.assertIn("http://localhost:3000", allow)
         self.assertEqual(classify_origin(None, allow), ("cli", None))
         self.assertEqual(classify_origin("", allow)[0], "deny")
         self.assertEqual(classify_origin("null", allow)[0], "deny")
         self.assertEqual(classify_origin("https://evil.example", allow)[0], "deny")
-        self.assertEqual(classify_origin("http://localhost:8090\r\nX: 1", allow)[0], "deny")
-        kind, echo = classify_origin("http://localhost:8090", allow)
-        self.assertEqual((kind, echo), ("allow", "http://localhost:8090"))
+        self.assertEqual(classify_origin("http://localhost:3000\r\nX: 1", allow)[0], "deny")
+        kind, echo = classify_origin("http://localhost:3000", allow)
+        self.assertEqual((kind, echo), ("allow", "http://localhost:3000"))
         self.assertEqual(classify_origin("chrome-extension://" + ("a" * 32), allow)[0], "allow")
         self.assertEqual(classify_origin("chrome-extension://" + ("b" * 32), allow)[0], "deny")
 
@@ -475,11 +475,11 @@ class BridgeOriginTests(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", headers)
         self.assertNotIn("access-control-allow-private-network", headers)
 
-        status, body, headers = request("GET", "/ping", {"Origin": "http://localhost:8090"})
+        status, body, headers = request("GET", "/ping", {"Origin": "http://localhost:3000"})
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertTrue(payload.get("token"))
-        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:8090")
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:3000")
         self.assertEqual(headers.get("access-control-allow-private-network"), "true")
         self.assertNotEqual(headers.get("access-control-allow-origin"), "*")
         token = payload["token"]
@@ -493,16 +493,16 @@ class BridgeOriginTests(unittest.TestCase):
         self.assertNotIn("access-control-allow-origin", headers)
 
         status, body, _headers = request(
-            "POST", "/voice?token=%s" % token, {"Origin": "http://localhost:8090"}, b"clip")
+            "POST", "/voice?token=%s" % token, {"Origin": "http://localhost:3000"}, b"clip")
         self.assertEqual(status, 403)
         self.assertNotIn(token.encode("ascii"), body)
 
         status, body, headers = request(
             "POST", "/voice?client=%s&token=%s" % (client, token),
-            {"Origin": "http://localhost:8090"}, b"clip")
+            {"Origin": "http://localhost:3000"}, b"clip")
         self.assertEqual(status, 200)
         self.assertNotIn(token.encode("ascii"), body)
-        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:8090")
+        self.assertEqual(headers.get("access-control-allow-origin"), "http://localhost:3000")
 
         status, body, headers = request("GET", "/ping")
         self.assertEqual(status, 200)
