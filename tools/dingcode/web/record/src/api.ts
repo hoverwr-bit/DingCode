@@ -143,6 +143,30 @@ export class ApiError extends Error {
   }
 }
 
+/** 用户对某个 engine 的覆盖（GET/POST /api/config 的 engines 字段）。 */
+export interface EngineOverride {
+  command?: string | string[];
+  args?: string[];
+  prompt_template?: string;
+  timeout_sec?: number;
+}
+
+/** /api/config 的 engine_catalog 里的一项；default_* 是出厂值，自定义 engine 为 null。 */
+export interface EngineRow {
+  name: string;
+  hidden: boolean;
+  risk: string;
+  custom: boolean;
+  command: string | string[];
+  args: string[];
+  prompt_template: string;
+  timeout_sec: number;
+  default_command: string | string[] | null;
+  default_args: string[] | null;
+  default_prompt_template: string | null;
+  default_timeout_sec: number | null;
+}
+
 export interface AppConfig {
   ok: boolean;
   engine: string;
@@ -152,6 +176,8 @@ export interface AppConfig {
   engine_path: string;
   port: number;
   app_url?: string;
+  engines?: Record<string, EngineOverride>;
+  engine_catalog?: EngineRow[];
 }
 
 /** 项目绑定表的一行（M6 设置页）。exists/is_git 是后端实时探测的目录状态。 */
@@ -187,7 +213,7 @@ export const api = {
     get_json<PinHistory>(`/api/runs/${sid}/pins/${pid}`),
   config: () => get_json<AppConfig>("/api/config"),
   /** 保存设置（M6）：patch 里的字段会写进 config.json；setup_done: true 结束首次引导。 */
-  saveConfig: (patch: Partial<Omit<AppConfig, "ok" | "app_url">>) =>
+  saveConfig: (patch: Partial<Omit<AppConfig, "ok" | "app_url" | "engine_catalog">>) =>
     post_json<AppConfig>("/api/config", { ...patch, confirm: "config" }),
   projects: () =>
     get_json<{ ok: boolean; projects: ProjectRow[] }>("/api/projects"),

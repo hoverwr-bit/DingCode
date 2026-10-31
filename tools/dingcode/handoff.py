@@ -30,7 +30,7 @@ this script is the CLI and the MCP server (no other component of DingCode speaks
   python3 handoff.py mcp                    # stdio MCP: newline-delimited JSON, or Content-Length
   python3 handoff.py bind <target> <folder>
   python3 handoff.py bindings
-  python3 handoff.py config engine claude|codex
+  python3 handoff.py config engine claude|codex|pi|cursor|gemini|kimi|<custom>
   python3 handoff.py config auto on|off
   python3 handoff.py autofix <note.json|session> [--round N] [--feedback text] [--pin id] [--per-pin]
   python3 handoff.py result <session>
@@ -45,6 +45,7 @@ import ntpath
 import re
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -957,7 +958,8 @@ def load_config():
     （auto=false 等价 manual）。port=0 表示用默认端口。
     """
     data = _read_json(config_path(), {})
-    engine = data.get("engine") if data.get("engine") in ("claude", "codex") else "claude"
+    engines = sanitize_engines(data.get("engines"))
+    engine = data.get("engine") if data.get("engine") in resolve_engines(engines) else "claude"
     if data.get("dispatch") in ("auto", "manual"):
         dispatch = data["dispatch"]
     else:
@@ -974,6 +976,7 @@ def load_config():
         "engine_path": str(data.get("engine_path") or ""),
         "port": port if 1 <= port <= 65535 else 0,
         "extension_id": str(data.get("extension_id") or ""),
+        "engines": engines,
     }
 
 
@@ -1010,7 +1013,7 @@ def auto_enabled():
 
 
 def set_engine(name):
-    if name not in ("claude", "codex"):
+    if name not in resolve_engines(load_config()["engines"]):
         return False
     cfg = load_auto_config()
     save_auto_config(name, cfg["auto"])
@@ -1214,27 +1217,191 @@ def engine_prompt(prompt):
     return "DingCode task:\n" + text
 
 
-def engine_command(engine, prompt, folder, engine_path=""):
-    """CLI argv（不经 shell）。engine_path 是设置页的自定义命令路径（如 ~/bin/claude-safe），
-    为空时按 engine 名在 PATH 里找。参数沿用所选 engine 的一套。"""
-    body = engine_prompt(prompt)
-    binary = find_binary(os.path.expanduser(engine_path)) if engine_path else find_binary(engine)
-    if engine == "codex":
-        return [
-            binary, "exec",
+# Engine 预设：engine_command() 从这里取 argv，不再写死 claude/codex。
+# 所有预设必须用纯文本输出——parse_pin_summary 从日志里找 JSON，
+# 喂 stream-json/json 之类的输出格式会毁掉解析（需实测每家的输出格式）。
+# 字段：command（str，或 str 列表=按顺序找第一个真实存在的备选名）、
+#       args（argv 列表，不经 shell；{prompt} 换最终提示词、{folder} 换绑定目录；
+#       args 里没有 {prompt} 元素时提示词追加在最后）、
+#       prompt_template（默认 "{prompt}"）、timeout_sec（默认 1800，0=不限）、
+#       hidden（默认 False）、risk（默认空=无风险提示）。
+ENGINE_PRESETS = {
+    "claude": {
+        "command": "claude",
+        "args": [
+            "-p",
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Read,Edit,Write,Glob,Grep",
+            "--disallowedTools", "Bash,WebFetch,WebSearch",
+            "--",
+            "{prompt}",
+        ],
+        "risk": "",
+    },
+    "codex": {
+        "command": "codex",
+        "args": [
+            "exec",
             "--sandbox", "workspace-write",
             "-c", "sandbox_workspace_write.network_access=false",
             "--",
-            body,
-        ], folder
-    return [
-        binary, "-p",
-        "--permission-mode", "acceptEdits",
-        "--allowedTools", "Read,Edit,Write,Glob,Grep",
-        "--disallowedTools", "Bash,WebFetch,WebSearch",
-        "--",
-        body,
-    ], folder
+            "{prompt}",
+        ],
+        "risk": "",
+    },
+    # 需实测：确认本机 pi 是 earendil-works/pi（pi --version）；
+    # 白名单工具名以官方文档
+    # https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/cli.md
+    # 为准。
+    "pi": {
+        "command": "pi",
+        "args": ["-p", "--tools", "read,edit,write,grep,find,ls", "--", "{prompt}"],
+        "risk": "pi 没有权限弹窗和沙箱，只靠 --tools 白名单去掉了 bash；"
+                "无目录限制，改动只由 DingCode 事后检查兜底",
+    },
+    # 需实测；文档 https://cursor.com/docs/cli/reference/parameters 、
+    # https://cursor.com/docs/reference/sandbox 。
+    "cursor": {
+        "command": ["agent", "cursor-agent"],
+        "args": ["-p", "--force", "--sandbox", "enabled", "--trust",
+                 "--output-format", "text", "{prompt}"],
+        "risk": "Cursor 的 -p 带 --force 才会改文件；依赖其沙箱限制命令与网络，"
+                "沙箱在 print 模式是否生效需实测",
+    },
+    # 需实测；文档 https://geminicli.com/docs/cli/headless/ 、
+    # https://geminicli.com/docs/reference/policy-engine/ 。
+    # 是否需要 --skip-trust 也需实测，先不加。
+    "gemini": {
+        "command": "gemini",
+        "args": ["-p", "{prompt}", "--approval-mode", "auto_edit",
+                 "--output-format", "text"],
+        "risk": "Gemini 用 auto_edit，非交互时 shell 预期被拒绝但需实测；命令行里无法禁网",
+    },
+    # 需实测——新旧版本对 --print/-p 写法不同（旧：--print -p；新：-p），
+    # --final-message-only 在本机版本是否存在需实测；
+    # 文档 https://www.kimi.com/code/docs/en/kimi-code-cli/reference/kimi-command 。
+    "kimi": {
+        "command": "kimi",
+        "args": ["--print", "--final-message-only", "-p", "{prompt}"],
+        "hidden": True,
+        "risk": "Kimi -p 自动批准所有工具调用，命令行里无法禁 shell/禁网/限目录；默认隐藏",
+    },
+}
+
+ENGINE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def sanitize_engines(raw):
+    """用户 config 里 engines 的白名单式清洗：类型/长度不对的键直接丢弃（宽松，不抛异常）。
+
+    hidden/risk 不接受用户覆盖（risk 是 DingCode 的安全说明，hidden 属于展示层）。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for name, item in raw.items():
+        if not isinstance(name, str) or not ENGINE_NAME_RE.match(name):
+            continue
+        if not isinstance(item, dict):
+            continue
+        row = {}
+        command = item.get("command")
+        if isinstance(command, str) and command and len(command) <= 500:
+            row["command"] = command
+        elif (isinstance(command, list) and 0 < len(command) <= 4
+                and all(isinstance(x, str) and x and len(x) <= 500 for x in command)):
+            row["command"] = list(command)
+        args = item.get("args")
+        if (isinstance(args, list) and 0 < len(args) <= 64
+                and all(isinstance(x, str) and len(x) <= 500 for x in args)):
+            row["args"] = list(args)
+        template = item.get("prompt_template")
+        if isinstance(template, str) and len(template) <= 8000:
+            row["prompt_template"] = template
+        timeout = item.get("timeout_sec")
+        if isinstance(timeout, int) and not isinstance(timeout, bool) and 0 <= timeout <= 86400:
+            row["timeout_sec"] = timeout
+        if row:
+            cleaned[name] = row
+    return cleaned
+
+
+def resolve_engines(user_engines):
+    """预设 ∪ 用户自定义的完整 engine 表。预设名的覆盖按「键」替换：用户给了的键
+    （command/args/prompt_template/timeout_sec）整个替换该键的值（列表不逐元素合并），
+    没给的键沿用预设；hidden 与 risk 永远来自预设。
+
+    名字不在预设里的是自定义 engine：必须同时有 command 和 args 才保留，
+    并带 custom=True、统一的风险提示与各默认字段。
+    """
+    merged = {}
+    for name, preset in ENGINE_PRESETS.items():
+        row = dict(preset)
+        row.setdefault("prompt_template", "{prompt}")
+        row.setdefault("timeout_sec", 1800)
+        row.setdefault("hidden", False)
+        row.setdefault("risk", "")
+        merged[name] = row
+    for name, row in sanitize_engines(user_engines).items():
+        if name in ENGINE_PRESETS:
+            # 按键替换：merge 进已补默认字段的预设行，缺的键沿用预设。
+            merged[name].update(row)
+            continue
+        row = dict(row)
+        row.setdefault("prompt_template", "{prompt}")
+        row.setdefault("timeout_sec", 1800)
+        if not row.get("command") or not row.get("args"):
+            continue
+        row["hidden"] = False
+        row["risk"] = "自定义命令，DingCode 不限制它能做什么，改动只由事后检查兜底"
+        row["custom"] = True
+        merged[name] = row
+    return merged
+
+
+def engine_command(engine, prompt, folder, engine_path="", engines=None):
+    """CLI argv（不经 shell）。engine_path 是设置页的自定义命令路径（如 ~/bin/claude-safe），
+    为空时按 preset 的 command 在 PATH 里找（command 是列表时依次找，用第一个真实存在的）。
+    engines 是 load_config()["engines"]（用户覆盖），None 表示只用内置预设。
+    未知/残缺的 engine 名回落 claude。"""
+    conf = resolve_engines(engines).get(engine)
+    if not isinstance(conf, dict) or not conf.get("command") or not isinstance(conf.get("args"), list):
+        conf = dict(ENGINE_PRESETS["claude"])
+        conf.setdefault("prompt_template", "{prompt}")
+    text = "" if prompt is None else str(prompt)
+    body = engine_prompt(str(conf["prompt_template"]).replace("{prompt}", text))
+    if engine_path:
+        binary = find_binary(os.path.expanduser(engine_path))
+    else:
+        command = conf["command"]
+        binary = command[0] if isinstance(command, list) and command else command
+        if isinstance(command, list):
+            for candidate in command:
+                found = find_binary(candidate)
+                if os.path.sep in found or (os.path.altsep and os.path.altsep in found) or os.path.isfile(found):
+                    binary = found
+                    break
+        else:
+            binary = find_binary(command)
+    argv = [binary]
+    has_prompt = False
+    for item in conf["args"]:
+        if item == "{prompt}":
+            has_prompt = True
+        argv.append(item.replace("{prompt}", body).replace("{folder}", folder))
+    if not has_prompt:
+        argv.append(body)
+    return argv, folder
+
+
+def engine_timeout(engine, engines=None):
+    """该 engine 的超时秒数（默认 1800，0=不限）。"""
+    conf = resolve_engines(engines).get(engine)
+    if isinstance(conf, dict):
+        timeout = conf.get("timeout_sec")
+        if isinstance(timeout, int) and not isinstance(timeout, bool):
+            return timeout
+    return 1800
 
 
 def run_dir(session):
@@ -2259,11 +2426,24 @@ def revert_pin(session, pid):
             "round": target, "session": session}
 
 
-def run_engine(cmd, cwd, log_path):
+def run_engine(cmd, cwd, log_path, timeout=None):
+    """跑 engine 子进程并把输出追加进日志。timeout=None 或 0 表示不限时。
+
+    超时：POSIX 给整个进程组发 SIGTERM（start_new_session 让子进程独立成组），
+    等 5 秒还在再 SIGKILL；Windows 用 taskkill /T /F。日志里提示词被遮蔽。
+    """
     with open(log_path, "a", encoding="utf-8") as log:
         shown = list(cmd)
         if shown:
-            shown[-1] = "<prompt %d chars>" % len(str(cmd[-1]))
+            masked = ""
+            for item in cmd:
+                text = str(item)
+                if text.startswith("DingCode task:") and len(text) > len(masked):
+                    masked = text
+            if masked:
+                shown[cmd.index(masked)] = "<prompt %d chars>" % len(masked)
+            else:
+                shown[-1] = "<prompt %d chars>" % len(str(cmd[-1]))
         log.write("cwd %s\n" % cwd)
         log.write("cmd %s\n" % json.dumps(shown, ensure_ascii=False))
         log.flush()
@@ -2271,12 +2451,44 @@ def run_engine(cmd, cwd, log_path):
             log.write("dry-run\n")
             return 0
         try:
-            proc = subprocess.run(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, text=True)
+            if os.name == "posix":
+                proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                                        text=True, start_new_session=True)
+            else:
+                proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                                        text=True,
+                                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         except OSError as exc:
             log.write("error %s\n" % exc)
             return 1
-        log.write("exit %s\n" % proc.returncode)
-        return proc.returncode
+        try:
+            returncode = proc.wait(timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            log.write("timeout %s\n" % timeout)
+            log.flush()
+            if os.name == "posix":
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                                   stdout=log, stderr=subprocess.STDOUT)
+                except Exception:
+                    pass
+            proc.wait()
+            log.write("exit 124\n")
+            return 124
+        log.write("exit %s\n" % returncode)
+        return returncode
 
 
 def autofix_per_pin(note_path, session):
@@ -2460,7 +2672,7 @@ def autofix_main(argv):
     shots = screenshot_paths(note, note_path)
     text = json.dumps(kept, ensure_ascii=False, indent=2)
     prompt = build_autofix_prompt(text, folder, shots, feedback, rules=load_rules_for(folder))
-    cmd, cwd = engine_command(engine, prompt, folder, cfg["engine_path"])
+    cmd, cwd = engine_command(engine, prompt, folder, cfg["engine_path"], cfg["engines"])
     folder_run = run_dir(session)
     os.makedirs(folder_run, exist_ok=True)
     with open(os.path.join(folder_run, "prompt.md"), "w", encoding="utf-8", newline="\n") as fh:
@@ -2481,7 +2693,8 @@ def autofix_main(argv):
         meta = snapshot_before(folder, round_dest)
     except Exception:
         meta = {"kind": "none", "folder": folder}
-    code = run_engine(cmd, cwd, os.path.join(folder_run, "log.txt"))
+    code = run_engine(cmd, cwd, os.path.join(folder_run, "log.txt"),
+                      engine_timeout(engine, cfg["engines"]))
     try:
         outside, git_rels = outside_changes(folder, round_dest, meta)
     except Exception:
@@ -2549,7 +2762,7 @@ def config_main(argv):
         return 0
     if len(argv) >= 4 and argv[2] == "engine":
         if not set_engine(argv[3]):
-            sys.stderr.write("engine must be claude or codex\n")
+            sys.stderr.write("engine must be claude|codex|pi|cursor|gemini|kimi or a custom name\n")
             return 2
         sys.stdout.write(json.dumps(load_auto_config()) + "\n")
         return 0
@@ -2561,7 +2774,7 @@ def config_main(argv):
         set_auto(word in ("on", "1", "true"))
         sys.stdout.write(json.dumps(load_auto_config()) + "\n")
         return 0
-    sys.stderr.write("usage: handoff.py config [engine claude|codex | auto on|off]\n")
+    sys.stderr.write("usage: handoff.py config [engine claude|codex|pi|cursor|gemini|kimi|<custom> | auto on|off]\n")
     return 2
 
 

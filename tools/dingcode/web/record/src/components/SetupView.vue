@@ -3,6 +3,8 @@ import { computed, onMounted, ref } from "vue";
 import {
   api,
   type AppConfig,
+  type EngineOverride,
+  type EngineRow,
   type ProjectRow,
   type ProjectRules,
 } from "../api";
@@ -18,6 +20,25 @@ const port = ref(0);
 const saving = ref(false);
 const saveError = ref("");
 const saved = ref(false);
+
+// b2) engine 目录与覆盖（本地编辑，随「保存设置」一起提交；engines 整体替换）
+const catalog = ref<EngineRow[]>([]);
+const savedEngine = ref("");
+const savedEngines = ref<Record<string, EngineOverride>>({});
+interface EngineEdit {
+  command: string; // 自定义 engine 的可编辑命令；预设里是只读展示文本
+  commandRaw: string | string[]; // 预设的原始命令，用来和 default_command 比较
+  args: string;
+  timeout_sec: number;
+  prompt_template: string;
+}
+const edits = ref<Record<string, EngineEdit>>({});
+const addedCustom = ref<string[]>([]);
+const riskAck = ref(false);
+const newName = ref("");
+const newCommand = ref("");
+const newArgs = ref("");
+const newEngineError = ref("");
 
 // c) 项目绑定表
 const projects = ref<ProjectRow[]>([]);
@@ -48,6 +69,11 @@ async function load() {
     engine.value = cfg.engine;
     enginePath.value = cfg.engine_path || "";
     port.value = cfg.port || 0;
+    savedEngine.value = cfg.engine;
+    savedEngines.value = cfg.engines || {};
+    catalog.value = cfg.engine_catalog || [];
+    // 给目录里的每个 engine 建本地编辑副本（已含保存过的覆盖）。
+    for (const r of catalog.value) edits.value[r.name] = toEdit(r.name);
   }
   try {
     projects.value = (await api.projects()).projects || [];
@@ -56,10 +82,207 @@ async function load() {
   }
 }
 
+// ---- b2) engine 目录与覆盖 ----
+function row(name: string): EngineRow | undefined {
+  return catalog.value.find((r) => r.name === name);
+}
+
+function fmtCommand(c: string | string[] | null | undefined): string {
+  if (!c) return "";
+  return Array.isArray(c) ? c.join(" ") : c;
+}
+
+function cmdEq(
+  a: string | string[] | null | undefined,
+  b: string | string[] | null | undefined,
+): boolean {
+  const norm = (x: string | string[] | null | undefined) =>
+    x == null ? [] : Array.isArray(x) ? x : [x];
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+}
+
+function isCustom(name: string): boolean {
+  const r = row(name);
+  return (
+    addedCustom.value.includes(name) ||
+    !!r?.custom ||
+    (!r && !!savedEngines.value[name])
+  );
+}
+
+function toEdit(name: string): EngineEdit {
+  const r = row(name);
+  const ov = savedEngines.value[name];
+  if (!r || r.custom) {
+    const cmd = ov?.command ?? (r ? r.command : "");
+    return {
+      command: fmtCommand(cmd),
+      commandRaw: cmd,
+      args: (ov?.args ?? r?.args ?? []).join("\n"),
+      timeout_sec: ov?.timeout_sec ?? r?.timeout_sec ?? 1800,
+      prompt_template: ov?.prompt_template ?? r?.prompt_template ?? "",
+    };
+  }
+  const cmd = ov?.command ?? r.command ?? "";
+  return {
+    command: fmtCommand(cmd),
+    commandRaw: cmd,
+    args: (ov?.args ?? r.args ?? r.default_args ?? []).join("\n"),
+    timeout_sec:
+      ov?.timeout_sec ?? r.timeout_sec ?? r.default_timeout_sec ?? 1800,
+    prompt_template:
+      ov?.prompt_template ?? r.prompt_template ?? r.default_prompt_template ?? "",
+  };
+}
+
+function ensureEdit(name: string) {
+  if (edits.value[name]) return;
+  if (!row(name) && !savedEngines.value[name]) return;
+  edits.value[name] = toEdit(name);
+}
+
+function onEngineChange() {
+  riskAck.value = false;
+  ensureEdit(engine.value);
+}
+
+/** 恢复默认：清掉该预设 engine 的本地覆盖，编辑副本回到 default_*（提交时即无差异）。 */
+function resetDefaults(name: string) {
+  const r = row(name);
+  if (!r) return;
+  edits.value[name] = {
+    command: fmtCommand(r.default_command),
+    commandRaw: r.default_command ?? "",
+    args: (r.default_args || []).join("\n"),
+    timeout_sec: r.default_timeout_sec ?? 1800,
+    prompt_template: r.default_prompt_template || "",
+  };
+}
+
+/** 删除自定义 engine：只从本次提交的 engines 里去掉，不涉及任何文件。 */
+function removeCustom(name: string) {
+  delete edits.value[name];
+  addedCustom.value = addedCustom.value.filter((n) => n !== name);
+  if (engine.value === name) {
+    engine.value = savedEngine.value || visibleEngines.value[0] || "";
+    onEngineChange();
+  }
+}
+
+function addCustomEngine() {
+  newEngineError.value = "";
+  const name = newName.value.trim();
+  if (!/^[a-z0-9_-]{1,32}$/.test(name)) {
+    newEngineError.value = "名字只能用小写字母、数字、_ 或 -，最长 32 个字符。";
+    return;
+  }
+  if (row(name) || addedCustom.value.includes(name)) {
+    newEngineError.value = `engine「${name}」已存在。`;
+    return;
+  }
+  const cmd = newCommand.value.trim();
+  if (!cmd.startsWith("/")) {
+    newEngineError.value = "命令要填存在的绝对路径（以 / 开头）。";
+    return;
+  }
+  const args = newArgs.value
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (args.filter((s) => s === "{prompt}").length !== 1) {
+    newEngineError.value = "参数要一行一个，且必须恰好有一行是 {prompt}。";
+    return;
+  }
+  addedCustom.value.push(name);
+  edits.value[name] = {
+    command: cmd,
+    commandRaw: cmd,
+    args: args.join("\n"),
+    timeout_sec: 1800,
+    prompt_template: "{prompt}",
+  };
+  engine.value = name;
+  riskAck.value = false;
+  newName.value = "";
+  newCommand.value = "";
+  newArgs.value = "";
+}
+
+const visibleEngines = computed(() => {
+  const names: string[] = catalog.value
+    .filter((r) => !r.hidden)
+    .map((r) => r.name);
+  // hidden 的（如 kimi）只在它就是当前已保存 engine 时露出；新加的自定义也要露出。
+  for (const n of [savedEngine.value, engine.value, ...addedCustom.value]) {
+    if (n && !names.includes(n)) names.push(n);
+  }
+  // 老后端没有 catalog 时保持原有 claude/codex 下拉。
+  if (!catalog.value.length) names.unshift("claude", "codex");
+  return names;
+});
+
+const edit = computed(() => edits.value[engine.value]);
+const selectedRow = computed(() => row(engine.value));
+const currentIsCustom = computed(() => isCustom(engine.value));
+// 风险提示只在选中的 engine 带 risk 且不是当前已保存的 engine 时出现。
+const riskNeeded = computed(
+  () => !!selectedRow.value?.risk && engine.value !== savedEngine.value,
+);
+
 async function save() {
   saving.value = true;
   saveError.value = "";
   saved.value = false;
+  // engines 覆盖：预设只提交与 default_* 不同的字段，自定义全字段提交。
+  const enginesPatch: Record<string, EngineOverride> = {};
+  for (const [name, e] of Object.entries(edits.value)) {
+    const r = row(name);
+    const args = e.args
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    const timeout = Number(e.timeout_sec);
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 86400) {
+      saveError.value = `「${name}」的超时必须是 0–86400 的整数（0 = 不限）。`;
+      saving.value = false;
+      return;
+    }
+    if (!e.prompt_template.includes("{prompt}")) {
+      saveError.value = `「${name}」的提示词模板必须含 {prompt}。`;
+      saving.value = false;
+      return;
+    }
+    if (isCustom(name)) {
+      const cmd = e.command.trim();
+      if (!cmd.startsWith("/")) {
+        saveError.value = `「${name}」的命令必须是存在的绝对路径。`;
+        saving.value = false;
+        return;
+      }
+      if (args.filter((s) => s === "{prompt}").length !== 1) {
+        saveError.value = `「${name}」的参数里必须恰好有一行是 {prompt}。`;
+        saving.value = false;
+        return;
+      }
+      enginesPatch[name] = {
+        command: cmd,
+        args,
+        prompt_template: e.prompt_template,
+        timeout_sec: timeout,
+      };
+    } else {
+      if (!r) continue;
+      const o: EngineOverride = {};
+      if (!cmdEq(e.commandRaw, r.default_command)) o.command = e.commandRaw;
+      if (JSON.stringify(args) !== JSON.stringify(r.default_args || []))
+        o.args = args;
+      if (timeout !== (r.default_timeout_sec ?? 1800))
+        o.timeout_sec = timeout;
+      if (e.prompt_template !== (r.default_prompt_template || ""))
+        o.prompt_template = e.prompt_template;
+      if (Object.keys(o).length > 0) enginesPatch[name] = o;
+    }
+  }
   try {
     const cfg = await api.saveConfig({
       dispatch: dispatch.value,
@@ -67,7 +290,15 @@ async function save() {
       engine_path: enginePath.value.trim(),
       port: Number(port.value) || 0,
       setup_done: true,
+      ...(Object.keys(enginesPatch).length > 0
+        ? { engines: enginesPatch }
+        : {}),
     });
+    savedEngine.value = engine.value;
+    savedEngines.value = cfg.engines || {};
+    if (cfg.engine_catalog) catalog.value = cfg.engine_catalog;
+    addedCustom.value = [];
+    riskAck.value = false;
     emit("saved", cfg);
     saved.value = true;
     if (window.location.hash === "#/setup") {
@@ -200,13 +431,13 @@ async function copy(text: string, tag: string) {
       <p class="mt-1 text-sm text-slate-500">
         自动派活时使用的 CLI。自定义命令路径填绝对路径（支持 ~），例如
         <code class="rounded bg-slate-100 px-1">~/bin/claude-safe</code>；留空则用所选工具的默认命令。
+        claude / codex 保持原有参数，可在这里改；pi / cursor / gemini 是新预设，默认不启用，选用前请看风险提示。
       </p>
       <div class="mt-3 flex flex-wrap items-center gap-4 text-sm">
         <label class="flex items-center gap-2">
           工具
-          <select v-model="engine" class="rounded border border-slate-300 px-2 py-1">
-            <option value="claude">claude</option>
-            <option value="codex">codex</option>
+          <select v-model="engine" class="rounded border border-slate-300 px-2 py-1" @change="onEngineChange">
+            <option v-for="name in visibleEngines" :key="name" :value="name">{{ name }}</option>
           </select>
         </label>
         <label class="flex flex-1 items-center gap-2">
@@ -218,6 +449,107 @@ async function copy(text: string, tag: string) {
             class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 font-mono text-xs"
           />
         </label>
+      </div>
+
+      <!-- 风险提示：选中的 engine 带 risk 且不是当前已保存的 engine 时出现 -->
+      <div
+        v-if="riskNeeded && selectedRow && selectedRow.risk"
+        class="mt-3 rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800"
+      >
+        <p class="font-semibold">{{ engine }} 的风险提示</p>
+        <p class="mt-1 whitespace-pre-wrap">{{ selectedRow.risk }}</p>
+        <label class="mt-2 flex items-center gap-2">
+          <input v-model="riskAck" type="checkbox" />
+          我了解这个风险，仍要启用
+        </label>
+      </div>
+
+      <!-- 选中 engine 的可编辑面板 -->
+      <div v-if="edit" class="mt-4 space-y-3 rounded border border-slate-200 p-3 text-sm">
+        <div class="flex items-center justify-between gap-2">
+          <span class="font-medium">
+            {{ engine }}<span v-if="currentIsCustom" class="ml-1 text-xs text-slate-500">自定义</span>
+          </span>
+          <button
+            v-if="!currentIsCustom"
+            class="text-xs text-blue-600 hover:underline"
+            @click="resetDefaults(engine)"
+          >恢复默认</button>
+          <button
+            v-else
+            class="text-xs text-red-600 hover:underline"
+            @click="removeCustom(engine)"
+          >删除这个自定义 engine</button>
+        </div>
+        <div v-if="!currentIsCustom" class="flex flex-wrap items-center gap-2">
+          <span class="text-slate-500">命令</span>
+          <code class="rounded bg-slate-100 px-1 font-mono text-xs">{{ edit.command }}</code>
+        </div>
+        <label v-else class="flex flex-wrap items-center gap-2">
+          <span class="text-slate-500">命令（绝对路径）</span>
+          <input
+            v-model="edit.command"
+            type="text"
+            class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+          />
+        </label>
+        <div>
+          <div class="text-slate-500">参数</div>
+          <textarea
+            v-model="edit.args"
+            rows="3"
+            class="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+          ></textarea>
+          <p class="mt-1 text-xs text-slate-500">
+            一行一个参数；{prompt} 会换成提示词，{folder} 会换成绑定目录；没有 {prompt} 行时提示词追加在最后。
+          </p>
+        </div>
+        <label class="flex flex-wrap items-center gap-2">
+          超时（秒）
+          <input
+            v-model.number="edit.timeout_sec"
+            type="number"
+            min="0"
+            max="86400"
+            class="w-28 rounded border border-slate-300 px-2 py-1"
+          />
+          <span class="text-xs text-slate-500">0 = 不限，默认 1800。</span>
+        </label>
+        <div>
+          <div class="text-slate-500">提示词模板（必须含 {prompt}）</div>
+          <textarea
+            v-model="edit.prompt_template"
+            rows="3"
+            class="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+          ></textarea>
+        </div>
+      </div>
+
+      <!-- 新增自定义 engine -->
+      <div class="mt-4 border-t border-slate-100 pt-3 text-sm">
+        <div class="text-xs font-medium text-slate-500">新增自定义 engine</div>
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <input
+            v-model="newName"
+            type="text"
+            placeholder="名字：小写字母数字 _ -，≤32"
+            class="w-56 rounded border border-slate-300 px-2 py-1"
+          />
+          <input
+            v-model="newCommand"
+            type="text"
+            placeholder="/绝对路径/到/命令"
+            class="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+          />
+          <button class="rounded border border-slate-300 px-3 py-1 hover:bg-slate-100" @click="addCustomEngine">添加</button>
+        </div>
+        <textarea
+          v-model="newArgs"
+          rows="2"
+          placeholder="参数，一行一个；必须恰好有一行是 {prompt}"
+          class="mt-2 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+        ></textarea>
+        <p v-if="newEngineError" class="mt-1 text-sm text-red-600">{{ newEngineError }}</p>
       </div>
     </section>
 
@@ -337,7 +669,7 @@ async function copy(text: string, tag: string) {
     <div class="flex items-center gap-3">
       <button
         class="rounded bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
-        :disabled="saving"
+        :disabled="saving || (riskNeeded && !riskAck)"
         @click="save"
       >{{ saving ? "保存中…" : "保存设置" }}</button>
       <span v-if="saved" class="text-sm text-green-700">已保存。</span>

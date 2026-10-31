@@ -679,6 +679,139 @@ class RunsApiTests(unittest.TestCase):
                 "/api/config", {**creds, "confirm": "config", **patch})
             self.assertEqual(status, 400, patch)
 
+    # -- engines 配置接口 -----------------------------------------------------
+
+    def _config_engines(self):
+        """config.json 落盘的 engines 原值（load_config 会清洗，这里要看原始键）。"""
+        from handoff import config_path
+        with open(config_path(), encoding="utf-8") as fh:
+            return json.load(fh).get("engines")
+
+    def _fake_engine_bin(self):
+        path = os.path.join(self.home, "bin", "fake-engine")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_engine_catalog_defaults(self):
+        creds = self.creds()
+        # 先清回默认 engines，目录断言不依赖别的用例留下的覆盖。
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": {}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(status, 200)
+        rows = json.loads(body)["engine_catalog"]
+        self.assertEqual([r["name"] for r in rows],
+                         ["claude", "codex", "pi", "cursor", "gemini", "kimi"])
+        by_name = dict((r["name"], r) for r in rows)
+        for name, row in by_name.items():
+            self.assertEqual(row["hidden"], name == "kimi", name)
+            self.assertFalse(row["custom"], name)
+        for name in ("claude", "codex"):
+            self.assertEqual(by_name[name]["risk"], "", name)
+        for name in ("pi", "cursor", "gemini", "kimi"):
+            self.assertTrue(by_name[name]["risk"], name)
+        self.assertEqual(by_name["claude"]["default_args"], by_name["claude"]["args"])
+        # 全新 home：预设超时默认 1800 秒。
+        self.assertEqual(by_name["claude"]["timeout_sec"], 1800)
+        self.assertEqual(by_name["claude"]["default_timeout_sec"], 1800)
+
+    def test_engine_custom_definition(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config",
+            "engines": {"mine": {"command": bin_path, "args": ["--x", "{prompt}"]}}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertIn("mine", rows)  # 自定义排在预设之后
+        self.assertTrue(rows["mine"]["custom"])
+        self.assertFalse(rows["mine"]["hidden"])
+        self.assertEqual(rows["mine"]["command"], bin_path)
+        self.assertEqual(rows["mine"]["args"], ["--x", "{prompt}"])
+
+    def test_engine_override_roundtrip(self):
+        creds = self.creds()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config", "engines": {"claude": {"timeout_sec": 0}}})
+        self.assertEqual(status, 200)
+        # 整体替换：config.json 的 engines 键就是提交的值。
+        self.assertEqual(self._config_engines(), {"claude": {"timeout_sec": 0}})
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertEqual(rows["claude"]["timeout_sec"], 0)
+        self.assertEqual(rows["claude"]["default_timeout_sec"], 1800)
+        # 只提交了 timeout：args 仍是预设默认。
+        self.assertEqual(rows["claude"]["args"], rows["claude"]["default_args"])
+        # engines={} 恢复默认。
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": {}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertEqual(rows["claude"]["timeout_sec"], 1800)
+
+    def test_engine_override_validations(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        baseline = {"claude": {"timeout_sec": 60}}
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": baseline})
+        self.assertEqual(status, 200)
+        bad = [
+            ("engines not an object", ["claude"]),
+            ("uppercase name", {"Claude": {"timeout_sec": 1}}),
+            ("name with space", {"my engine": {"timeout_sec": 1}}),
+            ("hidden not accepted", {"claude": {"hidden": True}}),
+            ("risk not accepted", {"claude": {"risk": "x"}}),
+            ("unknown field", {"claude": {"nope": 1}}),
+            ("custom missing args", {"mine": {"command": bin_path}}),
+            ("custom bare command", {"mine": {"command": "no-such-bin",
+                                              "args": ["{prompt}"]}}),
+            ("custom missing file", {"mine": {"command": os.path.join(self.home, "no-such-bin"),
+                                              "args": ["{prompt}"]}}),
+            ("custom args without {prompt}", {"mine": {"command": bin_path, "args": ["--x"]}}),
+            ("custom args with two {prompt}", {"mine": {"command": bin_path,
+                                                        "args": ["{prompt}", "{prompt}"]}}),
+            ("bare name not in preset command", {"pi": {"command": "rm"}}),
+            ("control char in args", {"claude": {"args": ["a\x00b"]}}),
+            ("negative timeout", {"claude": {"timeout_sec": -1}}),
+            ("timeout above 86400", {"claude": {"timeout_sec": 86401}}),
+            ("bool timeout", {"claude": {"timeout_sec": True}}),
+            ("string timeout", {"claude": {"timeout_sec": "5"}}),
+            ("template without {prompt}", {"claude": {"prompt_template": "no placeholder"}}),
+            ("too many engines", dict(("e%02d" % i, {"timeout_sec": 1}) for i in range(17))),
+        ]
+        for label, engines in bad:
+            status, _, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", "engines": engines})
+            self.assertEqual(status, 400, label)
+            # 校验在写盘之前：失败后 config.json 的 engines 原样不动。
+            self.assertEqual(self._config_engines(), baseline, label)
+
+    def test_engine_select_pi_kimi_custom_and_unknown(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config",
+            "engines": {"mine": {"command": bin_path, "args": ["--x", "{prompt}"]}}})
+        self.assertEqual(status, 200)
+        # 隐藏项（kimi）和自定义项同样可以通过接口选。
+        for name in ("pi", "kimi", "mine"):
+            status, body, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", "engine": name})
+            self.assertEqual(status, 200, name)
+            self.assertEqual(json.loads(body)["engine"], name)
+            status, body, _ = self.request("/api/config")
+            self.assertEqual(json.loads(body)["engine"], name)
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engine": "nope"})
+        self.assertEqual(status, 400)
+
     def test_projects_read_write_and_delete(self):
         status, body, _ = self.request("/api/projects")
         self.assertEqual(status, 200)

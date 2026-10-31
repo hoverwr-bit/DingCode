@@ -584,6 +584,121 @@ spawn_autofix = _spawn_autofix
 
 # -- M6 设置接口 -----------------------------------------------------------
 
+def _engine_catalog(cfg):
+    """设置页的 engine 目录：预设按 ENGINE_PRESETS 顺序、自定义在后；
+    hidden 的也返回（由前端决定是否展示）。default_* 是内置预设值（自定义 engine 为 null）。"""
+    import handoff
+
+    resolved = handoff.resolve_engines(cfg.get("engines") or {})
+    rows = []
+    for name, preset in handoff.ENGINE_PRESETS.items():
+        row = resolved.get(name, preset)
+        rows.append({
+            "name": name,
+            "hidden": bool(row.get("hidden", False)),
+            "risk": row.get("risk", ""),
+            "custom": False,
+            "command": row.get("command"),
+            "args": row.get("args"),
+            "prompt_template": row.get("prompt_template", "{prompt}"),
+            "timeout_sec": row.get("timeout_sec", 1800),
+            "default_command": preset.get("command"),
+            "default_args": preset.get("args"),
+            "default_prompt_template": preset.get("prompt_template", "{prompt}"),
+            "default_timeout_sec": preset.get("timeout_sec", 1800),
+        })
+    for name, row in resolved.items():
+        if name in handoff.ENGINE_PRESETS:
+            continue
+        rows.append({
+            "name": name,
+            "hidden": bool(row.get("hidden", False)),
+            "risk": row.get("risk", ""),
+            "custom": True,
+            "command": row.get("command"),
+            "args": row.get("args"),
+            "prompt_template": row.get("prompt_template", "{prompt}"),
+            "timeout_sec": row.get("timeout_sec", 1800),
+            "default_command": None,
+            "default_args": None,
+            "default_prompt_template": None,
+            "default_timeout_sec": None,
+        })
+    return rows
+
+
+def _validate_engines(handler, decision, raw):
+    """config_write 的 engines 严格校验：与 sanitize_engines 不同，这里是报错不是丢弃，
+    校验在写盘之前完成，失败整体不写。通过则原样返回（save_config 的 engines 键就是请求里的值）。"""
+    import handoff
+
+    if not isinstance(raw, dict):
+        _error(handler, decision, 400, "engines must be an object")
+        return None
+    if len(raw) > 16:
+        _error(handler, decision, 400, "too many engines")
+        return None
+    for name, item in raw.items():
+        if not isinstance(name, str) or not handoff.ENGINE_NAME_RE.match(name):
+            _error(handler, decision, 400, "bad engine name")
+            return None
+        if not isinstance(item, dict):
+            _error(handler, decision, 400, "engine %s must be an object" % name)
+            return None
+        if set(item) - {"command", "args", "prompt_template", "timeout_sec"}:
+            _error(handler, decision, 400, "engine %s has unsupported field" % name)
+            return None
+        preset = handoff.ENGINE_PRESETS.get(name)
+        command = item.get("command")
+        if command is not None:
+            if isinstance(command, str):
+                command = [command]
+            if (not isinstance(command, list) or not 1 <= len(command) <= 4
+                    or not all(isinstance(x, str) and x and len(x) <= 500 for x in command)):
+                _error(handler, decision, 400, "bad engine %s command" % name)
+                return None
+            for x in command:
+                expanded = os.path.expanduser(x)
+                if os.path.isabs(expanded):
+                    if not os.path.isfile(expanded):
+                        _error(handler, decision, 400,
+                               "engine %s command must be an existing file" % name)
+                        return None
+                elif preset is None or x not in (preset["command"] if isinstance(preset["command"], list)
+                                                 else [preset["command"]]):
+                    _error(handler, decision, 400,
+                           "engine %s command must be an absolute path or its preset command" % name)
+                    return None
+        elif preset is None:
+            _error(handler, decision, 400, "custom engine %s needs command" % name)
+            return None
+        args = item.get("args")
+        if args is not None:
+            if (not isinstance(args, list) or not 1 <= len(args) <= 64
+                    or not all(isinstance(x, str) and len(x) <= 500 and not _CTRL.search(x)
+                               for x in args)):
+                _error(handler, decision, 400, "bad engine %s args" % name)
+                return None
+            if preset is None and [x for x in args if x == "{prompt}"] != ["{prompt}"]:
+                _error(handler, decision, 400,
+                       "custom engine %s args must contain exactly one {prompt}" % name)
+                return None
+        elif preset is None:
+            _error(handler, decision, 400, "custom engine %s needs args" % name)
+            return None
+        template = item.get("prompt_template")
+        if template is not None and (not isinstance(template, str) or len(template) > 8000
+                                     or "{prompt}" not in template):
+            _error(handler, decision, 400, "bad engine %s prompt_template" % name)
+            return None
+        timeout = item.get("timeout_sec")
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int)
+                                    or not 0 <= timeout <= 86400):
+            _error(handler, decision, 400, "bad engine %s timeout_sec" % name)
+            return None
+    return raw
+
+
 def config_read(handler, decision):
     import handoff
 
@@ -605,7 +720,7 @@ def config_read(handler, decision):
         cfg["app_url"] = "http://%s/app/" % public
     else:
         cfg["app_url"] = "http://127.0.0.1:%d/app/" % (handler.server.server_address[1])
-    _json(handler, decision, 200, {"ok": True, **cfg})
+    _json(handler, decision, 200, {"ok": True, **cfg, "engine_catalog": _engine_catalog(cfg)})
 
 
 def config_write(handler, decision):
@@ -623,10 +738,22 @@ def config_write(handler, decision):
             return
         patch["dispatch"] = body["dispatch"]
     if "engine" in body:
-        if body["engine"] not in ("claude", "codex"):
-            _error(handler, decision, 400, "engine must be claude or codex")
+        # 名字必须在 resolve 后的 engine 表里（请求自带 engines 时以它为准，否则用当前配置）。
+        if not isinstance(body["engine"], str):
+            _error(handler, decision, 400, "unknown engine")
+            return
+        base = body.get("engines")
+        if not isinstance(base, dict):
+            base = handoff.load_config().get("engines") or {}
+        if body["engine"] not in handoff.resolve_engines(base):
+            _error(handler, decision, 400, "unknown engine")
             return
         patch["engine"] = body["engine"]
+    if "engines" in body:
+        engines = _validate_engines(handler, decision, body["engines"])
+        if engines is None:
+            return
+        patch["engines"] = engines
     if "engine_path" in body:
         path = body["engine_path"]
         if path is None or path == "":
@@ -660,7 +787,7 @@ def config_write(handler, decision):
             return
         patch["setup_done"] = body["setup_done"]
     cfg = handoff.save_config(patch)
-    _json(handler, decision, 200, {"ok": True, **cfg})
+    _json(handler, decision, 200, {"ok": True, **cfg, "engine_catalog": _engine_catalog(cfg)})
 
 
 def _binding_rows():

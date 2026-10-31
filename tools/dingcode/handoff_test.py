@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -388,6 +389,215 @@ class AutofixTests(unittest.TestCase):
         handoff.save_config({"engine_path": ""})
         argv, _ = handoff.engine_command("claude", "p", self.home)
         self.assertEqual(os.path.basename(argv[0]), "claude")
+
+    def _make_exec(self, name, body="#!/bin/sh\nexit 0\n"):
+        # 沿用 setUp 的造法：临时 home 的 bin 下放一个可执行脚本。
+        path = os.path.join(self.home, "bin", name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+        return path
+
+    def test_engine_presets_claude_codex_argv_unchanged(self):
+        # 预设化之后 claude/codex 的 argv 必须与旧硬编码逐字相同。
+        prompt = "fix the pin"
+        folder = os.path.join(self.home, "proj")
+        argv, cwd = handoff.engine_command("claude", prompt, folder)
+        self.assertEqual(cwd, folder)
+        self.assertEqual(argv, [
+            handoff.find_binary("claude"), "-p",
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Read,Edit,Write,Glob,Grep",
+            "--disallowedTools", "Bash,WebFetch,WebSearch",
+            "--", handoff.engine_prompt(prompt),
+        ])
+        argv, _ = handoff.engine_command("codex", prompt, folder)
+        self.assertEqual(argv, [
+            handoff.find_binary("codex"), "exec",
+            "--sandbox", "workspace-write",
+            "-c", "sandbox_workspace_write.network_access=false",
+            "--", handoff.engine_prompt(prompt),
+        ])
+
+    def test_engine_presets_binary_and_prompt_substitution(self):
+        # pi/gemini：argv[0] 是可执行名；{prompt} 换成 engine_prompt(...)。
+        # cursor 的 command 是备选列表 ["agent", "cursor-agent"]，选中 PATH 里的 cursor-agent。
+        cursor_agent = self._make_exec("cursor-agent")
+        prompt = "pin text"
+        folder = os.path.join(self.home, "proj")
+        for name, index in (("pi", -1), ("gemini", 2)):
+            argv, _ = handoff.engine_command(name, prompt, folder)
+            self.assertEqual(os.path.basename(argv[0]), name)
+            self.assertEqual(argv[index], handoff.engine_prompt(prompt))
+        argv, _ = handoff.engine_command("cursor", prompt, folder)
+        self.assertEqual(argv[0], cursor_agent)
+        self.assertEqual(argv[-1], handoff.engine_prompt(prompt))
+        # 任何预设的 args 都不得把输出格式设成 json/stream-json（毁掉日志解析）。
+        for name, preset in handoff.ENGINE_PRESETS.items():
+            lowered = [str(arg).lower() for arg in preset["args"]]
+            self.assertNotIn("json", lowered, name)
+            self.assertNotIn("stream-json", lowered, name)
+
+    def test_engine_preset_hidden_and_risk(self):
+        engines = handoff.resolve_engines({})
+        for name, row in engines.items():
+            self.assertEqual(row["hidden"], name == "kimi", name)
+            if name in ("claude", "codex"):
+                self.assertEqual(row["risk"], "", name)
+            else:
+                self.assertTrue(row["risk"], name)
+
+    def test_engines_override_replaces_and_custom(self):
+        folder = os.path.join(self.home, "proj")
+        # 用户覆盖整体生效（覆盖需写全，整体替换不做深合并）：
+        # timeout_sec 与 args 都来自覆盖，{folder}/{prompt} 都被替换。
+        override = {"claude": {"command": "claude",
+                               "args": ["--dir", "{folder}", "{prompt}"], "timeout_sec": 5}}
+        argv, _ = handoff.engine_command("claude", "p", folder, engines=override)
+        self.assertEqual(argv[0], handoff.find_binary("claude"))
+        self.assertEqual(argv[1:3], ["--dir", folder])
+        self.assertEqual(argv[-1], handoff.engine_prompt("p"))
+        self.assertEqual(handoff.engine_timeout("claude", override), 5)
+        # 整体替换不做深合并：只给 args 时 timeout 仍是默认 1800。
+        args_only = {"claude": {"args": ["-p", "{prompt}"]}}
+        self.assertEqual(handoff.engine_timeout("claude", args_only), 1800)
+        # 自定义 engine：command+args 齐全才保留，带 custom=True。
+        tool = self._make_exec("mytool")
+        custom = {"mytool": {"command": tool, "args": ["-p", "{prompt}"]}}
+        resolved = handoff.resolve_engines(custom)
+        self.assertTrue(resolved["mytool"]["custom"])
+        argv3, _ = handoff.engine_command("mytool", "p", folder, engines=custom)
+        self.assertEqual(argv3[0], tool)
+        self.assertEqual(argv3[-1], handoff.engine_prompt("p"))
+        # 缺 args 的自定义项被丢弃。
+        self.assertNotIn("badtool", handoff.resolve_engines({"badtool": {"command": tool}}))
+        # 名字不合法（大写/空格）被 sanitize_engines 丢弃。
+        cleaned = handoff.sanitize_engines({
+            "Claude": {"args": ["-p", "{prompt}"]},
+            "with space": {"args": ["-p", "{prompt}"]},
+            "ok-name": {"args": ["-p", "{prompt}"]},
+        })
+        self.assertEqual(sorted(cleaned), ["ok-name"])
+        # hidden/risk 不接受用户覆盖：sanitize 只放行 command/args/模板/timeout。
+        cleaned_row = handoff.sanitize_engines(
+            {"claude": {"hidden": True, "risk": "no", "args": ["-p", "{prompt}"]}})
+        self.assertNotIn("hidden", cleaned_row["claude"])
+        self.assertNotIn("risk", cleaned_row["claude"])
+
+    def test_engines_override_keywise_keeps_preset_fields(self):
+        # 按键替换：预设名只覆盖部分键时，没给的键沿用预设（hidden/risk 永远来自预设）。
+        folder = os.path.join(self.home, "proj")
+        # (a) claude 只给 timeout_sec：argv 与无覆盖时逐字相同，timeout 生效。
+        timeout_only = {"claude": {"timeout_sec": 5}}
+        argv_plain, cwd_plain = handoff.engine_command("claude", "p", folder)
+        argv_a, cwd_a = handoff.engine_command("claude", "p", folder, engines=timeout_only)
+        self.assertEqual(argv_a, argv_plain)
+        self.assertEqual(cwd_a, cwd_plain)
+        self.assertEqual(handoff.engine_timeout("claude", timeout_only), 5)
+        # (b) kimi 只给 timeout_sec：hidden 仍 True、risk 仍非空、command 不变。
+        resolved = handoff.resolve_engines({"kimi": {"timeout_sec": 7}})
+        self.assertTrue(resolved["kimi"]["hidden"])
+        self.assertTrue(resolved["kimi"]["risk"])
+        self.assertEqual(resolved["kimi"]["command"], "kimi")
+        self.assertEqual(resolved["kimi"]["timeout_sec"], 7)
+        # (c) claude 只给 args：command 沿用预设，timeout 仍 1800。
+        args_only = {"claude": {"args": ["-p", "{prompt}"]}}
+        argv_c, _ = handoff.engine_command("claude", "p", folder, engines=args_only)
+        self.assertEqual(argv_c[0], handoff.find_binary("claude"))
+        self.assertEqual(argv_c[1], "-p")
+        self.assertEqual(argv_c[-1], handoff.engine_prompt("p"))
+        self.assertEqual(handoff.engine_timeout("claude", args_only), 1800)
+
+    def test_prompt_template_braces_use_str_replace(self):
+        # 模板替换是 str.replace：含 JSON 花括号的模板不得抛 KeyError。
+        # （覆盖须写全 command，整体替换的行才完整、不会被回落逻辑丢掉。）
+        engines = {"claude": {"command": "claude", "args": ["{prompt}"],
+                              "prompt_template": '{"pins": []} {prompt}'}}
+        argv, _ = handoff.engine_command("claude", "p", self.home, engines=engines)
+        self.assertEqual(argv[-1], handoff.engine_prompt('{"pins": []} p'))
+
+    def test_set_engine_and_config_keeps_engines_key(self):
+        self.assertTrue(handoff.set_engine("pi"))
+        self.assertEqual(handoff.current_engine(), "pi")
+        self.assertFalse(handoff.set_engine("nope"))
+        self.assertEqual(handoff.current_engine(), "pi")
+        # config 里 engine 写成不认识的名字 → load_config 回落 claude。
+        cfg_path = handoff.config_path()
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump({"engine": "weird",
+                       "engines": {"mytool": {"command": "x", "args": ["-p", "{prompt}"]}}},
+                      fh)
+        self.assertEqual(handoff.load_config()["engine"], "claude")
+        # save_config 的 read-modify-write 不丢 engines（未知键保留）。
+        handoff.save_config({"setup_done": True})
+        with open(cfg_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self.assertIn("engines", raw)
+        self.assertIn("mytool", raw["engines"])
+
+    def test_engine_timeout_default_and_zero(self):
+        self.assertEqual(handoff.engine_timeout("claude"), 1800)
+        self.assertEqual(handoff.engine_timeout("nope"), 1800)
+        self.assertEqual(handoff.engine_timeout("claude", {"claude": {"timeout_sec": 0}}), 0)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX only")
+    def test_run_engine_timeout_kills_process_group(self):
+        saved_dry = os.environ.pop("DINGCODE_AUTOFIX_DRY", None)  # 关掉 setUp 的 dry-run
+        try:
+            pidfile = os.path.join(self.home, "child.pid")
+            script = self._make_exec(
+                "sleeper", "#!/bin/sh\nsleep 30 &\necho $! > %s\nwait\n" % pidfile)
+            log = os.path.join(self.home, "timeout.log")
+            started = time.time()
+            code = handoff.run_engine([script], self.home, log, timeout=1)
+            elapsed = time.time() - started
+            self.assertEqual(code, 124)
+            self.assertLess(elapsed, 15)
+            with open(log, encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("timeout 1", text)
+            self.assertIn("exit 124", text)
+            # killpg 杀整个进程组：脚本里的 sleep 子进程也得死（给内核一点回收时间）。
+            with open(pidfile, encoding="utf-8") as fh:
+                child = int(fh.read().strip())
+            for _ in range(50):
+                try:
+                    os.kill(child, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("child %d survived the timeout kill" % child)
+        finally:
+            if saved_dry is not None:
+                os.environ["DINGCODE_AUTOFIX_DRY"] = saved_dry
+
+    @unittest.skipUnless(os.name == "posix", "POSIX only")
+    def test_run_engine_returns_exit_code(self):
+        saved_dry = os.environ.pop("DINGCODE_AUTOFIX_DRY", None)
+        try:
+            script = self._make_exec("exit3", "#!/bin/sh\nexit 3\n")
+            log = os.path.join(self.home, "exit.log")
+            self.assertEqual(handoff.run_engine([script], self.home, log), 3)
+            with open(log, encoding="utf-8") as fh:
+                self.assertIn("exit 3", fh.read())
+        finally:
+            if saved_dry is not None:
+                os.environ["DINGCODE_AUTOFIX_DRY"] = saved_dry
+
+    def test_run_engine_log_masks_prompt_not_at_end(self):
+        # gemini 预设：提示词在 argv 第 3 位（不在末尾），日志里也要被遮蔽。
+        folder = os.path.join(self.home, "proj")
+        argv, _ = handoff.engine_command("gemini", "SECRET prompt body", folder)
+        self.assertEqual(argv[2], handoff.engine_prompt("SECRET prompt body"))
+        self.assertEqual(argv[3], "--approval-mode")
+        log = os.path.join(self.home, "mask.log")
+        handoff.run_engine(argv, folder, log)  # setUp 已开 dry-run，不会真启动
+        with open(log, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("<prompt %d chars>" % len(argv[2]), text)
+        self.assertNotIn("SECRET prompt body", text)
 
     def test_session_prompt_built_from_note(self):
         # 没有 prompt.md 时由 runs/<sid>/note.json 现拼，folder 取 status。

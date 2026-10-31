@@ -1025,7 +1025,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         let autoItem = NSMenuItem(title: cfg.auto ? "自动模式:开" : "自动模式:关", action: #selector(toggleAutoMode), keyEquivalent: "")
         menu.addItem(autoItem)
         autoMenuItem = autoItem
-        let engineItem = NSMenuItem(title: cfg.engine == "codex" ? "引擎:Codex" : "引擎:Claude Code", action: #selector(toggleEngine), keyEquivalent: "")
+        let engineItem = NSMenuItem(title: engineMenuTitle(cfg.engine), action: #selector(toggleEngine), keyEquivalent: "")
         menu.addItem(engineItem)
         engineMenuItem = engineItem
         let runItem = NSMenuItem(title: "自动修复:空闲", action: nil, keyEquivalent: "")
@@ -2305,7 +2305,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     func writeJSONFile(_ path: String, _ obj: [String: Any]) {
         try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
-        try? data.write(to: URL(fileURLWithPath: path))
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
     func stringMap(_ value: Any?) -> [String: String] {
@@ -2317,21 +2317,39 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         return out
     }
 
+    func engineMenuTitle(_ engine: String) -> String {
+        switch engine {
+        case "codex": return "引擎:Codex"
+        case "claude": return "引擎:Claude Code"
+        default: return "引擎:" + engine
+        }
+    }
+
     func loadAutoConfig() -> (engine: String, auto: Bool) {
         let obj = readJSONFile((dotConfigDir() as NSString).appendingPathComponent("config.json"))
-        let engine = (obj["engine"] as? String) == "codex" ? "codex" : "claude"
+        let engine = obj["engine"] as? String ?? ""
         let auto = obj["auto"] as? Bool ?? true
-        return (engine, auto)
+        return (engine.isEmpty ? "claude" : engine, auto)
     }
 
     func saveAutoConfig(engine: String, auto: Bool) {
-        writeJSONFile((dotConfigDir() as NSString).appendingPathComponent("config.json"), ["engine": engine, "auto": auto])
+        let path = (dotConfigDir() as NSString).appendingPathComponent("config.json")
+        var obj: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: path) {
+            // 已存在时不整文件覆盖：读出原字典保留其它键；损坏/非 JSON 对象则放弃写入
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            obj = existing
+        }
+        obj["engine"] = engine
+        obj["auto"] = auto
+        writeJSONFile(path, obj)
     }
 
     func refreshAutoMenu() {
         let cfg = loadAutoConfig()
         autoMenuItem?.title = cfg.auto ? "自动模式:开" : "自动模式:关"
-        engineMenuItem?.title = cfg.engine == "codex" ? "引擎:Codex" : "引擎:Claude Code"
+        engineMenuItem?.title = engineMenuTitle(cfg.engine)
     }
 
     @objc func toggleAutoMode() {
@@ -2341,8 +2359,9 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggleEngine() {
+        // 菜单只在两个默认引擎间切换；其它引擎（pi/cursor/gemini/kimi/自定义）在设置页选择
         let cfg = loadAutoConfig()
-        saveAutoConfig(engine: cfg.engine == "codex" ? "claude" : "codex", auto: cfg.auto)
+        saveAutoConfig(engine: cfg.engine == "claude" ? "codex" : "claude", auto: cfg.auto)
         refreshAutoMenu()
     }
 
