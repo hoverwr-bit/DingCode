@@ -1,32 +1,70 @@
-# AI-toolbox
+# DingCode（AI-toolbox）
 
-A toolbox of local helpers for AI coding agents. The first tool is **DingAI** (formerly AnnoOverlay / anno): point at the screen, and the agent receives machine-readable JSON instead of a one-line description.
-
-**给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingAI**（原 AnnoOverlay / anno）：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
+**给写代码的 AI 用的本地工具箱。** 第一件工具是 **DingAI**：在屏幕上点一下，智能体拿到的是机器可读的 JSON，而不是一句「改左上角那个按钮」。
 
 DingAI drops pins on any app or web page and exports JSON: app, window, pixel coordinates, nearby OCR text and, inside a browser, the DOM element and field under the pin. Paste that into Claude Code, Codex or any other agent.
+
+## Editions / 版本
+
+| | Community 免费开源版 | Pro 专业版 | Team 团队版（开发中） |
+|---|---|---|---|
+| 定位钉 + JS 描述复制 | ✅ | ✅ | ✅ |
+| 箭头 / 方框 / 椭圆 / 聚光 / 文字 | — | ✅ | ✅ |
+| 改动范围检查 + 一键回退 | — | ✅ | ✅ |
+| 发布评审 / 归档 / 回退 | — | ✅ | ✅ |
+| 会话冲突检测 | — | ✅ | ✅ |
+| agent 工作流配置 + 钉过直接执行 | — | ✅ | ✅ |
+| 驾驶台（本地管理台） | — | ✅ | ✅ |
+| 共享目录 / 服务器同步 | — | ✅ | ✅ |
+| 团队服务端 + 账号 + 看板 | — | — | ✅ |
+| 授权 | MIT，随意商用 | 收费许可 | 按席位收费 |
+
+**Community 就是「定位钉 + 复制 JSON 给 agent」**，所有端（macOS / Windows / Linux / 页面）一致；其余功能通过 `core/edition.py` 门控，不藏私、可审计。
+
+**解锁 pro / team**（任选其一）：
+
+- 环境变量 `DINGAI_EDITION=pro`，或 `DINGAI_LICENSE=<DGA1 密钥>`
+- `~/DingAI/license.json` 写 `{"key": "DGA1-..."}`
+- 项目级：`<project>/.dingai/license.json`
+
+密钥格式 `DGA1-<pro|team>-<yyyymmdd 到期日>-<hmac>`，由团队服务端管理员接口 `POST /api/license/issue` 签发（自托管团队可用 `DINGAI_LICENSE_SECRET` 换成自己的密钥源）。`python3 tools/dingai/handoff.py edition` 随时查看当前版本与功能列表。
 
 ## Layout / 目录
 
 | Path | What |
 |---|---|
 | `tools/dingai/macos/` | DingAI menu-bar app (Swift, AppKit, ScreenCaptureKit, Vision). Live overlay: the app underneath stays usable; the screenshot is taken when you finish |
-| `tools/dingai/windows/` | DingAIWin, same JSON contract |
+| `tools/dingai/windows/` | DingAIWin. Live overlay by default, UI Automation anchors, same JSON contract |
+| `tools/dingai/linux/` | Linux session. X11 toolbar, optional grim / Tesseract / AT-SPI |
 | `tools/dingai/web/anno.js` | In-page annotation layer. Pins anchor to DOM elements and follow scrolling. Localhost bridge to the desktop app |
-| `tools/dingai/team-server/` | Optional self-hosted collector and board. No authentication — trusted network only |
+| `tools/dingai/core/` | Python standard library: note schema, label placement, edition gating, folder and server sync. Used by Linux, `handoff.py`, and `cockpit.py` |
+| `tools/dingai/cockpit.py` | 驾驶台：pro 本地管理台（127.0.0.1:8764）。钉 / 发布 / 工作流 / 会话一屏管理 |
+| `tools/dingai/team-server/` | Team 版自托管服务。账号、SQLite、Docker、license 签发。No telemetry |
 | `tools/dingai/probes/` | Diagnostic probes (display, capture, OCR, red-pixel scans) |
 
 ## Build / 构建
 
 - macOS 14+: `cd tools/dingai/macos && ./build.sh`  
   Signs with a local **DingAI Dev** identity if present, otherwise **AnnoOverlay Dev**, otherwise ad-hoc. Needs Screen Recording. Changing the bundle id to `io.github.dingai.mac` means granting that permission again.
-- Windows: `cd tools/dingai/windows && dotnet build`
-- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`.
-- Team server: `python3 tools/dingai/team-server/dingai_team_server.py`
+- Windows: `cd tools/dingai/windows && dotnet build`  
+  `Ctrl+Alt+A` starts a live session. Hold Alt to click the app underneath. `DINGAI_LIVE=0` freezes the screenshot first, as the older build did. B / C / Q set the next pin to bug, change, or question.
+- Linux: `python3 tools/dingai/linux/dingai_linux.py` on X11 or XWayland. `--check` prints which of X11, grim, Tesseract, and the AT-SPI bus are available. Focus the toolbar, press p then click to drop a pin. Pro: a / r / s and two clicks for an arrow, box, or spotlight. B / C / Q set the pin type. Esc exports under `~/DingAI/linux`.
+- Web: load `tools/dingai/web/anno.js`. Enable with `?anno=1`, `window.ANNO_V7_ADMIN = true`, or `window.ANNO_ADMIN_CHECK()`. Pro unlocks on a page with `window.DINGAI_EDITION = 'pro'` or a `dingai-license` localStorage key. The note dialog has a pin type.
+- Cockpit (pro): `python3 tools/dingai/cockpit.py` → http://127.0.0.1:8764
+- Team server: see [tools/dingai/team-server/DEPLOY.md](tools/dingai/team-server/DEPLOY.md).
+
+```
+export DINGAI_TEAM_ADMIN_TOKEN='choose-a-long-token'
+docker compose -f tools/dingai/team-server/compose.yaml up --build -d
+```
+
+Without Docker, from `tools/dingai/team-server`: `python3 dingai_team_server.py`. Put Caddy or nginx in front for HTTPS and leave the Python process on `127.0.0.1`. Do not commit the token or certificates.
+
+GitHub Actions (`.github/workflows/dingai.yml`) runs the Python and page checks and builds the server image on Ubuntu, `dotnet build` on Windows, and `swiftc` on macOS.
 
 ## Annotating
 
-`⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. Esc writes JSON and a PNG taken at that moment.
+`⌥⌘A` starts a session on the display under the pointer. The desktop stays live: the scroll wheel goes through to the app, hold ⌥ to click it, and `⌥⌘P` locks that click-through. Pins in a browser follow the element reported by the page bridge; other pins follow the Accessibility element when that permission is granted. B / C / Q set the selected pin to bug, change, or question. Esc writes JSON and a PNG taken at that moment. New pins start `open`. An agent can later mark one `ai-fixed`; a person confirms it on the team board.
 
 ## Desktop ↔ page bridge
 
@@ -34,11 +72,35 @@ The macOS app listens on `127.0.0.1:8763` only. A page that has loaded `anno.js`
 
 ## Configuration / 配置
 
+Clients stay local until you opt in. `~/DingAI/settings.json` is the switch:
+
+```json
+{ "mode": "folder", "share_dir": "/mnt/dingai", "project": "inbox" }
+```
+
+Server mode:
+
+```json
+{ "mode": "server", "server_url": "http://127.0.0.1:8050", "token": "paste-the-token", "project": "inbox" }
+```
+
+A shared folder is one directory on a NAS or a synced drive. Each pin is its own file under `projects/<project>/pins/`, written via a temp file and rename, so two people can add pins without clobbering each other. Screenshots sit in `shots/`. The page layer cannot read that file; publishing is done by the desktop clients.
+
 | Env var | Used by | Default |
 |---|---|---|
 | `DINGAI_OUTPUT_DIR` (fallback `ANNO_OUTPUT_DIR`) | macOS, path relative to home; Windows, under the user profile | `DingAI` |
-| `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) | macOS, comma-separated team server URLs | empty = no upload |
-| `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT` (fallback `ANNO_TEAM_*`) | team server | `127.0.0.1` / `8050` |
+| `DINGAI_MODE` | `local`, `folder`, or `server`. Overrides `settings.json` | `local` |
+| `DINGAI_SHARE_DIR` | shared-folder root | empty |
+| `DINGAI_TEAM_URLS` (fallback `ANNO_TEAM_URLS`) | team server URL. A value selects server mode when `DINGAI_MODE` is unset | empty = no upload |
+| `DINGAI_TEAM_TOKEN` | bearer token for that server | empty |
+| `DINGAI_PROJECT_NAME` | board or folder project | `inbox` |
+| `DINGAI_LIVE` | Windows. `0` freezes the screenshot at the start | live |
+| `DINGAI_EDITION` / `DINGAI_LICENSE` | unlock pro/team features (see Editions) | community |
+| `DINGAI_LICENSE_SECRET` | team server: custom HMAC secret for key issuance | built-in dev secret |
+| `DINGAI_TEAM_HOST` / `DINGAI_TEAM_PORT` (fallback `ANNO_TEAM_*`) | team server bind address | `127.0.0.1` / `8050` |
+| `DINGAI_TEAM_REQUIRE_AUTH` | `1` rejects anonymous upload. The Docker image sets this | off for a local process |
+| `DINGAI_TEAM_ADMIN_TOKEN` | first admin token. If unset, the process prints one random token once | unset |
+| `DINGAI_TEAM_ROOT` | SQLite, notes, and screenshots | `~/anno-team` |
 
 ## Handoff rules
 
@@ -46,23 +108,59 @@ Every clipboard export is a prompt: the handoff rules, then the JSON note. The n
 
 ```
 python3 tools/dingai/handoff.py prompt notes/anno.json
-python3 tools/dingai/handoff.py mcp
+python3 tools/dingai/handoff.py edition
 ```
 
 The defaults ask the coding agent for a minimal change, to follow the project's architecture file, to stay on the pinned element, to justify new dependencies, and to explain how the diff was verified.
 
+## Agent workflow（pro）
+
+`.dingai/workflow.json` describes what happens after a pin: an agent command plus checks. Initialize it with `handoff.py workflow init`:
+
+```json
+{
+  "name": "default",
+  "steps": [
+    { "agent": ["claude", "-p"], "input": "handoff-prompt" },
+    { "check": "scope" }
+  ]
+}
+```
+
+`{prompt}` inside an agent argument is replaced with the handoff text; without it the prompt goes to the agent's stdin. Then:
+
+```
+python3 tools/dingai/handoff.py run notes/anno.json --dry-run   # 先看计划
+python3 tools/dingai/handoff.py run notes/anno.json             # 钉过直接执行
+```
+
+`run` records the git baseline, feeds the note to the configured agent in the project directory, then runs the scope check. A step with `"optional": true` never aborts the run. The same actions are on the cockpit's 工作流 tab.
+
+## Scope check and rollback（pro）
+
 After the agent marks the pin fixed, compare the tree with the snapshot taken at export:
 
 ```
+python3 tools/dingai/handoff.py baseline
 python3 tools/dingai/handoff.py scope
+python3 tools/dingai/handoff.py reject
 ```
 
 The macOS and Windows menus have the same check (“检查本次改动”). Put the paths the pin should touch in `.dingai/scope.txt`, one prefix per line. The check warns about other files, new dependencies or lockfiles, new top-level directories, and a diff over 400 lines or 8 files. Rejecting restores only those paths, and only while `HEAD` is still the snapshot. It does not reset commits. The page copy does not snapshot git; the desktop export and `handoff.py prompt` do.
 
+## Release review（pro）
+
+`handoff.py release open note.json` builds a review batch: each pin, the before and after shots cropped on the review page around the pin, the diff stat since the handoff baseline, the scope warnings, the commit SHAs, and the handoff rules. Approve or reject every pin before `release publish`. A rejected or unreviewed pin blocks publishing unless `DINGAI_RELEASE_ADMIN=1` and `--override` gives a reason. That reason is stored on the release and in `releases/audit.jsonl`. The published record is read-only. `release search`, `release export <id> zip|markdown <dest>`, and `release rollback <id>` read it. Rollback points at the previous release and does not edit the archive. On the team board the same pages are under Releases. The server stores them in `<DINGAI_TEAM_ROOT>/state`. The cockpit 发布 tab offers the same buttons.
+
+## Session collisions（pro）
+
+`handoff.py session start` records the agent, repo, branch, pins, paths, and any services, ports, databases, or deploy targets. The same check runs when a prompt is built and when a pin is marked fixed. It warns, without stopping the handoff, about a shared repo and branch, overlapping paths, a pin claimed twice, a pin sent to the wrong project, a shared service or port or database or deploy target, and a working tree whose `HEAD` moved. `session choose <id> queue|isolate|hand|continue` queues the second session, makes a git worktree and branch, gives the pin to the session that already owns the area, or continues. Continue is written onto the session. Locks expire after four hours. `session end <id>` drops them and prints overlapping diffs. One user can keep this in `~/DingAI`. The team server stores the same records, and the board shows a yellow banner. The desktop clients read `~/DingAI/notices.json` and draw that banner. Set `DINGAI_SESSIONS=0` to skip the automatic check.
+
 ## JSON contract
 
-Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Arrows use `from_px` / `to_px`. Boxes use `rect_px`.
+Desktop notes use `schema: "dingai-desktop-v1"` and `tool: "dingai"`. The field set matches the previous `anno-desktop-v1` contract (`schema_compat` records that name): `pins[].x_px` / `y_px` are screenshot pixels with a top-left origin, plus `window_nx` / `window_ny`, `ocr_nearby`, optional `note`, optional `window`, and optional `page` from the browser bridge. Optional `pin_type` is `bug` (the default), `change`, or `question`. Optional `status` is `open` (the default), `ai-fixed`, or `confirmed`. Arrows use `from_px` / `to_px`. Boxes use `rect_px` and an optional `shape`. Page export stays `version: 7.9` and stores `pinType` and `status` on each annotation.
 
 ## License
 
-MIT
+- Community 版（`core/edition.py` 中 community 功能集 + 四端客户端的定位钉路径）：MIT
+- Pro / Team 功能为收费许可，授权密钥由团队服务端签发；自行托管并设置 `DINGAI_LICENSE_SECRET` 后，你的团队服务器即授权机构

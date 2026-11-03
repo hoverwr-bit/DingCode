@@ -9,7 +9,25 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py baseline [project]
   python3 handoff.py scope [project]
   python3 handoff.py reject [project]
+  python3 handoff.py pins [project]
+  python3 handoff.py mark-fixed <note_id> <pin_id> [verify.png]
+  python3 handoff.py release open [note.json] [--version V] [--tag T]
+  python3 handoff.py release decide <id> <pin> approve|reject [--reviewer name]
+  python3 handoff.py release publish <id> [--override reason] [--actor name]
+  python3 handoff.py release export <id> zip|markdown <dest>
+  python3 handoff.py release search <query>
+  python3 handoff.py release rollback <id>
+  python3 handoff.py session start --agent NAME --repo PATH --branch NAME [--project P] [--pin id] [--paths a,b] [--port 8080]
+  python3 handoff.py session choose <id> queue|isolate|hand|continue
+  python3 handoff.py session end <id>
+  python3 handoff.py session list
+  python3 handoff.py workflow [init]          # 查看 / 初始化 .dingai/workflow.json（pro）
+  python3 handoff.py run [note.json] [--dry-run]   # 钉过直接执行：prompt→agent→scope 检查（pro）
+  python3 handoff.py edition                  # 显示当前版本（community/pro/team）
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
+
+Editions: community (free, pin + JS prompt copy) / pro (cockpit, all features) / team.
+See core/edition.py. DINGAI_EDITION=pro or a DGA1 license key unlocks pro.
 """
 
 import json
@@ -115,6 +133,218 @@ def reject_tool_schema():
     }
 
 
+def list_tool_schema():
+    return {
+        "name": "dingai_list_pins",
+        "description": "List DingAI pins from the shared folder or the team server. Each pin includes its note id and screenshot name.",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}},
+    }
+
+
+def mark_tool_schema():
+    return {
+        "name": "dingai_mark_fixed",
+        "description": "Mark a pin ai-fixed and store a verification screenshot for the team to review.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"},
+                "note_id": {"type": "string"},
+                "pin_id": {"type": "string"},
+                "verification_path": {"type": "string"},
+                "comment": {"type": "string"},
+            },
+            "required": ["note_id", "pin_id"],
+        },
+    }
+
+
+def current_edition():
+    from core import edition
+    return edition
+
+
+def gate(feature):
+    """Raise EditionError when the current edition lacks a pro/team feature."""
+    return current_edition().require(feature)
+
+
+DEFAULT_WORKFLOW = {
+    "name": "default",
+    "steps": [
+        {"agent": ["claude", "-p"], "input": "handoff-prompt"},
+        {"check": "scope"},
+    ],
+}
+
+
+def workflow_path(project=None):
+    project = project if project is not None else project_dir()
+    if not project:
+        return ""
+    return os.path.join(project, ".dingai", "workflow.json")
+
+
+def load_workflow(project=None):
+    path = workflow_path(project)
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("steps"), list):
+                return data
+        except (OSError, ValueError):
+            pass
+    return dict(DEFAULT_WORKFLOW)
+
+
+def save_workflow(data, project=None):
+    path = workflow_path(project)
+    if not path:
+        return {"ok": False, "error": "no project dir (set DINGAI_PROJECT or ~/DingAI/project.txt)"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    return {"ok": True, "path": path}
+
+
+def expand_args(args, prompt):
+    return [str(a).replace("{prompt}", prompt) for a in args]
+
+
+def run_workflow(note_text, workflow=None, dry_run=False, project=None, stream=None):
+    """钉过直接执行：handoff prompt → agent 命令 → scope 检查。"""
+    gate("workflow")
+    project = project if project is not None else project_dir()
+    workflow = workflow or load_workflow(project)
+    out = stream or sys.stdout
+    prompt = prompt_for(note_text)
+    record_baseline(project)
+    observe_note(note_text, "run")
+    report = {"ok": True, "steps": [], "project": project, "workflow": workflow.get("name") or ""}
+    for index, step in enumerate(workflow.get("steps") or []):
+        if not isinstance(step, dict):
+            continue
+        if step.get("agent"):
+            argv = expand_args([str(a) for a in step["agent"]], prompt)
+            entry = {"step": index, "agent": argv}
+            report["steps"].append(entry)
+            if dry_run:
+                continue
+            if not project or not os.path.isdir(project):
+                report.update(ok=False, error="no project dir; cannot run the agent step")
+                return report
+            use_stdin = "{prompt}" not in [str(a) for a in step["agent"]]
+            try:
+                proc = subprocess.run(
+                    argv, cwd=project, text=True,
+                    input=prompt if use_stdin else None,
+                    capture_output=True, timeout=int(step.get("timeout") or 1800),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                entry["error"] = str(exc)
+                report.update(ok=False, error="agent step failed: %s" % exc)
+                return report
+            entry["returncode"] = proc.returncode
+            entry["stdout"] = proc.stdout
+            entry["stderr"] = proc.stderr
+            out.write(proc.stdout or "")
+            if proc.returncode != 0:
+                report.update(ok=False, error="agent exited with %d" % proc.returncode)
+                return report
+        elif step.get("check") == "scope":
+            entry = {"step": index, "check": "scope"}
+            report["steps"].append(entry)
+            if dry_run:
+                continue
+            check = scope_check(project)
+            entry["report"] = check
+            out.write(format_scope(check) + "\n")
+            if check.get("warnings") and not step.get("optional"):
+                report.update(ok=False, error="scope check reported warnings")
+                return report
+    return report
+
+
+def workflow_main(argv):
+    try:
+        gate("workflow")
+    except Exception as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    if len(argv) > 2 and argv[2] == "init":
+        result = save_workflow(dict(DEFAULT_WORKFLOW))
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    project = project_dir()
+    workflow = load_workflow(project)
+    sys.stdout.write(json.dumps({"project": project, "path": workflow_path(project) or "(default)",
+                                 "workflow": workflow}, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def run_main(argv):
+    try:
+        gate("workflow")
+    except Exception as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    args = [a for a in argv[2:] if a != "--dry-run"]
+    dry = "--dry-run" in argv[2:]
+    note = read_note(args[0] if args else "")
+    if dry:
+        workflow = load_workflow()
+        prompt = prompt_for(note)
+        plan = []
+        for step in workflow.get("steps") or []:
+            if isinstance(step, dict) and step.get("agent"):
+                argv2 = expand_args([str(a) for a in step["agent"]], prompt)
+                via = "arg {prompt}" if "{prompt}" in [str(a) for a in step["agent"]] else "stdin"
+                plan.append({"run": argv2, "prompt_via": via})
+            elif isinstance(step, dict) and step.get("check"):
+                plan.append({"check": step["check"]})
+        sys.stdout.write(json.dumps({"dry_run": True, "plan": plan}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    report = run_workflow(note)
+    if not dry:
+        sys.stderr.write(json.dumps({k: v for k, v in report.items() if k != "steps"}, ensure_ascii=False) + "\n")
+    return 0 if report.get("ok") else 1
+
+
+def edition_main():
+    sys.stdout.write(json.dumps(current_edition().describe(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def list_agent_pins(project=None):
+    gate("sync")
+    from core.sync import list_pins
+    return list_pins(project)
+
+
+def mark_fixed(arguments):
+    from core.sync import load_settings, set_pin_status
+    arguments = arguments or {}
+    note_id = arguments.get("note_id")
+    pin_id = arguments.get("pin_id")
+    if not note_id or pin_id in (None, ""):
+        return {"ok": False, "error": "note_id and pin_id are required"}
+    blob = None
+    path = arguments.get("verification_path") or ""
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+        except OSError as exc:
+            return {"ok": False, "error": "could not read verification screenshot: %s" % exc}
+    cfg = load_settings()
+    project = arguments.get("project") or cfg["project"]
+    result = set_pin_status(project, note_id, str(pin_id), "ai-fixed", blob, arguments.get("comment") or "")
+    observe_fixed(note_id, pin_id)
+    return result
+
+
 def call_handoff(arguments):
     arguments = arguments or {}
     if arguments.get("note_path"):
@@ -122,6 +352,7 @@ def call_handoff(arguments):
     else:
         note = arguments.get("note") or ""
     record_baseline()
+    observe_note(note, arguments.get("agent") or "")
     text = prompt_for(note)
     return {"content": [{"type": "text", "text": text}]}
 
@@ -335,19 +566,41 @@ def handle_rpc(msg):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [tool_schema(), scope_tool_schema(), reject_tool_schema()]}}
+        tools = [tool_schema()]
+        try:
+            gate("scope")
+            tools += [scope_tool_schema(), reject_tool_schema()]
+        except Exception:
+            pass
+        try:
+            gate("sync")
+            tools += [list_tool_schema(), mark_tool_schema()]
+        except Exception:
+            pass
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name == "dingai_handoff":
-            return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(arguments)}
-        if name == "dingai_scope_check":
-            report = scope_check(arguments.get("project") or None)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
-        if name == "dingai_reject":
-            result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        try:
+            if name == "dingai_handoff":
+                return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(arguments)}
+            if name == "dingai_scope_check":
+                gate("scope")
+                report = scope_check(arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
+            if name == "dingai_reject":
+                gate("scope")
+                result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+            if name == "dingai_list_pins":
+                result = list_agent_pins(arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+            if name == "dingai_mark_fixed":
+                result = mark_fixed(arguments)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True}}
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
     if mid is None:
         return None
@@ -390,18 +643,350 @@ def serve_mcp(stdin, stdout):
             write_message(reply, stdout)
 
 
+def state_root():
+    from core.sync import load_settings
+    cfg = load_settings()
+    if cfg["mode"] == "folder" and cfg["share_dir"]:
+        return os.path.join(cfg["share_dir"], "dingai-state")
+    env = os.environ.get("DINGAI_STATE_DIR", "").strip()
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), "DingAI")
+
+
+def _flag(argv, name):
+    if name in argv:
+        index = argv.index(name)
+        if index + 1 < len(argv):
+            return argv[index + 1]
+    return ""
+
+
+def open_from_note(path, version="", tag=""):
+    from core.release import open_release
+    try:
+        note = json.loads(read_note(path) or "{}")
+    except ValueError:
+        note = {}
+    if not isinstance(note, dict):
+        note = {}
+    note_id = str(note.get("file") or note.get("id") or "note")
+    project = project_dir()
+    report = scope_check(project) if project else {}
+    base = (load_baseline(project) or {}).get("head") if project else ""
+    diff = ""
+    commits = []
+    if project and base:
+        diff = git(project, ["diff", "--stat", "--no-renames", base]) or ""
+        commits = [line for line in (git(project, ["log", "--format=%H", "%s..HEAD" % base]) or "").splitlines() if line]
+    parent = os.path.dirname(os.path.abspath(path)) if path else ""
+    before = ""
+    shot_name = str(note.get("screenshot") or "")
+    if shot_name:
+        for candidate in (
+            os.path.join(parent, shot_name) if parent else "",
+            os.path.join(os.path.expanduser("~"), "DingAI", "shots", os.path.basename(shot_name)),
+        ):
+            if candidate and os.path.isfile(candidate):
+                before = candidate
+                break
+    pins = []
+    shots = {}
+    for pin in note.get("pins") or []:
+        if not isinstance(pin, dict):
+            continue
+        pid = pin.get("id")
+        key = "%s:%s" % (note_id, pid)
+        row = dict(pin)
+        row["note_id"] = note_id
+        row["pin_id"] = pid
+        row["key"] = key
+        pins.append(row)
+        after = ""
+        if parent:
+            verify = os.path.join(parent, "verify-%s-%s.png" % (note_id, pid))
+            if os.path.isfile(verify):
+                after = verify
+        if before or after:
+            shots[key] = {"before": before, "after": after}
+    return open_release(
+        state_root(), pins, version=version, tag=tag,
+        project=str(note.get("project") or ""), repo=project or "",
+        rules=load_rules(), diff_summary=diff,
+        scope_warnings=report.get("warnings") or [],
+        head=report.get("head") or "", commits=commits, shots=shots,
+    )
+
+
+def sessions_enabled():
+    return os.environ.get("DINGAI_SESSIONS", "1") != "0"
+
+
+def _csv(argv, name):
+    text = _flag(argv, name)
+    return [part.strip() for part in text.split(",") if part.strip()] if text else []
+
+
+def mirror_notices():
+    home = os.path.join(os.path.expanduser("~"), "DingAI", "notices.json")
+    src = os.path.join(state_root(), "notices.json")
+    if os.path.abspath(src) == os.path.abspath(home) or not os.path.isfile(src):
+        return
+    os.makedirs(os.path.dirname(home), exist_ok=True)
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read()
+    with open(home, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def push_session(path, body):
+    from core.sync import load_settings
+    cfg = load_settings()
+    if cfg["mode"] != "server" or not cfg["server_url"]:
+        return None
+    import urllib.request
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("token"):
+        headers["Authorization"] = "Bearer " + cfg["token"]
+    req = urllib.request.Request(cfg["server_url"].rstrip("/") + path, data=json.dumps(body).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except Exception:
+        return None
+
+
+def register_observed(fields):
+    if not sessions_enabled():
+        return None
+    from core.collide import register, write_notices
+    local = register(state_root(), fields)
+    remote = push_session("/api/sessions", fields)
+    if remote and "warnings" in remote:
+        write_notices(state_root(), remote.get("warnings") or [])
+        local = remote
+    mirror_notices()
+    banner = (local or {}).get("banner") or ""
+    if banner:
+        sys.stderr.write(banner + "\n")
+    return local
+
+
+def observe_note(note_text, agent=""):
+    if not sessions_enabled():
+        return None
+    try:
+        note = json.loads(note_text or "")
+    except ValueError:
+        note = {}
+    if not isinstance(note, dict):
+        note = {}
+    pins = []
+    projects = {}
+    paths = []
+    for pin in note.get("pins") or []:
+        if not isinstance(pin, dict):
+            continue
+        key = "%s:%s" % (note.get("file") or note.get("id") or "note", pin.get("id"))
+        pins.append(key)
+        if pin.get("project"):
+            projects[key] = pin["project"]
+        for path in pin.get("paths") or []:
+            paths.append(path)
+    repo = project_dir()
+    if not repo and not pins:
+        return None
+    branch = ""
+    if repo:
+        branch = (git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]) or "").strip()
+    return register_observed({
+        "agent": agent or os.environ.get("DINGAI_AGENT") or "handoff",
+        "repo": repo,
+        "branch": branch,
+        "project": str(note.get("project") or ""),
+        "pins": pins,
+        "pin_projects": projects,
+        "paths": paths,
+    })
+
+
+def observe_fixed(note_id, pin_id):
+    if not sessions_enabled():
+        return None
+    from core.collide import list_sessions
+    repo = project_dir()
+    active = [
+        row for row in list_sessions(state_root())
+        if row.get("status") == "active" and (not repo or row.get("repo") == repo)
+    ]
+    if not active:
+        return None
+    session = active[-1]
+    pins = [str(pin) for pin in session.get("pins") or []]
+    key = "%s:%s" % (note_id, pin_id)
+    if key not in pins:
+        pins.append(key)
+    return register_observed({
+        "agent": session.get("agent") or "handoff",
+        "repo": session.get("repo") or "",
+        "branch": session.get("branch") or "",
+        "project": session.get("project") or "",
+        "pins": pins,
+        "pin_projects": session.get("pin_projects") or {},
+        "paths": session.get("paths") or [],
+        "ports": session.get("ports") or [],
+        "services": session.get("services") or [],
+        "databases": session.get("databases") or [],
+        "deploys": session.get("deploys") or [],
+        "head": session.get("head") or "",
+    })
+
+
+def session_fields(argv):
+    return {
+        "agent": _flag(argv, "--agent") or os.environ.get("DINGAI_AGENT") or "handoff",
+        "repo": _flag(argv, "--repo") or project_dir(),
+        "branch": _flag(argv, "--branch"),
+        "project": _flag(argv, "--project"),
+        "pins": _csv(argv, "--pin"),
+        "paths": _csv(argv, "--paths"),
+        "services": _csv(argv, "--services"),
+        "ports": _csv(argv, "--ports"),
+        "databases": _csv(argv, "--databases"),
+        "deploys": _csv(argv, "--deploys"),
+    }
+
+
+def session_main(argv):
+    from core import collide
+    if len(argv) < 3:
+        sys.stderr.write("usage: handoff.py session start|choose|end|list\n")
+        return 2
+    root = state_root()
+    sub = argv[2]
+    if sub == "list":
+        sys.stdout.write(json.dumps(collide.list_sessions(root), ensure_ascii=False) + "\n")
+        return 0
+    if sub == "start":
+        fields = session_fields(argv)
+        if not fields["branch"] and fields["repo"]:
+            fields["branch"] = (git(fields["repo"], ["rev-parse", "--abbrev-ref", "HEAD"]) or "").strip()
+        result = collide.register(root, fields)
+        push_session("/api/sessions", fields)
+        mirror_notices()
+        banner = result.get("banner") or ""
+        if banner:
+            sys.stderr.write(banner + "\n")
+        sys.stdout.write(json.dumps({"ok": True, "id": result["session"]["id"], "warnings": result.get("warnings") or []}, ensure_ascii=False) + "\n")
+        return 0
+    if sub == "choose":
+        if len(argv) < 5:
+            sys.stderr.write("usage: handoff.py session choose <id> queue|isolate|hand|continue\n")
+            return 2
+        result = collide.choose(root, argv[3], argv[4], actor=_flag(argv, "--actor") or "local")
+        push_session("/api/sessions/%s/choose" % argv[3], {"choice": argv[4]})
+        mirror_notices()
+        sys.stdout.write(json.dumps({"ok": result.get("ok"), "error": result.get("error", ""), "status": (result.get("session") or {}).get("status", "")}) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "end":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py session end <id>\n")
+            return 2
+        result = collide.end_session(root, argv[3])
+        push_session("/api/sessions/%s/end" % argv[3], {})
+        mirror_notices()
+        sys.stdout.write(json.dumps({"ok": result.get("ok"), "overlaps": result.get("overlaps") or [], "error": result.get("error", "")}, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    sys.stderr.write("unknown session command\n")
+    return 2
+
+
+def release_main(argv):
+    from core import release as rel
+    if len(argv) < 3:
+        sys.stderr.write("usage: handoff.py release open|decide|publish|export|search|rollback\n")
+        return 2
+    sub = argv[2]
+    root = state_root()
+    if sub == "open":
+        path = argv[3] if len(argv) > 3 and not str(argv[3]).startswith("--") else ""
+        opened = open_from_note(path, _flag(argv, "--version"), _flag(argv, "--tag"))
+        page = os.path.join(root, "releases", opened["id"], "review.html")
+        sys.stdout.write(json.dumps({"ok": True, "id": opened["id"], "page": page}) + "\n")
+        return 0
+    if sub == "decide":
+        if len(argv) < 6:
+            sys.stderr.write("usage: handoff.py release decide <id> <pin> approve|reject\n")
+            return 2
+        result = rel.decide(root, argv[3], argv[4], argv[5], _flag(argv, "--reviewer"))
+        sys.stdout.write(json.dumps({k: v for k, v in result.items() if k != "release"}) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "publish":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py release publish <id> [--override reason]\n")
+            return 2
+        result = rel.publish(
+            root, argv[3], actor=_flag(argv, "--actor") or "local",
+            admin=os.environ.get("DINGAI_RELEASE_ADMIN") == "1",
+            override_reason=_flag(argv, "--override"),
+        )
+        sys.stdout.write(json.dumps({k: v for k, v in result.items() if k != "release"}, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "export":
+        if len(argv) < 6:
+            sys.stderr.write("usage: handoff.py release export <id> zip|markdown <dest>\n")
+            return 2
+        result = rel.export_release(root, argv[3], argv[4], argv[5])
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if sub == "search":
+        query = argv[3] if len(argv) > 3 else ""
+        sys.stdout.write(json.dumps(rel.search_releases(root, query), ensure_ascii=False) + "\n")
+        return 0
+    if sub == "rollback":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py release rollback <id>\n")
+            return 2
+        result = rel.rollback(root, argv[3], _flag(argv, "--actor") or "local")
+        body = {"ok": result.get("ok"), "error": result.get("error", ""), "id": (result.get("release") or {}).get("id", ""), "restores": (result.get("release") or {}).get("restores", "")}
+        sys.stdout.write(json.dumps(body) + "\n")
+        return 0 if result.get("ok") else 1
+    sys.stderr.write("unknown release command\n")
+    return 2
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "rules"
     if cmd in ("-h", "--help", "help"):
         sys.stdout.write(__doc__ or "")
         return 0
+    if cmd == "edition":
+        return edition_main()
+    if cmd == "workflow":
+        return workflow_main(argv)
+    if cmd == "run":
+        return run_main(argv)
+    # Everything below is gated by edition; community keeps rules + prompt only.
+    gates = {
+        "baseline": "scope", "scope": "scope", "reject": "scope",
+        "pins": "sync", "mark-fixed": "sync",
+        "release": "release", "session": "session",
+    }
+    if cmd in gates:
+        try:
+            gate(gates[cmd])
+        except Exception as exc:
+            sys.stderr.write("%s\n" % exc)
+            return 1
     if cmd == "rules":
         sys.stdout.write(load_rules() + "\n")
         return 0
     if cmd == "prompt":
         path = argv[2] if len(argv) > 2 else ""
         record_baseline()
-        sys.stdout.write(prompt_for(read_note(path)))
+        note = read_note(path)
+        observe_note(note, "")
+        sys.stdout.write(prompt_for(note))
         return 0
     if cmd == "baseline":
         saved = record_baseline(argv[2] if len(argv) > 2 else None)
@@ -418,6 +1003,24 @@ def main(argv):
         result = reject_changes(None, argv[2] if len(argv) > 2 else None)
         sys.stdout.write(json.dumps(result) + "\n")
         return 0 if result.get("ok") else 1
+    if cmd == "pins":
+        sys.stdout.write(json.dumps(list_agent_pins(argv[2] if len(argv) > 2 else None), ensure_ascii=False, indent=2) + "\n")
+        return 0
+    if cmd == "mark-fixed":
+        if len(argv) < 4:
+            sys.stderr.write("usage: handoff.py mark-fixed <note_id> <pin_id> [verify.png]\n")
+            return 2
+        result = mark_fixed({
+            "note_id": argv[2],
+            "pin_id": argv[3],
+            "verification_path": argv[4] if len(argv) > 4 else "",
+        })
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 0 if result.get("ok") else 1
+    if cmd == "release":
+        return release_main(argv)
+    if cmd == "session":
+        return session_main(argv)
     if cmd == "mcp":
         serve_mcp(sys.stdin.buffer, sys.stdout.buffer)
         return 0

@@ -15,6 +15,7 @@ import Vision
 import ScreenCaptureKit
 import Network
 import ApplicationServices
+import StoreKit
 
 // MARK: - 数据模型(截图像素坐标,左上原点)
 
@@ -51,6 +52,8 @@ struct PinRecord {
     var anchorKey: String?
     var anchorNote: String?
     var scroll: ScrollSample?
+    var pinType: String = "bug"     // bug | change | question
+    var status: String = "open"     // open | ai-fixed | confirmed
 }
 
 struct ArrowRecord {
@@ -96,6 +99,105 @@ struct OcrTextItem {
     var text: String
     var cx: Double        // 截图像素
     var cy: Double
+}
+
+// MARK: - 版本门控(edition)
+// community(免费开源)=定位钉+复制JSON；pro/team=箭头/方框/椭圆/聚光/文字等全部工具。
+// 解锁：环境变量 DINGAI_LICENSE(原始密钥)/DINGAI_EDITION，或 ~/DingAI/license.json {"key":"DGA1-..."}。
+func currentEdition() -> String {
+    let env = ProcessInfo.processInfo.environment
+    for key in ["DINGAI_LICENSE", "DINGAI_EDITION"] {
+        guard let raw = env[key], !raw.isEmpty else { continue }
+        let low = raw.lowercased()
+        if low.hasPrefix("dga1-pro") { return "pro" }
+        if low.hasPrefix("dga1-team") { return "team" }
+        if low == "pro" || low == "team" { return low }
+    }
+    let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/license.json")
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let edition = (obj["edition"] as? String)?.lowercased(), edition == "pro" || edition == "team" {
+            return edition   // App Store 解锁记录（StoreKit 验证后由 App 写入）
+        }
+        if let key = (obj["key"] as? String)?.lowercased() {
+            if key.hasPrefix("dga1-pro") { return "pro" }
+            if key.hasPrefix("dga1-team") { return "team" }
+        }
+    }
+    return "community"
+}
+
+// MARK: - App Store 内购解锁(StoreKit 2)
+// 买断型 IAP：购买/恢复成功后写 ~/DingAI/license.json {"edition":"pro","source":"appstore"}，
+// currentEdition() 与 core/edition.py 都认这个记录；与 DGA1 密钥体系并行，密钥由网页渠道发放。
+@MainActor
+final class ProStore {
+    static let shared = ProStore()
+    static let productId = "dev.dingcode.pro.lifetime"
+    private var listenTask: Task<Void, Never>?
+
+    func start() {
+        guard listenTask == nil else { return }
+        listenTask = Task { [weak self] in
+            for await result in Transaction.updates {
+                if case .verified(let tx) = result, tx.productID == Self.productId {
+                    self?.activate()
+                }
+            }
+        }
+    }
+
+    func restore() async -> Bool {
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let tx) = result, tx.productID == Self.productId {
+                activate()
+                return true
+            }
+        }
+        return false
+    }
+
+    func purchase() async -> String {
+        do {
+            let products = try await Product.products(for: [Self.productId])
+            guard let product = products.first else { return "商品尚未在 App Store Connect 配置" }
+            let result = try await product.purchase()
+            switch result {
+            case .success(let verification):
+                if case .verified(let tx) = verification {
+                    activate()
+                    await tx.finish()
+                    return ""
+                }
+                return "购买凭证校验失败"
+            case .userCancelled:
+                return ""
+            case .pending:
+                return "等待审核(家庭共享/儿童账户)，批准后会自动解锁"
+            @unknown default:
+                return "购买未完成"
+            }
+        } catch {
+            return "购买失败: \(error.localizedDescription)"
+        }
+    }
+
+    private func activate() {
+        Self.writeProLicense()
+        let alert = NSAlert()
+        alert.messageText = "DingCode 专业版已解锁"
+        alert.informativeText = "重启 DingAI 后生效：箭头、方框、聚光、驾驶台与 agent 工作流全部可用。"
+        alert.runModal()
+    }
+
+    static func writeProLicense() {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = ["edition": "pro", "source": "appstore"]
+        if let data = try? JSONSerialization.data(withJSONObject: obj) {
+            try? data.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("license.json")))
+        }
+    }
 }
 
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
@@ -535,6 +637,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        ProStore.shared.start()
         setupStatusBar()
         registerHotKey()
         trackFrontmostApp()
@@ -568,6 +671,32 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     // MARK: 状态栏
 
+    @objc func upgradePro() {
+        Task { @MainActor in
+            ProStore.shared.start()
+            let message = await ProStore.shared.purchase()
+            if !message.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "升级专业版"
+                alert.informativeText = message
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc func restorePro() {
+        Task { @MainActor in
+            ProStore.shared.start()
+            let ok = await ProStore.shared.restore()
+            if !ok {
+                let alert = NSAlert()
+                alert.messageText = "恢复购买"
+                alert.informativeText = "没有找到专业版购买记录。请确认使用的 Apple ID 与购买时一致。"
+                alert.runModal()
+            }
+        }
+    }
+
     func setupStatusBar() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         // 图标:自绘图钉(模板图,深浅菜单栏自动适配)
@@ -585,6 +714,14 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                             action: nil, keyEquivalent: "")
         st.isEnabled = false
         menu.addItem(st)
+        if currentEdition() == "community" {
+            menu.addItem(withTitle: "升级专业版…", action: #selector(upgradePro), keyEquivalent: "")
+            menu.addItem(withTitle: "恢复购买", action: #selector(restorePro), keyEquivalent: "")
+        } else {
+            let edItem = NSMenuItem(title: "DingCode \(currentEdition()) 版已解锁", action: nil, keyEquivalent: "")
+            edItem.isEnabled = false
+            menu.addItem(edItem)
+        }
         menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
         menu.autoenablesItems = false
         item.menu = menu
@@ -849,6 +986,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)   // 修「首击不算」:无激活时第一次点击只激活窗口不进画布
         overlay = win
+        win.annoView.noticeBanner = noticeBannerText()
         if live && cg == nil {
             win.annoView.flashBubble("实时:滚轮穿透 · 按住⌥操作下层 · ⌥⌘P锁定")
         }
@@ -987,31 +1125,105 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         overlay?.orderOut(nil)
         overlay = nil
         shotCG = nil
-        if let shotCopy { reportToTeam(jsonData: data, shotFile: shotCopy) }
+        reportToTeam(json: json, jsonData: data, noteFile: url, shotFile: shotCopy)
         done?()
     }
 
-    // MARK: 团队账本上报(configurable team server via ANNO_TEAM_URLS,失败静默跳过)
+    // MARK: 团队同步(环境变量或 ~/DingAI/settings.json;失败静默跳过)
 
-    static let teamHosts: [String] = (ProcessInfo.processInfo.environment["DINGAI_TEAM_URLS"] ?? ProcessInfo.processInfo.environment["ANNO_TEAM_URLS"] ?? "").split(separator: ",").map { String($0) }.filter { !$0.isEmpty }   // e.g. DINGAI_TEAM_URLS=http://team-host:8050
+    struct SyncChoice {
+        var mode: String
+        var share: String
+        var hosts: [String]
+        var token: String
+        var project: String
+    }
 
-    func reportToTeam(jsonData: Data, shotFile: URL) {
+    func syncChoice() -> SyncChoice {
+        var mode = "local"
+        var share = ""
+        var server = ""
+        var token = ""
+        var project = "inbox"
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/settings.json")
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let m = obj["mode"] as? String, !m.isEmpty { mode = m }
+            if let s = obj["share_dir"] as? String { share = s }
+            if let s = obj["server_url"] as? String { server = s }
+            if let s = obj["token"] as? String { token = s }
+            if let s = obj["project"] as? String, !s.isEmpty { project = s }
+        }
+        let env = ProcessInfo.processInfo.environment
+        if let m = env["DINGAI_MODE"], !m.isEmpty { mode = m }
+        if let s = env["DINGAI_SHARE_DIR"], !s.isEmpty { share = s }
+        if let s = env["DINGAI_TEAM_URLS"] ?? env["ANNO_TEAM_URLS"], !s.isEmpty { server = s }
+        if let s = env["DINGAI_TEAM_TOKEN"], !s.isEmpty { token = s }
+        if let s = env["DINGAI_PROJECT_NAME"], !s.isEmpty { project = s }
+        if mode == "local" && !share.isEmpty { mode = "folder" }
+        if mode == "local" && !server.isEmpty { mode = "server" }
+        if mode != "folder" && mode != "server" { mode = "local" }
+        let hosts = server.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let safe = project.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: "\\", with: "-")
+        return SyncChoice(mode: mode, share: share, hosts: hosts, token: token, project: safe.isEmpty ? "inbox" : safe)
+    }
+
+    func reportToTeam(json: [String: Any], jsonData: Data, noteFile: URL, shotFile: URL?) {
+        let choice = syncChoice()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            for host in Self.teamHosts {
-                guard let shotName = self.postJson(host, data: jsonData) else { continue }
-                self.postShot(host, name: shotName, file: shotFile)
-                return
+            if choice.mode == "folder", !choice.share.isEmpty {
+                self.publishFolder(choice, json: json, jsonData: jsonData, noteFile: noteFile, shotFile: shotFile)
+            }
+            if choice.mode == "server" {
+                for host in choice.hosts {
+                    guard let shotName = self.postJson(host, data: jsonData, token: choice.token) else { continue }
+                    if let shotFile { self.postShot(host, name: shotName, file: shotFile, token: choice.token) }
+                    return
+                }
             }
         }
     }
 
+    func publishFolder(_ choice: SyncChoice, json: [String: Any], jsonData: Data, noteFile: URL, shotFile: URL?) {
+        let noteId = noteFile.deletingPathExtension().lastPathComponent
+        let base = URL(fileURLWithPath: choice.share).appendingPathComponent("projects").appendingPathComponent(choice.project)
+        atomicWrite(jsonData, to: base.appendingPathComponent("notes").appendingPathComponent(noteId + ".json"))
+        let shotName = shotFile?.lastPathComponent ?? ""
+        if let shotFile, let png = try? Data(contentsOf: shotFile), !shotName.isEmpty {
+            atomicWrite(png, to: base.appendingPathComponent("shots").appendingPathComponent(shotName))
+        }
+        for pin in json["pins"] as? [[String: Any]] ?? [] {
+            var row = pin
+            row["note_id"] = noteId
+            row["project"] = choice.project
+            row["screenshot"] = shotName
+            let pinId = row["id"] ?? 0
+            guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.prettyPrinted, .sortedKeys]) else { continue }
+            atomicWrite(data, to: base.appendingPathComponent("pins").appendingPathComponent("\(noteId)--\(pinId).json"))
+        }
+    }
+
+    func atomicWrite(_ data: Data, to url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let tmp = url.appendingPathExtension("tmp")
+        do {
+            try data.write(to: tmp)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+        } catch { }
+    }
+
     @discardableResult
-    func postJson(_ host: String, data: Data) -> String? {
+    func postJson(_ host: String, data: Data, token: String) -> String? {
         guard let url = URL(string: host + "/api/note") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 6
         req.httpBody = data
         var shotName: String?
@@ -1027,12 +1239,13 @@ final class AnnoController: NSObject, NSApplicationDelegate {
         return shotName
     }
 
-    func postShot(_ host: String, name: String, file: URL) {
+    func postShot(_ host: String, name: String, file: URL, token: String) {
         guard let png = try? Data(contentsOf: file),
               let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: host + "/api/shot/" + enc) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 20
         req.httpBody = png
         let sem = DispatchSemaphore(value: 0)
@@ -1050,7 +1263,8 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             case .pin(let p):
                 var near = p.ocrNearby
                 if near == "OCR…" { near = ocrNear(x: p.x, y: p.y) }
-                var d: [String: Any] = ["id": p.id, "x_px": p.x, "y_px": p.y, "ocr_nearby": near]
+                var d: [String: Any] = ["id": p.id, "x_px": p.x, "y_px": p.y, "ocr_nearby": near,
+                                        "pin_type": p.pinType, "status": p.status]
                 if let note = p.note { d["note"] = note }
                 if let o = p.windowOwner {
                     d["window"] = ["owner": o, "title": p.windowTitle ?? ""] as [String: Any]
@@ -1117,6 +1331,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             "screenshot": shotURL?.lastPathComponent ?? NSNull(),
             "screen_capture_ok": (shotCG != nil),
             "live": live,
+            "project": syncChoice().project,
             "handoff_rules": handoffRules(),
         ]
         return json
@@ -1153,6 +1368,14 @@ final class AnnoController: NSObject, NSApplicationDelegate {
             }
         }
         return Self.defaultHandoffRules
+    }
+
+    func noticeBannerText() -> String {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/notices.json")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["banners"] as? [[String: Any]] else { return "" }
+        return rows.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     func handoffPrompt(_ json: String) -> String {
@@ -1446,6 +1669,7 @@ final class AnnotationView: NSView {
     var draftTo: NSPoint?
     var hoverPoint: NSPoint?
     var curColor = "red"
+    var pinType = "bug"
     var curWidth = 4
     var drawMode = 1        // 0选择 1箭头 2方框 3椭圆 4聚光 5文字
     var selectedIndex: Int?
@@ -1567,7 +1791,7 @@ final class AnnotationView: NSView {
         let pinId = nextId
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
-                                    windowFrame: win?.frame, pageInfo: nil)))
+                                    windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
         let idx = items.count - 1
         nextId += 1
         selectedIndex = idx
@@ -1699,7 +1923,7 @@ final class AnnotationView: NSView {
         let pinId = nextId
         items.append(.pin(PinRecord(id: pinId, x: x, y: y, ocrNearby: near, note: nil,
                                     windowOwner: win?.owner, windowTitle: win?.title,
-                                    windowFrame: win?.frame, pageInfo: nil)))
+                                    windowFrame: win?.frame, pageInfo: nil, pinType: pinType)))
         let idx = items.count - 1
         nextId += 1
         needsDisplay = true
@@ -1745,6 +1969,9 @@ final class AnnotationView: NSView {
         case UInt16(kVK_Escape): controller?.finish(copyToPasteboard: true)
         case UInt16(kVK_ANSI_Z) where event.modifierFlags.contains(.command): undo()
         case UInt16(kVK_Delete), UInt16(kVK_ForwardDelete): deleteSelection()
+        case UInt16(kVK_ANSI_B): setPinKind("bug")
+        case UInt16(kVK_ANSI_C): setPinKind("change")
+        case UInt16(kVK_ANSI_Q): setPinKind("question")
         default: super.keyDown(with: event)
         }
     }
@@ -1753,6 +1980,14 @@ final class AnnotationView: NSView {
         textAnchor = p
         beginNoteEditing(pinIndex: -1, at: p)
         noteField?.placeholderString = "文字:回车确认"
+    }
+
+    func setPinKind(_ kind: String) {
+        pinType = kind
+        guard let idx = selectedIndex, items.indices.contains(idx), case .pin(var p) = items[idx] else { return }
+        p.pinType = kind
+        items[idx] = .pin(p)
+        needsDisplay = true
     }
 
     func deleteSelection() {
@@ -1978,6 +2213,15 @@ final class AnnotationView: NSView {
             NSColor.black.withAlphaComponent(0.85).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
             (t as NSString).draw(at: NSPoint(x: rect.minX + 8, y: rect.minY + 4), withAttributes: attr)
+        }
+        if !noticeBanner.isEmpty {
+            let bar = NSRect(x: 12, y: bounds.height - 40, width: min(bounds.width - 24, 860), height: 28)
+            NSColor(calibratedRed: 1, green: 0.85, blue: 0.35, alpha: 0.95).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 6, yRadius: 6).fill()
+            let attr: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.black]
+            (noticeBanner as NSString).draw(in: bar.insetBy(dx: 8, dy: 6), withAttributes: attr)
         }
     }
 
@@ -2420,7 +2664,9 @@ final class AnnotationView: NSView {
     var modeTextBtn: NSButton?
 
     func installToolBar() {
-        let bar = DragBar(frame: NSRect(x: bounds.midX - 560, y: 16, width: 1120, height: 44))
+        let pro = currentEdition() != "community"
+        let barWidth: CGFloat = pro ? 1120 : 480
+        let bar = DragBar(frame: NSRect(x: bounds.midX - barWidth / 2, y: 16, width: barWidth, height: 44))
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
         bar.layer?.cornerRadius = 10
@@ -2429,39 +2675,44 @@ final class AnnotationView: NSView {
 
         var x: CGFloat = 12
         // 0选择 1箭头 2方框 3椭圆 4聚光 5文字。单击(非选择/文字)仍落钉。
+        // community 免费版只装「选择」：落钉、复制JSON、完成；箭头/方框/椭圆/聚光/文字为 pro。
         let sel = textBtn("选择", frame: NSRect(x: x, y: 8, width: 52, height: 28))
         sel.tag = 20; sel.action = #selector(pickMode(_:)); sel.target = self
         bar.addSubview(sel); modeSelectBtn = sel; x += 56
-        let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
-        bar.addSubview(a); modeArrowBtn = a; x += 74
-        let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
-        bar.addSubview(b); modeBoxBtn = b; x += 74
-        let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
-        bar.addSubview(e); modeEllipseBtn = e; x += 74
-        let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
-        bar.addSubview(spot); modeSpotBtn = spot; x += 74
-        let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
-        tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
-        bar.addSubview(tx); modeTextBtn = tx; x += 72
+        if pro {
+            let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
+            bar.addSubview(a); modeArrowBtn = a; x += 74
+            let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
+            bar.addSubview(b); modeBoxBtn = b; x += 74
+            let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
+            bar.addSubview(e); modeEllipseBtn = e; x += 74
+            let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
+            bar.addSubview(spot); modeSpotBtn = spot; x += 74
+            let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
+            tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
+            bar.addSubview(tx); modeTextBtn = tx; x += 72
+        }
         refreshModeButtons()
 
-        for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
-            let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
-            dot.action = #selector(pickColor(_:)); dot.tag = tag
-            dot.target = self
-            bar.addSubview(dot); x += 26
+        if pro {
+            for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
+                let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
+                dot.action = #selector(pickColor(_:)); dot.tag = tag
+                dot.target = self
+                bar.addSubview(dot); x += 26
+            }
+            x += 8
+            for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
+                let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
+                w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
+                bar.addSubview(w); x += 36
+            }
+            x += 10
         }
-        x += 8
-        for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
-            let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
-            w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
-            bar.addSubview(w); x += 36
-        }
-        x += 10
         let acts: [(String, Selector)] = [("⌘Z撤销", #selector(undo)),
                                           ("清空", #selector(clearAll)),
                                           ("复制JSON", #selector(copyJSON)),
@@ -2532,6 +2783,7 @@ final class AnnotationView: NSView {
 
     var labelObstacles: [LayoutRect] = []
 
+    var noticeBanner = ""
     var flashText: String?
     var flashUntil = Date.distantPast
     func flashBubble(_ t: String) {

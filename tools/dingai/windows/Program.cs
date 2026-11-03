@@ -1,7 +1,7 @@
-// DingAIWin — 系统级批注 Windows 版 v0.1
+// DingAIWin — 系统级批注 Windows 版
 // 交互与 JSON 契约(dingai-desktop-v1)对齐 macOS 版:
-//   Ctrl+Alt+A → 冻结截屏 → 单击落钉(XY辅助线+坐标气泡+信息签+备注输入)/拖拽箭头/框选
-//   → Esc/完成 = JSON+剪贴板+落盘(%USERPROFILE%\DingAI\notes|shots)
+//   Ctrl+Alt+A → 默认实时批注(DINGAI_LIVE=0 才冻结截屏) → 单击落钉 / 拖拽箭头或框
+//   按住 Alt 把点击交给下层。Esc/完成 = 此时截图 + JSON + 剪贴板 + 落盘
 // 托盘常驻(自绘图钉图标);--auto-test 自动模式(无人工交互,落样例后退出)
 
 using System;
@@ -38,6 +38,9 @@ using Rectangle = System.Windows.Shapes.Rectangle;
 using Path = System.IO.Path;
 using Application = System.Windows.Application;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Windows.Automation;
 
 namespace DingAIWin;
 
@@ -54,8 +57,14 @@ internal static class Win32
     public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
 
     public const int WM_HOTKEY = 0x0312;
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_TRANSPARENT = 0x20;
+    public const int VK_MENU = 0x12;
     public const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2;
     public const uint VK_A = 0x41;
 
@@ -74,9 +83,17 @@ record PinRec(int Id, int X, int Y)
     public string WinOwner { get; set; } = null;
     public string WinTitle { get; set; } = null;
     public int[] WinFrame { get; set; } = null;   // 钉所在窗(物理像素,屏内)
+    public string PinType { get; set; } = "bug";
+    public string Status { get; set; } = "open";
+    public string AnchorKind { get; set; } = "viewport";
+    public string AnchorNote { get; set; } = null;
 }
 record ArrowRec(int Id, int FromX, int FromY, int ToX, int ToY, string Color, int Width);
-record BoxRec(int Id, int X, int Y, int W, int H, string Color, int Width);
+record BoxRec(int Id, int X, int Y, int W, int H, string Color, int Width)
+{
+    public string Shape { get; set; } = "rect";
+}
+record SyncCfg(string Mode, string Share, string[] Hosts, string Token, string Project);
 abstract record Item { public int Id = 0; }
 record PinItem(PinRec Pin) : Item;
 record ArrowItem(ArrowRec A) : Item;
@@ -106,12 +123,14 @@ internal class Controller
     public List<WinCand> WinCands = new();
     public int ScreenW, ScreenH;   // 物理像素
     public double Scale = 1;       // 物理/DIP
+    public bool Live = true;       // DINGAI_LIVE=0 才冻结截图
     public DateTime T0;
 
     public void Run(string[] args)
     {
         Directory.CreateDirectory(Path.Combine(OutRoot, "notes"));
         Directory.CreateDirectory(Path.Combine(OutRoot, "shots"));
+        Live = Environment.GetEnvironmentVariable("DINGAI_LIVE") != "0";
 
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         Sink = new HotkeySink(() => Toggle());
@@ -168,6 +187,26 @@ internal class Controller
         t.Start();
     }
 
+    public static string NoticeText()
+    {
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "notices.json");
+            if (!File.Exists(path)) return "";
+            var root = JsonNode.Parse(File.ReadAllText(path)) as JsonObject;
+            var rows = root?["banners"] as JsonArray;
+            if (rows == null) return "";
+            var parts = new List<string>();
+            foreach (var row in rows)
+            {
+                var text = (row as JsonObject)?["text"]?.ToString();
+                if (!string.IsNullOrEmpty(text)) parts.Add(text);
+            }
+            return string.Join(" · ", parts);
+        }
+        catch { return ""; }
+    }
+
     public void Begin()
     {
         if (Overlay != null) return;
@@ -190,15 +229,10 @@ internal class Controller
             catch { }
         }
 
-        // 2) 冻结截屏(先截后显,画面必不含自己)
+        // 2) 实时模式先盖透明层,截图留到完成,这样下层还能滚动。DINGAI_LIVE=0 仍是先冻截图。
         var bounds = WF.Screen.PrimaryScreen.Bounds;
         ScreenW = bounds.Width; ScreenH = bounds.Height;
-        Shot = new System.Drawing.Bitmap(ScreenW, ScreenH);
-        using (var g = System.Drawing.Graphics.FromImage(Shot))
-            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, Shot.Size);
-
-        ShotFile = Path.Combine(OutRoot, "shots", $"anno-{Stamp()}.png");
-        Shot.Save(ShotFile, System.Drawing.Imaging.ImageFormat.Png);
+        if (!Live) CaptureShot();
 
         // 3) 窗口候选(落钉按坐标定位窗口用;EnumWindows 从顶到底,后者覆盖前者→倒序=小窗在上)
         WinCands.Clear();
@@ -223,16 +257,47 @@ internal class Controller
 
         Overlay = new AnnotationWindow(this);
         Canvas = Overlay.Canvas;
+        Canvas.ShowNotice(NoticeText());
         Overlay.Show();
         Overlay.Activate();
 
-        // 4) 后台 OCR 全图
-        Task.Run(async () =>
+        // 4) 冻结模式后台 OCR;实时模式等导出时的截图
+        if (!Live && Shot != null)
         {
-            var items = await RunOcr(Shot);
-            Ocr = items; OcrDone = true;
-            await Application.Current.Dispatcher.InvokeAsync(() => Canvas?.RefreshPinSigns());
-        });
+            Task.Run(async () =>
+            {
+                var items = await RunOcr(Shot);
+                Ocr = items; OcrDone = true;
+                await Application.Current.Dispatcher.InvokeAsync(() => Canvas?.RefreshPinSigns());
+            });
+        }
+    }
+
+    public void CaptureShot()
+    {
+        var bounds = WF.Screen.PrimaryScreen.Bounds;
+        ScreenW = bounds.Width; ScreenH = bounds.Height;
+        Shot?.Dispose();
+        Shot = new System.Drawing.Bitmap(ScreenW, ScreenH);
+        using (var g = System.Drawing.Graphics.FromImage(Shot))
+            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, Shot.Size);
+        ShotFile = Path.Combine(OutRoot, "shots", $"anno-{Stamp()}.png");
+        Shot.Save(ShotFile, System.Drawing.Imaging.ImageFormat.Png);
+    }
+
+    public string UiaAt(int x, int y)
+    {
+        try
+        {
+            var el = AutomationElement.FromPoint(new Point(x, y));
+            if (el == null) return null;
+            var type = el.Current.ControlType?.ProgrammaticName ?? "";
+            var id = el.Current.AutomationId ?? "";
+            var name = el.Current.Name ?? "";
+            var text = (type + " " + id + " " + name).Trim();
+            return text.Length == 0 ? null : text;
+        }
+        catch { return null; }
     }
 
     async Task<List<OcrText>> RunOcr(System.Drawing.Bitmap bmp)
@@ -295,6 +360,25 @@ internal class Controller
     {
         var view = Overlay?.Canvas; if (view == null) return;
         view.CommitNoteField();
+        if (Live)
+        {
+            Overlay.Opacity = 0;
+            Overlay.Hide();
+            try { CaptureShot(); } catch { Shot = null; }
+            try
+            {
+                if (Shot != null)
+                {
+                    var work = Task.Run(async () => await RunOcr(Shot));
+                    if (work.Wait(TimeSpan.FromMilliseconds(1200)))
+                    {
+                        Ocr = work.Result;
+                        OcrDone = true;
+                    }
+                }
+            }
+            catch { OcrDone = true; }
+        }
         var json = BuildJson(view.Items);
         var path = Path.Combine(OutRoot, "notes", $"anno-{Stamp()}.json");
         File.WriteAllText(path, json);
@@ -303,7 +387,112 @@ internal class Controller
         {
             try { System.Windows.Clipboard.SetText(HandoffPrompt(json)); } catch { }
         }
+        Publish(json, path, ShotFile);
         Overlay.Close(); Overlay = null; Shot?.Dispose(); Shot = null;
+    }
+
+    public SyncCfg LoadSync()
+    {
+        string mode = "local", share = "", server = "", token = "", project = "inbox";
+        var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "settings.json");
+        try
+        {
+            var obj = JsonNode.Parse(File.ReadAllText(file)) as JsonObject;
+            if (obj != null)
+            {
+                mode = obj["mode"]?.ToString() ?? mode;
+                share = obj["share_dir"]?.ToString() ?? "";
+                server = obj["server_url"]?.ToString() ?? "";
+                token = obj["token"]?.ToString() ?? "";
+                var named = obj["project"]?.ToString();
+                if (!string.IsNullOrEmpty(named)) project = named;
+            }
+        }
+        catch { }
+        string Env(string name) => Environment.GetEnvironmentVariable(name);
+        if (!string.IsNullOrEmpty(Env("DINGAI_MODE"))) mode = Env("DINGAI_MODE");
+        if (!string.IsNullOrEmpty(Env("DINGAI_SHARE_DIR"))) share = Env("DINGAI_SHARE_DIR");
+        var urls = Env("DINGAI_TEAM_URLS") ?? Env("ANNO_TEAM_URLS");
+        if (!string.IsNullOrEmpty(urls)) server = urls;
+        if (!string.IsNullOrEmpty(Env("DINGAI_TEAM_TOKEN"))) token = Env("DINGAI_TEAM_TOKEN");
+        if (!string.IsNullOrEmpty(Env("DINGAI_PROJECT_NAME"))) project = Env("DINGAI_PROJECT_NAME");
+        if (mode == "local" && !string.IsNullOrEmpty(share)) mode = "folder";
+        if (mode == "local" && !string.IsNullOrEmpty(server)) mode = "server";
+        if (mode != "folder" && mode != "server") mode = "local";
+        project = project.Replace("/", "-").Replace("\\", "-");
+        if (string.IsNullOrEmpty(project)) project = "inbox";
+        var hosts = server.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return new SyncCfg(mode, share, hosts, token ?? "", project);
+    }
+
+    public void Publish(string json, string noteFile, string shotFile)
+    {
+        var cfg = LoadSync();
+        if (cfg.Mode == "local") return;
+        try
+        {
+            if (cfg.Mode == "folder" && !string.IsNullOrEmpty(cfg.Share)) WriteFolder(cfg, json, noteFile, shotFile);
+            if (cfg.Mode == "server")
+            {
+                foreach (var host in cfg.Hosts)
+                    if (PostNote(host, cfg.Token, json, shotFile)) break;
+            }
+        }
+        catch { }
+    }
+
+    static void AtomicBytes(string path, byte[] data)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        var tmp = path + ".tmp";
+        File.WriteAllBytes(tmp, data);
+        File.Move(tmp, path, true);
+    }
+
+    void WriteFolder(SyncCfg cfg, string json, string noteFile, string shotFile)
+    {
+        var noteId = Path.GetFileNameWithoutExtension(noteFile);
+        var root = Path.Combine(cfg.Share, "projects", cfg.Project);
+        AtomicBytes(Path.Combine(root, "notes", noteId + ".json"), Encoding.UTF8.GetBytes(json));
+        var shotName = string.IsNullOrEmpty(shotFile) ? "" : Path.GetFileName(shotFile);
+        if (!string.IsNullOrEmpty(shotName) && File.Exists(shotFile))
+            AtomicBytes(Path.Combine(root, "shots", shotName), File.ReadAllBytes(shotFile));
+        var pins = (JsonNode.Parse(json) as JsonObject)?["pins"] as JsonArray;
+        if (pins == null) return;
+        foreach (var pin in pins)
+        {
+            if (pin is not JsonObject row) continue;
+            var copy = (JsonObject)row.DeepClone();
+            copy["note_id"] = noteId;
+            copy["project"] = cfg.Project;
+            copy["screenshot"] = shotName;
+            var pinId = copy["id"]?.ToString() ?? "0";
+            AtomicBytes(Path.Combine(root, "pins", noteId + "--" + pinId + ".json"),
+                Encoding.UTF8.GetBytes(copy.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true })));
+        }
+    }
+
+    bool PostNote(string host, string token, string json, string shotFile)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+            var req = new HttpRequestMessage(HttpMethod.Post, host.TrimEnd('/') + "/api/note");
+            req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            if (!string.IsNullOrEmpty(token)) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var resp = http.Send(req);
+            if (!resp.IsSuccessStatusCode) return false;
+            var body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var name = (JsonNode.Parse(body) as JsonObject)?["shot_name"]?.ToString();
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(shotFile) || !File.Exists(shotFile)) return true;
+            var shotReq = new HttpRequestMessage(HttpMethod.Post, host.TrimEnd('/') + "/api/shot/" + Uri.EscapeDataString(name));
+            shotReq.Content = new ByteArrayContent(File.ReadAllBytes(shotFile));
+            shotReq.Content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+            if (!string.IsNullOrEmpty(token)) shotReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            http.Send(shotReq);
+            return true;
+        }
+        catch { return false; }
     }
 
     public string BuildJson(List<Item> items)
@@ -316,8 +505,12 @@ internal class Controller
             {
                 var p = pi.Pin;
                 var near = p.OcrNearby == "OCR…" ? OcrNear(p.X, p.Y) : p.OcrNearby;
-                var o = new JsonObject { ["id"] = p.Id, ["x_px"] = p.X, ["y_px"] = p.Y, ["ocr_nearby"] = near };
+                var o = new JsonObject { ["id"] = p.Id, ["x_px"] = p.X, ["y_px"] = p.Y, ["ocr_nearby"] = near,
+                    ["pin_type"] = string.IsNullOrEmpty(p.PinType) ? "bug" : p.PinType,
+                    ["status"] = string.IsNullOrEmpty(p.Status) ? "open" : p.Status };
                 if (!string.IsNullOrEmpty(p.Note)) o["note"] = p.Note;
+                o["anchor"] = new JsonObject { ["kind"] = p.AnchorKind ?? "viewport" };
+                if (!string.IsNullOrEmpty(p.AnchorNote)) o["anchor"]["note"] = p.AnchorNote;
                 if (p.WinOwner != null) o["window"] = new JsonObject { ["owner"] = p.WinOwner, ["title"] = p.WinTitle ?? "" };
                 var f = p.WinFrame ?? SessWinFrame;
                 if (f != null)
@@ -336,7 +529,7 @@ internal class Controller
             else if (it is BoxItem bi)
             {
                 boxes.Add(new JsonObject { ["id"] = bi.B.Id, ["rect_px"] = new JsonArray(bi.B.X, bi.B.Y, bi.B.W, bi.B.H),
-                    ["color"] = bi.B.Color, ["width"] = bi.B.Width });
+                    ["color"] = bi.B.Color, ["width"] = bi.B.Width, ["shape"] = string.IsNullOrEmpty(bi.B.Shape) ? "rect" : bi.B.Shape });
                 nb++;
             }
         }
@@ -356,7 +549,9 @@ internal class Controller
             ["pins"] = pins, ["arrows"] = arrows, ["boxes"] = boxes,
             ["pin_count"] = np, ["arrow_count"] = na, ["box_count"] = nb,
             ["screenshot"] = Path.GetFileName(ShotFile),
-            ["screen_capture_ok"] = true,
+            ["screen_capture_ok"] = Shot != null,
+            ["live"] = Live,
+            ["project"] = LoadSync().Project,
             ["handoff_rules"] = HandoffRules(),
         };
         return root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
@@ -586,20 +781,48 @@ internal class AnnotationWindow : Window
         WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize;
         Topmost = true; ShowInTaskbar = false; ShowActivated = true;
         WindowState = WindowState.Maximized;
-        Background = Brushes.Black;
+        if (c.Live) { AllowsTransparency = true; Background = Brushes.Transparent; }
+        else Background = Brushes.Black;
 
-        Canvas = new AnnoCanvas(c) { Background = Brushes.Black };
+        Canvas = new AnnoCanvas(c) { Background = c.Live ? Brushes.Transparent : Brushes.Black };
         Content = Canvas;
+        Canvas.Notice = new TextBlock
+        {
+            Background = new SolidColorBrush(Color.FromArgb(242, 255, 214, 102)),
+            Foreground = Brushes.Black, FontSize = 13, Padding = new Thickness(10, 6, 10, 6),
+            TextWrapping = TextWrapping.Wrap, Visibility = Visibility.Collapsed, IsHitTestVisible = false,
+            MaxWidth = 860,
+        };
+        Canvas.Children.Add(Canvas.Notice);
+        System.Windows.Controls.Canvas.SetZIndex(Canvas.Notice, 50);
+        System.Windows.Controls.Canvas.SetLeft(Canvas.Notice, 12);
+        System.Windows.Controls.Canvas.SetTop(Canvas.Notice, 8);
         // 前台主窗 frame(物理像素)
         var fg = Win32.GetForegroundWindow();
         if (fg != IntPtr.Zero && Win32.GetWindowRect(fg, out var r))
             C.SessWinFrame = new[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top };
+        DispatcherTimer pass = null;
         Loaded += (s, e) =>
         {
             var m = PresentationSource.FromVisual(this).CompositionTarget.TransformToDevice.M11;
             C.Scale = m;
             Canvas.Init();
+            if (!C.Live) return;
+            pass = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) };
+            pass.Tick += (_, _) => ApplyPass();
+            pass.Start();
         };
+        Closed += (s, e) => pass?.Stop();
+    }
+
+    void ApplyPass()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) return;
+        bool alt = (Win32.GetAsyncKeyState(Win32.VK_MENU) & 0x8000) != 0;
+        int ex = Win32.GetWindowLong(hwnd, Win32.GWL_EXSTYLE);
+        int next = alt ? (ex | Win32.WS_EX_TRANSPARENT) : (ex & ~Win32.WS_EX_TRANSPARENT);
+        if (next != ex) Win32.SetWindowLong(hwnd, Win32.GWL_EXSTYLE, next);
     }
 }
 
@@ -610,26 +833,59 @@ internal class AnnoCanvas : Canvas
     public List<Item> Items = new();
     int _nextId = 1;
     Point? _draftFrom, _draftTo;
-    public string CurColor = "red"; public int CurWidth = 4; public int DrawMode = 1;   // 1=箭头 2=方框
+    public string CurColor = "red"; public int CurWidth = 4; public int DrawMode = 1;   // 1箭头 2方框 3椭圆 4聚光
+    // community(免费开源)=定位钉+复制JSON；pro/team=全部标记工具。解锁同其他端：DINGAI_LICENSE/DINGAI_EDITION 或 ~/DingAI/license.json
+    readonly bool Pro = IsPro();
+    static bool IsPro()
+    {
+        foreach (var key in new[] { "DINGAI_LICENSE", "DINGAI_EDITION" })
+        {
+            var v = Environment.GetEnvironmentVariable(key);
+            if (string.IsNullOrEmpty(v)) continue;
+            var low = v.ToLowerInvariant();
+            if (low.StartsWith("dga1-pro") || low.StartsWith("dga1-team")) return true;
+            if (low == "pro" || low == "team") return true;
+        }
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "license.json");
+            var low = File.ReadAllText(path).ToLowerInvariant();
+            if (low.Contains("dga1-pro") || low.Contains("dga1-team")) return true;
+        }
+        catch { }
+        return false;
+    }
+    public string NextPinType = "bug";
+    bool _spotDim;
     UIElement _draftPreview;
     TextBox _noteField; int _noteIdx;
     List<UIElement> _markers = new();   // 当前会话的钉/箭/框元素(撤销时移除)
+    public TextBlock Notice;
+    public void ShowNotice(string text)
+    {
+        if (Notice == null) return;
+        Notice.Text = text ?? "";
+        Notice.Visibility = string.IsNullOrEmpty(Notice.Text) ? Visibility.Collapsed : Visibility.Visible;
+    }
     UIElement _toolbar;
 
     public AnnoCanvas(Controller c) { C = c; }
 
     public void Init()
     {
-        // 背景=冻结截图铺满(物理→DIP 由 WPF 自动映射)
-        Bg = new Image
+        // 冻结模式才铺截图。实时模式保持透明,导出时再截。
+        if (C.Shot != null)
         {
-            Source = ToWpfBitmap(C.Shot),
-            Width = ActualWidth > 0 ? ActualWidth : SystemParameters.PrimaryScreenWidth,
-            Height = ActualHeight > 0 ? ActualHeight : SystemParameters.PrimaryScreenHeight,
-            Stretch = Stretch.Fill,
-        };
-        SetLeft(Bg, 0); SetTop(Bg, 0);
-        Children.Add(Bg);
+            Bg = new Image
+            {
+                Source = ToWpfBitmap(C.Shot),
+                Width = ActualWidth > 0 ? ActualWidth : SystemParameters.PrimaryScreenWidth,
+                Height = ActualHeight > 0 ? ActualHeight : SystemParameters.PrimaryScreenHeight,
+                Stretch = Stretch.Fill,
+            };
+            SetLeft(Bg, 0); SetTop(Bg, 0);
+            Children.Add(Bg);
+        }
         Focusable = true;
         MouseLeftButtonDown += OnDown;
         MouseMove += OnMove;
@@ -676,13 +932,16 @@ internal class AnnoCanvas : Canvas
         if (from == null || to == null) return;
         var dist = Math.Sqrt((to.Value.X - from.Value.X) * (to.Value.X - from.Value.X) + (to.Value.Y - from.Value.Y) * (to.Value.Y - from.Value.Y)) * C.Scale;
         if (dist < 7) AddPin(from.Value);
-        else if (DrawMode == 1) AddArrow(from.Value, to.Value);
-        else AddBox(from.Value, to.Value);
+        else if (Pro && DrawMode == 1) AddArrow(from.Value, to.Value);
+        else if (Pro) AddBox(from.Value, to.Value);
     }
     void OnKey(object s, KeyEventArgs e)
     {
         if (e.Key == Key.Escape) C.Finish(true);
         else if (e.Key == Key.Z && (Keyboard.Modifiers & ModifierKeys.Control) != 0) Undo();
+        else if (e.Key == Key.B) NextPinType = "bug";
+        else if (e.Key == Key.C) NextPinType = "change";
+        else if (e.Key == Key.Q) NextPinType = "question";
     }
 
     public void AddPin(Point p)
@@ -694,23 +953,27 @@ internal class AnnoCanvas : Canvas
             OcrNearby = C.OcrNear(x, y),
             WinOwner = w?.Owner, WinTitle = w?.Title,
             WinFrame = w != null ? (int[])w.FramePhys.Clone() : null,
+            PinType = NextPinType,
         };
+        var uia = C.UiaAt(x, y);
+        if (!string.IsNullOrEmpty(uia)) { pin.AnchorKind = "uia"; pin.AnchorNote = uia; }
         Items.Add(new PinItem(pin));
-        DrawPin(pin);
+        RerenderAll();
         BeginNote(Items.Count - 1, p);
     }
     public void AddArrow(Point f, Point t)
     {
         var (fx, fy) = ToPx(f); var (tx, ty) = ToPx(t);
         var a = new ArrowRec(_nextId++, fx, fy, tx, ty, CurColor, CurWidth);
-        Items.Add(new ArrowItem(a)); DrawArrow(a);
+        Items.Add(new ArrowItem(a)); RerenderAll();
     }
     public void AddBox(Point f, Point t)
     {
         var (fx, fy) = ToPx(f); var (tx, ty) = ToPx(t);
+        var shape = DrawMode == 3 ? "ellipse" : (DrawMode == 4 ? "spotlight" : "rect");
         var b = new BoxRec(_nextId++, Math.Min(fx, tx), Math.Min(fy, ty),
-            Math.Abs(tx - fx), Math.Abs(ty - fy), CurColor, CurWidth);
-        Items.Add(new BoxItem(b)); DrawBox(b);
+            Math.Abs(tx - fx), Math.Abs(ty - fy), CurColor, CurWidth) { Shape = shape };
+        Items.Add(new BoxItem(b)); RerenderAll();
     }
     public void DebugAddPin(double px, double py) => AddPin(ToDip((int)px, (int)py));
     public void DebugAddArrow(double fx, double fy, double tx, double ty) => AddArrow(ToDip((int)fx, (int)fy), ToDip((int)tx, (int)ty));
@@ -727,12 +990,15 @@ internal class AnnoCanvas : Canvas
     {
         foreach (var m in _markers) Children.Remove(m);
         _markers.Clear();
+        _spotDim = false;
+        var pins = new List<PinRec>();
         foreach (var it in Items)
         {
-            if (it is PinItem pi) DrawPin(pi.Pin);
+            if (it is PinItem pi) { DrawPin(pi.Pin); pins.Add(pi.Pin); }
             else if (it is ArrowItem ai) DrawArrow(ai.A);
             else if (it is BoxItem bi) DrawBox(bi.B);
         }
+        DrawPinLabels(pins);
     }
     public void RefreshPinSigns() => RerenderAll();   // OCR 到账重绘
 
@@ -783,37 +1049,120 @@ internal class AnnoCanvas : Canvas
 
     void Track(UIElement e) { Children.Add(e); _markers.Add(e); }
 
+    int PinNumber(PinRec p)
+    {
+        int n = 0;
+        foreach (var it in Items)
+        {
+            if (it is PinItem pi)
+            {
+                n++;
+                if (pi.Pin.Id == p.Id) return n;
+            }
+        }
+        return p.Id;
+    }
+
     void DrawPin(PinRec p)
     {
         var pt = ToDip(p.X, p.Y);
-        // XY 辅助线
-        var gx = new Line { X1 = 0, Y1 = pt.Y, X2 = ActualWidth, Y2 = pt.Y, StrokeThickness = 1,
-            Stroke = new SolidColorBrush(Color.FromArgb(190, 255, 80, 80)), StrokeDashArray = new DoubleCollection { 6, 5 } };
-        var gy = new Line { X1 = pt.X, Y1 = 0, X2 = pt.X, Y2 = ActualHeight, StrokeThickness = 1,
-            Stroke = new SolidColorBrush(Color.FromArgb(190, 255, 80, 80)), StrokeDashArray = new DoubleCollection { 6, 5 } };
-        Track(gx); Track(gy);
-        // 钉体(白圈红心)
         var dot = new Ellipse { Width = 14, Height = 14, Fill = Brushes.White };
         var inner = new Ellipse { Width = 10, Height = 10, Fill = Brushes.Red };
         SetLeft(dot, pt.X - 7); SetTop(dot, pt.Y - 7);
         SetLeft(inner, pt.X - 5); SetTop(inner, pt.Y - 5);
         Track(dot); Track(inner);
-        // 坐标气泡
-        var bub = Bubble($"⌗{p.Id}  {p.X},{p.Y}", pt.X + 12, pt.Y + 10);
-        Track(bub);
-        // 信息签
-        var lines = new List<string>();
+        Track(Bubble("#" + PinNumber(p) + "  " + p.X + "," + p.Y, pt.X + 12, pt.Y + 10));
+    }
+
+    List<string> LabelLines(PinRec p)
+    {
+        var lines = new List<string> { p.PinType ?? "bug" };
         if (!string.IsNullOrEmpty(p.Note)) lines.Add("✎ " + Trunc(p.Note, 34));
         if (!string.IsNullOrEmpty(p.WinOwner)) lines.Add("win: " + p.WinOwner + (string.IsNullOrEmpty(p.WinTitle) ? "" : " · " + Trunc(p.WinTitle, 24)));
         if (C.AppName != null && C.AppName != p.WinOwner) lines.Add("app: " + C.AppName);
         var near = p.OcrNearby == "OCR…" ? C.OcrNear(p.X, p.Y) : p.OcrNearby;
         if (!string.IsNullOrEmpty(near)) lines.Add("ocr: " + Trunc(near.Split(" | ")[0], 34));
-        if (lines.Count > 0)
+        return lines;
+    }
+
+    void DrawPinLabels(List<PinRec> pins)
+    {
+        var callouts = new List<(double ax, double ay, double w, double h, List<string> lines)>();
+        var obstacles = new List<(double x, double y, double w, double h)>();
+        foreach (var p in pins)
         {
-            var h = 18.0 * lines.Count + 8;
-            var sign = Sign(lines, pt.X + 12, pt.Y - 8 - h);
-            Track(sign);
+            var pt = ToDip(p.X, p.Y);
+            obstacles.Add((pt.X - 8, pt.Y - 8, 16, 16));
+            var lines = LabelLines(p);
+            callouts.Add((pt.X, pt.Y, 200, 18.0 * lines.Count + 8, lines));
         }
+        double bw = ActualWidth > 1 ? ActualWidth : SystemParameters.PrimaryScreenWidth;
+        double bh = ActualHeight > 1 ? ActualHeight : SystemParameters.PrimaryScreenHeight;
+        var placed = LayoutCallouts(callouts, obstacles, (0, 0, bw, bh));
+        foreach (var box in placed)
+        {
+            if (box.leader)
+            {
+                Track(new Line { X1 = box.ax, Y1 = box.ay, X2 = box.x, Y2 = box.y + 8,
+                    Stroke = Brushes.White, StrokeThickness = 1 });
+            }
+            Track(Sign(box.lines, box.x, box.y));
+        }
+    }
+
+    // Same placement rule as core/layout.py.
+    static List<(double x, double y, double ax, double ay, bool leader, List<string> lines)> LayoutCallouts(
+        List<(double ax, double ay, double w, double h, List<string> lines)> callouts,
+        List<(double x, double y, double w, double h)> obstacles,
+        (double x, double y, double w, double h) bounds)
+    {
+        (int dx, int dy, int prefer)[] dirs = { (1, 0, 0), (1, -1, 6), (0, -1, 6), (-1, -1, 6), (-1, 0, 6), (-1, 1, 6), (0, 1, 6), (1, 1, 6) };
+        int[] dists = { 18, 32, 48, 68, 96, 132, 176 };
+        const double gap = 4;
+        var placed = obstacles.Select(o => (o.x, o.y, o.w, o.h)).ToList();
+        double Overlap((double x, double y, double w, double h) a, (double x, double y, double w, double h) b)
+        {
+            double x1 = Math.Max(a.x, b.x - gap), y1 = Math.Max(a.y, b.y - gap);
+            double x2 = Math.Min(a.x + a.w, b.x + b.w + gap), y2 = Math.Min(a.y + a.h, b.y + b.h + gap);
+            return x2 > x1 && y2 > y1 ? (x2 - x1) * (y2 - y1) : 0;
+        }
+        double PointDist(double px, double py, (double x, double y, double w, double h) rect)
+        {
+            double cx = Math.Min(Math.Max(px, rect.x), rect.x + rect.w);
+            double cy = Math.Min(Math.Max(py, rect.y), rect.y + rect.h);
+            return Math.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+        }
+        var output = new List<(double x, double y, double ax, double ay, bool leader, List<string> lines)>();
+        for (int k = 0; k < callouts.Count; k++)
+        {
+            var c = callouts[k];
+            double bestCost = double.MaxValue, bestX = c.ax, bestY = c.ay;
+            bool bestLeader = false;
+            foreach (var dir in dirs)
+            {
+                double length = Math.Sqrt(dir.dx * dir.dx + dir.dy * dir.dy);
+                if (length == 0) length = 1;
+                foreach (var dist in dists)
+                {
+                    double ox = dir.dx / length * dist, oy = dir.dy / length * dist;
+                    double x = c.ax + ox + (dir.dx < 0 ? -c.w : (dir.dx == 0 ? -c.w / 2 : 0));
+                    double y = c.ay + oy + (dir.dy < 0 ? -c.h : (dir.dy == 0 ? -c.h / 2 : 0));
+                    x = Math.Max(bounds.x, Math.Min(x, bounds.x + bounds.w - c.w));
+                    y = Math.Max(bounds.y, Math.Min(y, bounds.y + bounds.h - c.h));
+                    var rect = (x, y, c.w, c.h);
+                    double hit = placed.Sum(p => Overlap(rect, p));
+                    double cost = hit * 10000 + dist + dir.prefer + k * 0.01;
+                    if (cost < bestCost)
+                    {
+                        bestCost = cost; bestX = x; bestY = y;
+                        bestLeader = PointDist(c.ax, c.ay, rect) > 14;
+                    }
+                }
+            }
+            placed.Add((bestX, bestY, c.w, c.h));
+            output.Add((bestX, bestY, c.ax, c.ay, bestLeader, c.lines));
+        }
+        return output;
     }
 
     void DrawArrow(ArrowRec a)
@@ -835,15 +1184,36 @@ internal class AnnoCanvas : Canvas
     void DrawBox(BoxRec b)
     {
         var tl = ToDip(b.X, b.Y);
-        var rect = new Rectangle
+        double w = b.W / C.Scale, h = b.H / C.Scale;
+        var stroke = ColorOf(b.Color);
+        if (b.Shape == "spotlight")
         {
-            Width = b.W / C.Scale, Height = b.H / C.Scale,
-            Stroke = ColorOf(b.Color), StrokeThickness = b.Width / C.Scale,
-            Fill = new SolidColorBrush(Color.FromArgb(40, 255, 60, 60)),
-            RadiusX = 4, RadiusY = 4,
-        };
-        SetLeft(rect, tl.X); SetTop(rect, tl.Y);
-        Track(rect);
+            if (!_spotDim)
+            {
+                _spotDim = true;
+                double bw = ActualWidth > 1 ? ActualWidth : SystemParameters.PrimaryScreenWidth;
+                double bh = ActualHeight > 1 ? ActualHeight : SystemParameters.PrimaryScreenHeight;
+                var full = new RectangleGeometry(new Rect(0, 0, bw, bh));
+                var hole = new RectangleGeometry(new Rect(tl.X, tl.Y, Math.Max(w, 1), Math.Max(h, 1)));
+                Track(new System.Windows.Shapes.Path
+                {
+                    Data = new CombinedGeometry(GeometryCombineMode.Exclude, full, hole),
+                    Fill = new SolidColorBrush(Color.FromArgb(148, 3, 7, 18)),
+                });
+            }
+            var edge = new Rectangle { Width = w, Height = h, Stroke = stroke, StrokeThickness = Math.Max(2, b.Width / C.Scale) };
+            SetLeft(edge, tl.X); SetTop(edge, tl.Y);
+            Track(edge);
+            return;
+        }
+        Shape shape = b.Shape == "ellipse"
+            ? new Ellipse { Width = w, Height = h }
+            : new Rectangle { Width = w, Height = h, RadiusX = 4, RadiusY = 4 };
+        shape.Stroke = stroke;
+        shape.StrokeThickness = b.Width / C.Scale;
+        shape.Fill = new SolidColorBrush(Color.FromArgb(40, 255, 60, 60));
+        SetLeft(shape, tl.X); SetTop(shape, tl.Y);
+        Track(shape);
     }
 
     UIElement Bubble(string text, double x, double y)
@@ -891,13 +1261,14 @@ internal class AnnoCanvas : Canvas
         }
         else
         {
-            e = new Rectangle
-            {
-                Width = Math.Abs(t.X - f.X), Height = Math.Abs(t.Y - f.Y),
-                Stroke = ColorOf(CurColor), StrokeThickness = CurWidth / C.Scale,
-                Fill = new SolidColorBrush(Color.FromArgb(40, 255, 60, 60)),
-            };
-            SetLeft(e, Math.Min(f.X, t.X)); SetTop(e, Math.Min(f.Y, t.Y));
+            Shape shape = DrawMode == 3
+                ? new Ellipse { Width = Math.Abs(t.X - f.X), Height = Math.Abs(t.Y - f.Y) }
+                : new Rectangle { Width = Math.Abs(t.X - f.X), Height = Math.Abs(t.Y - f.Y) };
+            shape.Stroke = ColorOf(CurColor);
+            shape.StrokeThickness = CurWidth / C.Scale;
+            if (DrawMode != 4) shape.Fill = new SolidColorBrush(Color.FromArgb(40, 255, 60, 60));
+            SetLeft(shape, Math.Min(f.X, t.X)); SetTop(shape, Math.Min(f.Y, t.Y));
+            e = shape;
         }
         Children.Add(e); _draftPreview = e;
     }
@@ -909,29 +1280,49 @@ internal class AnnoCanvas : Canvas
 
     void InstallToolbar()
     {
-        var bar = new Canvas { Width = 690, Height = 44, Background = new SolidColorBrush(Color.FromArgb(225, 0, 0, 0)) };
-        var rd = new Rectangle { Width = 690, Height = 44, RadiusX = 10, RadiusY = 10,
+        var barWidth = Pro ? 980 : 560;
+        var bar = new Canvas { Width = barWidth, Height = 44, Background = new SolidColorBrush(Color.FromArgb(225, 0, 0, 0)) };
+        var rd = new Rectangle { Width = barWidth, Height = 44, RadiusX = 10, RadiusY = 10,
             Stroke = new SolidColorBrush(Color.FromArgb(90, 255, 255, 255)), StrokeThickness = 1 };
         bar.Children.Add(rd);
         double x = 12;
-        var arrowBtn = Btn(bar, ref x, "➜ 箭头", 70); arrowBtn.Tag = 21; arrowBtn.Click += (s, e) => { DrawMode = 1; HiMode(); };
-        var boxBtn = Btn(bar, ref x, "▭ 方框", 70); boxBtn.Tag = 22; boxBtn.Click += (s, e) => { DrawMode = 2; HiMode(); };
-        _modeBtns = (arrowBtn, boxBtn); HiMode();
+        _modes.Clear();
+        void Mode(string title, double w, int mode)
+        {
+            var b = Btn(bar, ref x, title, w);
+            b.Tag = mode;
+            b.Click += (s, e) => { DrawMode = mode; HiMode(); };
+            _modes.Add((b, mode));
+        }
+        if (Pro)
+        {
+            Mode("➜ 箭头", 70, 1);
+            Mode("▭ 方框", 70, 2);
+            Mode("◯ 椭圆", 70, 3);
+            Mode("◉ 聚光", 70, 4);
+        }
+        HiMode();
+        Btn(bar, ref x, "bug", 46).Click += (s, e) => NextPinType = "bug";
+        Btn(bar, ref x, "change", 64).Click += (s, e) => NextPinType = "change";
+        Btn(bar, ref x, "question", 72).Click += (s, e) => NextPinType = "question";
         x += 6;
-        foreach (var (c, tag) in new[] { ("red", 1), ("yellow", 2), ("cyan", 3) })
+        if (Pro)
         {
-            var d = new Border { Width = 20, Height = 20, CornerRadius = new CornerRadius(10),
-                Background = ColorOf(c), BorderBrush = Brushes.White, BorderThickness = new Thickness(1.5) };
-            d.MouseLeftButtonUp += (s, e) => CurColor = c;
-            Canvas.SetLeft(d, x); Canvas.SetTop(d, 12); bar.Children.Add(d); x += 26;
+            foreach (var (c, tag) in new[] { ("red", 1), ("yellow", 2), ("cyan", 3) })
+            {
+                var d = new Border { Width = 20, Height = 20, CornerRadius = new CornerRadius(10),
+                    Background = ColorOf(c), BorderBrush = Brushes.White, BorderThickness = new Thickness(1.5) };
+                d.MouseLeftButtonUp += (s, e) => CurColor = c;
+                Canvas.SetLeft(d, x); Canvas.SetTop(d, 12); bar.Children.Add(d); x += 26;
+            }
+            x += 8;
+            foreach (var (w, tag) in new[] { (2, 11), (4, 12), (6, 13) })
+            {
+                var b = Btn(bar, ref x, "—", 34); b.Tag = tag;
+                b.Click += (s, e) => CurWidth = (int)b.Tag - 10;
+            }
+            x += 10;
         }
-        x += 8;
-        foreach (var (w, tag) in new[] { (2, 11), (4, 12), (6, 13) })
-        {
-            var b = Btn(bar, ref x, "—", 34); b.Tag = tag;
-            b.Click += (s, e) => CurWidth = (int)b.Tag - 10;
-        }
-        x += 10;
         Btn(bar, ref x, "⌘Z撤销", 76).Click += (s, e) => Undo();
         Btn(bar, ref x, "清空", 56).Click += (s, e) => ClearAll();
         Btn(bar, ref x, "复制JSON", 76).Click += (s, e) =>
@@ -964,13 +1355,14 @@ internal class AnnoCanvas : Canvas
         Children.Add(bar); _toolbar = bar;
     }
 
-    (Button, Button) _modeBtns;
+    readonly List<(Button btn, int mode)> _modes = new();
     void HiMode()
     {
-        var (a, b) = _modeBtns;
-        a.BorderThickness = DrawMode == 1 ? new Thickness(2) : new Thickness(0);
-        b.BorderThickness = DrawMode == 2 ? new Thickness(2) : new Thickness(0);
-        a.BorderBrush = Brushes.DodgerBlue; b.BorderBrush = Brushes.DodgerBlue;
+        foreach (var (btn, mode) in _modes)
+        {
+            btn.BorderThickness = DrawMode == mode ? new Thickness(2) : new Thickness(0);
+            btn.BorderBrush = Brushes.DodgerBlue;
+        }
     }
 
     Button Btn(Canvas bar, ref double x, string text, double w)
