@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 os.environ.setdefault("DINGAI_SESSIONS", "0")
+os.environ.setdefault("DINGAI_EDITION", "pro")  # sync/release/session features under test are pro
 
 import handoff
 

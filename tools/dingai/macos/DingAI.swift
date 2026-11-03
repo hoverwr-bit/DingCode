@@ -100,6 +100,28 @@ struct OcrTextItem {
     var cy: Double
 }
 
+// MARK: - 版本门控(edition)
+// community(免费开源)=定位钉+复制JSON；pro/team=箭头/方框/椭圆/聚光/文字等全部工具。
+// 解锁：环境变量 DINGAI_LICENSE(原始密钥)/DINGAI_EDITION，或 ~/DingAI/license.json {"key":"DGA1-..."}。
+func currentEdition() -> String {
+    let env = ProcessInfo.processInfo.environment
+    for key in ["DINGAI_LICENSE", "DINGAI_EDITION"] {
+        guard let raw = env[key], !raw.isEmpty else { continue }
+        let low = raw.lowercased()
+        if low.hasPrefix("dga1-pro") { return "pro" }
+        if low.hasPrefix("dga1-team") { return "team" }
+        if low == "pro" || low == "team" { return low }
+    }
+    let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/license.json")
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let key = (obj["key"] as? String)?.lowercased() {
+        if key.hasPrefix("dga1-pro") { return "pro" }
+        if key.hasPrefix("dga1-team") { return "team" }
+    }
+    return "community"
+}
+
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
 // 桌面钉↔页面钉同步:127.0.0.1:8763 回环 HTTP,页面(anno-v7.js 桥模式,管理员态)
 // ping 注册取 token → 轮询 /pending 取 resolve 请求 → elementFromPoint 反查 → POST /answer;
@@ -2529,7 +2551,9 @@ final class AnnotationView: NSView {
     var modeTextBtn: NSButton?
 
     func installToolBar() {
-        let bar = DragBar(frame: NSRect(x: bounds.midX - 560, y: 16, width: 1120, height: 44))
+        let pro = currentEdition() != "community"
+        let barWidth: CGFloat = pro ? 1120 : 480
+        let bar = DragBar(frame: NSRect(x: bounds.midX - barWidth / 2, y: 16, width: barWidth, height: 44))
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
         bar.layer?.cornerRadius = 10
@@ -2538,39 +2562,44 @@ final class AnnotationView: NSView {
 
         var x: CGFloat = 12
         // 0选择 1箭头 2方框 3椭圆 4聚光 5文字。单击(非选择/文字)仍落钉。
+        // community 免费版只装「选择」：落钉、复制JSON、完成；箭头/方框/椭圆/聚光/文字为 pro。
         let sel = textBtn("选择", frame: NSRect(x: x, y: 8, width: 52, height: 28))
         sel.tag = 20; sel.action = #selector(pickMode(_:)); sel.target = self
         bar.addSubview(sel); modeSelectBtn = sel; x += 56
-        let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
-        bar.addSubview(a); modeArrowBtn = a; x += 74
-        let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
-        bar.addSubview(b); modeBoxBtn = b; x += 74
-        let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
-        bar.addSubview(e); modeEllipseBtn = e; x += 74
-        let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
-        bar.addSubview(spot); modeSpotBtn = spot; x += 74
-        let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
-        tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
-        bar.addSubview(tx); modeTextBtn = tx; x += 72
+        if pro {
+            let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
+            bar.addSubview(a); modeArrowBtn = a; x += 74
+            let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
+            bar.addSubview(b); modeBoxBtn = b; x += 74
+            let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
+            bar.addSubview(e); modeEllipseBtn = e; x += 74
+            let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
+            bar.addSubview(spot); modeSpotBtn = spot; x += 74
+            let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
+            tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
+            bar.addSubview(tx); modeTextBtn = tx; x += 72
+        }
         refreshModeButtons()
 
-        for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
-            let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
-            dot.action = #selector(pickColor(_:)); dot.tag = tag
-            dot.target = self
-            bar.addSubview(dot); x += 26
+        if pro {
+            for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
+                let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
+                dot.action = #selector(pickColor(_:)); dot.tag = tag
+                dot.target = self
+                bar.addSubview(dot); x += 26
+            }
+            x += 8
+            for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
+                let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
+                w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
+                bar.addSubview(w); x += 36
+            }
+            x += 10
         }
-        x += 8
-        for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
-            let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
-            w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
-            bar.addSubview(w); x += 36
-        }
-        x += 10
         let acts: [(String, Selector)] = [("⌘Z撤销", #selector(undo)),
                                           ("清空", #selector(clearAll)),
                                           ("复制JSON", #selector(copyJSON)),

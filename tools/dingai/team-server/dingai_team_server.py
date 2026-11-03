@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import collide as collide_lib
+from core import edition as edition_lib
 from core import release as release_lib
 
 PIN_TYPES = ("bug", "change", "question")
@@ -411,6 +412,19 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 return self._send(200, json.dumps({"name": name, "role": role, "token": token}))
+            if path == "/api/license/issue":
+                # 团队版授权：管理员签发 DGA1 密钥。客户端用同一密钥离线验证，
+                # 或服务端用 DINGAI_LICENSE_SECRET 作为自定义密钥源。
+                user = self._auth(conn, "admin")
+                if user is None:
+                    return
+                body = self._json()
+                edition = (body.get("edition") or "pro").lower()
+                expires = str(body.get("expires") or "").strip()
+                if edition not in ("pro", "team") or not (len(expires) == 8 and expires.isdigit()):
+                    return self._send(400, '{"error":"edition (pro|team) and expires yyyymmdd required"}')
+                key = edition_lib.issue_key(edition, expires)
+                return self._send(200, json.dumps({"edition": edition, "expires": expires, "key": key}))
             if path.startswith("/api/pins/by-note/"):
                 return self._pin_action(conn, path)
             if path.startswith("/api/pins/") and path.endswith("/status"):

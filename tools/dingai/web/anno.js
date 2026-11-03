@@ -12,6 +12,21 @@
   window.ANNO_V7 = true; /* v7.9.1（261008）：修复防重入锁——原只检查不赋值，二次注入=双实例同 id 打架 */
   if (new URLSearchParams(location.search).get('qa') === '1') return;
   var LS_KEY = 'anno-v7:' + location.pathname;
+  /* 版本门控：community(免费)=只有定位钉+复制JS描述；pro/team=全部工具。
+     解锁方式（优先级从高到低）：window.DINGAI_EDITION ＞ localStorage 'dingai-license' 的 DGA1 密钥 ＞ localStorage 'dingai-edition' */
+  function resolveEdition() {
+    try { if (window.DINGAI_EDITION) return String(window.DINGAI_EDITION).toLowerCase(); } catch (e) {}
+    try {
+      var lic = localStorage.getItem('dingai-license') || '';
+      var m = lic.match(/^DGA1-(pro|team)-/i);
+      if (m) return m[1].toLowerCase();
+    } catch (e) {}
+    try { var e2 = (localStorage.getItem('dingai-edition') || '').toLowerCase(); if (e2) return e2; } catch (e) {}
+    return 'community';
+  }
+  var EDITION = resolveEdition();
+  var PRO_TOOLS = { arrow: 1, box: 1, ellipse: 1, spot: 1, text: 1 };
+  function toolAllowed(t) { return EDITION !== 'community' || !PRO_TOOLS[t]; }
   var mode = false, annos = [], seq = 0, me = 'admin';
   var oldBtn = document.getElementById('annotationLaunch');
   if (oldBtn) oldBtn.style.display = 'none';
@@ -167,6 +182,13 @@
         }).join('')
       + '<span class="sep"></span>'
       + '<button type="button" data-undo="1" title="撤销上一条标记">↩</button>';
+    /* 免费开源版（community）：隐藏箭头/方框/椭圆/聚光/文字与箭头样式，只留定位钉 + 复制 JSON */
+    if (EDITION === 'community') {
+      Array.prototype.forEach.call(row.querySelectorAll('button'), function (b) {
+        if ((b.dataset.tool && PRO_TOOLS[b.dataset.tool]) || b.dataset.style) b.remove();
+      });
+      Array.prototype.forEach.call(row.querySelectorAll('.sep'), function (s) { s.remove(); });
+    }
     var head = hostPanel.querySelector('.av7head');
     head.insertAdjacentElement('afterend', row);
     return row;
@@ -1078,4 +1100,4 @@
   })();
 })();
 
-window.__AV7_BUILD='261019a';
+window.__AV7_BUILD='261103-edition';

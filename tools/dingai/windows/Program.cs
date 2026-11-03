@@ -834,6 +834,27 @@ internal class AnnoCanvas : Canvas
     int _nextId = 1;
     Point? _draftFrom, _draftTo;
     public string CurColor = "red"; public int CurWidth = 4; public int DrawMode = 1;   // 1箭头 2方框 3椭圆 4聚光
+    // community(免费开源)=定位钉+复制JSON；pro/team=全部标记工具。解锁同其他端：DINGAI_LICENSE/DINGAI_EDITION 或 ~/DingAI/license.json
+    readonly bool Pro = IsPro();
+    static bool IsPro()
+    {
+        foreach (var key in new[] { "DINGAI_LICENSE", "DINGAI_EDITION" })
+        {
+            var v = Environment.GetEnvironmentVariable(key);
+            if (string.IsNullOrEmpty(v)) continue;
+            var low = v.ToLowerInvariant();
+            if (low.StartsWith("dga1-pro") || low.StartsWith("dga1-team")) return true;
+            if (low == "pro" || low == "team") return true;
+        }
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DingAI", "license.json");
+            var low = File.ReadAllText(path).ToLowerInvariant();
+            if (low.Contains("dga1-pro") || low.Contains("dga1-team")) return true;
+        }
+        catch { }
+        return false;
+    }
     public string NextPinType = "bug";
     bool _spotDim;
     UIElement _draftPreview;
@@ -911,8 +932,8 @@ internal class AnnoCanvas : Canvas
         if (from == null || to == null) return;
         var dist = Math.Sqrt((to.Value.X - from.Value.X) * (to.Value.X - from.Value.X) + (to.Value.Y - from.Value.Y) * (to.Value.Y - from.Value.Y)) * C.Scale;
         if (dist < 7) AddPin(from.Value);
-        else if (DrawMode == 1) AddArrow(from.Value, to.Value);
-        else AddBox(from.Value, to.Value);
+        else if (Pro && DrawMode == 1) AddArrow(from.Value, to.Value);
+        else if (Pro) AddBox(from.Value, to.Value);
     }
     void OnKey(object s, KeyEventArgs e)
     {
@@ -1259,8 +1280,9 @@ internal class AnnoCanvas : Canvas
 
     void InstallToolbar()
     {
-        var bar = new Canvas { Width = 980, Height = 44, Background = new SolidColorBrush(Color.FromArgb(225, 0, 0, 0)) };
-        var rd = new Rectangle { Width = 980, Height = 44, RadiusX = 10, RadiusY = 10,
+        var barWidth = Pro ? 980 : 560;
+        var bar = new Canvas { Width = barWidth, Height = 44, Background = new SolidColorBrush(Color.FromArgb(225, 0, 0, 0)) };
+        var rd = new Rectangle { Width = barWidth, Height = 44, RadiusX = 10, RadiusY = 10,
             Stroke = new SolidColorBrush(Color.FromArgb(90, 255, 255, 255)), StrokeThickness = 1 };
         bar.Children.Add(rd);
         double x = 12;
@@ -1272,29 +1294,35 @@ internal class AnnoCanvas : Canvas
             b.Click += (s, e) => { DrawMode = mode; HiMode(); };
             _modes.Add((b, mode));
         }
-        Mode("➜ 箭头", 70, 1);
-        Mode("▭ 方框", 70, 2);
-        Mode("◯ 椭圆", 70, 3);
-        Mode("◉ 聚光", 70, 4);
+        if (Pro)
+        {
+            Mode("➜ 箭头", 70, 1);
+            Mode("▭ 方框", 70, 2);
+            Mode("◯ 椭圆", 70, 3);
+            Mode("◉ 聚光", 70, 4);
+        }
         HiMode();
         Btn(bar, ref x, "bug", 46).Click += (s, e) => NextPinType = "bug";
         Btn(bar, ref x, "change", 64).Click += (s, e) => NextPinType = "change";
         Btn(bar, ref x, "question", 72).Click += (s, e) => NextPinType = "question";
         x += 6;
-        foreach (var (c, tag) in new[] { ("red", 1), ("yellow", 2), ("cyan", 3) })
+        if (Pro)
         {
-            var d = new Border { Width = 20, Height = 20, CornerRadius = new CornerRadius(10),
-                Background = ColorOf(c), BorderBrush = Brushes.White, BorderThickness = new Thickness(1.5) };
-            d.MouseLeftButtonUp += (s, e) => CurColor = c;
-            Canvas.SetLeft(d, x); Canvas.SetTop(d, 12); bar.Children.Add(d); x += 26;
+            foreach (var (c, tag) in new[] { ("red", 1), ("yellow", 2), ("cyan", 3) })
+            {
+                var d = new Border { Width = 20, Height = 20, CornerRadius = new CornerRadius(10),
+                    Background = ColorOf(c), BorderBrush = Brushes.White, BorderThickness = new Thickness(1.5) };
+                d.MouseLeftButtonUp += (s, e) => CurColor = c;
+                Canvas.SetLeft(d, x); Canvas.SetTop(d, 12); bar.Children.Add(d); x += 26;
+            }
+            x += 8;
+            foreach (var (w, tag) in new[] { (2, 11), (4, 12), (6, 13) })
+            {
+                var b = Btn(bar, ref x, "—", 34); b.Tag = tag;
+                b.Click += (s, e) => CurWidth = (int)b.Tag - 10;
+            }
+            x += 10;
         }
-        x += 8;
-        foreach (var (w, tag) in new[] { (2, 11), (4, 12), (6, 13) })
-        {
-            var b = Btn(bar, ref x, "—", 34); b.Tag = tag;
-            b.Click += (s, e) => CurWidth = (int)b.Tag - 10;
-        }
-        x += 10;
         Btn(bar, ref x, "⌘Z撤销", 76).Click += (s, e) => Undo();
         Btn(bar, ref x, "清空", 56).Click += (s, e) => ClearAll();
         Btn(bar, ref x, "复制JSON", 76).Click += (s, e) =>
