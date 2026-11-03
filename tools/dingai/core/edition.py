@@ -98,6 +98,11 @@ def _read_license_file(path):
     except (OSError, ValueError):
         return ""
     if isinstance(data, dict):
+        # DGA1 key, or an app-store unlock record {"edition": "pro", "source": "appstore"}
+        # written by the macOS app's StoreKit path (only the app bundle can write it).
+        edition = str(data.get("edition") or "").lower()
+        if edition in ("pro", "team"):
+            return edition
         return str(data.get("key") or data.get("license") or "")
     return ""
 
@@ -120,7 +125,10 @@ def detect(project=""):
         candidates.append(os.path.join(project, ".dingai", "license.json"))
     candidates.append(os.path.join(os.path.expanduser("~"), "DingAI", "license.json"))
     for path in candidates:
-        edition, expiry = parse_key(_read_license_file(path))
+        raw = _read_license_file(path)
+        if raw.lower() in ("pro", "team"):
+            return raw.lower(), path  # app-store unlock record
+        edition, expiry = parse_key(raw)
         if edition and not _expired(expiry):
             return edition, path
     return "community", ""

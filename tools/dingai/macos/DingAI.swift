@@ -15,6 +15,7 @@ import Vision
 import ScreenCaptureKit
 import Network
 import ApplicationServices
+import StoreKit
 
 // MARK: - 数据模型(截图像素坐标,左上原点)
 
@@ -114,12 +115,89 @@ func currentEdition() -> String {
     }
     let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/license.json")
     if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let key = (obj["key"] as? String)?.lowercased() {
-        if key.hasPrefix("dga1-pro") { return "pro" }
-        if key.hasPrefix("dga1-team") { return "team" }
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let edition = (obj["edition"] as? String)?.lowercased(), edition == "pro" || edition == "team" {
+            return edition   // App Store 解锁记录（StoreKit 验证后由 App 写入）
+        }
+        if let key = (obj["key"] as? String)?.lowercased() {
+            if key.hasPrefix("dga1-pro") { return "pro" }
+            if key.hasPrefix("dga1-team") { return "team" }
+        }
     }
     return "community"
+}
+
+// MARK: - App Store 内购解锁(StoreKit 2)
+// 买断型 IAP：购买/恢复成功后写 ~/DingAI/license.json {"edition":"pro","source":"appstore"}，
+// currentEdition() 与 core/edition.py 都认这个记录；与 DGA1 密钥体系并行，密钥由网页渠道发放。
+@MainActor
+final class ProStore {
+    static let shared = ProStore()
+    static let productId = "dev.dingcode.pro.lifetime"
+    private var listenTask: Task<Void, Never>?
+
+    func start() {
+        guard listenTask == nil else { return }
+        listenTask = Task { [weak self] in
+            for await result in Transaction.updates {
+                if case .verified(let tx) = result, tx.productID == Self.productId {
+                    self?.activate()
+                }
+            }
+        }
+    }
+
+    func restore() async -> Bool {
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let tx) = result, tx.productID == Self.productId {
+                activate()
+                return true
+            }
+        }
+        return false
+    }
+
+    func purchase() async -> String {
+        do {
+            let products = try await Product.products(for: [Self.productId])
+            guard let product = products.first else { return "商品尚未在 App Store Connect 配置" }
+            let result = try await product.purchase()
+            switch result {
+            case .success(let verification):
+                if case .verified(let tx) = verification {
+                    activate()
+                    await tx.finish()
+                    return ""
+                }
+                return "购买凭证校验失败"
+            case .userCancelled:
+                return ""
+            case .pending:
+                return "等待审核(家庭共享/儿童账户)，批准后会自动解锁"
+            @unknown default:
+                return "购买未完成"
+            }
+        } catch {
+            return "购买失败: \(error.localizedDescription)"
+        }
+    }
+
+    private func activate() {
+        writeProLicense()
+        let alert = NSAlert()
+        alert.messageText = "DingCode 专业版已解锁"
+        alert.informativeText = "重启 DingAI 后生效：箭头、方框、聚光、驾驶台与 agent 工作流全部可用。"
+        alert.runModal()
+    }
+
+    static func writeProLicense() {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = ["edition": "pro", "source": "appstore"]
+        if let data = try? JSONSerialization.data(withJSONObject: obj) {
+            try? data.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("license.json")))
+        }
+    }
 }
 
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
@@ -559,6 +637,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        ProStore.shared.start()
         setupStatusBar()
         registerHotKey()
         trackFrontmostApp()
@@ -592,6 +671,32 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     // MARK: 状态栏
 
+    @objc func upgradePro() {
+        Task {
+            ProStore.shared.start()
+            let message = await ProStore.shared.purchase()
+            if !message.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "升级专业版"
+                alert.informativeText = message
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc func restorePro() {
+        Task {
+            ProStore.shared.start()
+            let ok = await ProStore.shared.restore()
+            if !ok {
+                let alert = NSAlert()
+                alert.messageText = "恢复购买"
+                alert.informativeText = "没有找到专业版购买记录。请确认使用的 Apple ID 与购买时一致。"
+                alert.runModal()
+            }
+        }
+    }
+
     func setupStatusBar() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         // 图标:自绘图钉(模板图,深浅菜单栏自动适配)
@@ -609,6 +714,14 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                             action: nil, keyEquivalent: "")
         st.isEnabled = false
         menu.addItem(st)
+        if currentEdition() == "community" {
+            menu.addItem(withTitle: "升级专业版…", action: #selector(upgradePro), keyEquivalent: "")
+            menu.addItem(withTitle: "恢复购买", action: #selector(restorePro), keyEquivalent: "")
+        } else {
+            let edItem = NSMenuItem(title: "DingCode \(currentEdition()) 版已解锁", action: nil, keyEquivalent: "")
+            edItem.isEnabled = false
+            menu.addItem(edItem)
+        }
         menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
         menu.autoenablesItems = false
         item.menu = menu
