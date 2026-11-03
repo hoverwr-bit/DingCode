@@ -183,7 +183,7 @@ final class ProStore {
     }
 
     private func activate() {
-        writeProLicense()
+        Self.writeProLicense()
         let alert = NSAlert()
         alert.messageText = "DingCode 专业版已解锁"
         alert.informativeText = "重启 DingAI 后生效：箭头、方框、聚光、驾驶台与 agent 工作流全部可用。"
@@ -672,7 +672,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     // MARK: 状态栏
 
     @objc func upgradePro() {
-        Task {
+        Task { @MainActor in
             ProStore.shared.start()
             let message = await ProStore.shared.purchase()
             if !message.isEmpty {
@@ -685,7 +685,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
     }
 
     @objc func restorePro() {
-        Task {
+        Task { @MainActor in
             ProStore.shared.start()
             let ok = await ProStore.shared.restore()
             if !ok {
