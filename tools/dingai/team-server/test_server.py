@@ -142,10 +142,6 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn(b"banner", page)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_admin_issues_a_license_key(self):
         from core import edition
         code, body = self.req("POST", "/api/license/issue",
@@ -153,10 +149,74 @@ if __name__ == "__main__":
                               token="test-admin-token")
         self.assertEqual(code, 200)
         self.assertEqual(edition.parse_key(body["key"]), ("pro", "29990101"))
-        # 未认证不能签发
+        # 未认证不能签发（_auth_admin：无 token 一律 401，不允许 anonymous 越权）
         code, _ = self.req("POST", "/api/license/issue", {"edition": "pro", "expires": "29990101"})
-        self.assertEqual(code, 403)
+        self.assertEqual(code, 401)
         # 参数不合法
         code, _ = self.req("POST", "/api/license/issue", {"edition": "nope", "expires": "29990101"},
                            token="test-admin-token")
         self.assertEqual(code, 400)
+
+    def test_license_issue_verify_activate_seats_revoke(self):
+        from core import edition
+        # 签发（带 2 席位）并登记
+        code, body = self.req("POST", "/api/license/issue",
+                              {"edition": "team", "expires": "29990101", "seats": 2},
+                              token="test-admin-token")
+        self.assertEqual(code, 200)
+        key = body["key"]
+        self.assertEqual(edition.parse_key(key), ("team", "29990101"))
+        # 列表（管理员）含此密钥预览；viewer 拒绝
+        code, rows = self.req("GET", "/api/licenses", token="test-admin-token")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["seats"], 2)
+        code, _ = self.req("GET", "/api/licenses")
+        self.assertEqual(code, 401)
+        # 在线核验与席位占用
+        code, v = self.req("GET", "/api/license/verify?key=" + key)
+        self.assertEqual((code, v["ok"]), (200, True))
+        for machine in ("mac-a", "mac-b"):
+            code, a = self.req("POST", "/api/license/activate", {"key": key, "machine": machine})
+            self.assertEqual((code, a["ok"]), (200, True))
+        code, a = self.req("POST", "/api/license/activate", {"key": key, "machine": "mac-c"})
+        self.assertEqual(a["ok"], False)
+        self.assertIn("seats", a["error"])
+        code, v = self.req("GET", "/api/license/verify?key=" + key)
+        self.assertFalse(v["ok"])
+        # 幂等：重复激活同一机器不重复占座
+        code, a = self.req("POST", "/api/license/activate", {"key": key, "machine": "mac-a"})
+        self.assertTrue(a["ok"])
+        # 吊销后核验与激活均拒绝
+        code, rows = self.req("GET", "/api/licenses", token="test-admin-token")
+        code, r = self.req("POST", "/api/licenses/revoke", {"id": rows[0]["id"]}, token="test-admin-token")
+        self.assertTrue(r["ok"])
+        code, v = self.req("GET", "/api/license/verify?key=" + key)
+        self.assertEqual(v["error"], "revoked")
+        code, a = self.req("POST", "/api/license/activate", {"key": key, "machine": "mac-d"})
+        self.assertFalse(a["ok"])
+        # 坏密钥
+        code, v = self.req("GET", "/api/license/verify?key=DGA1-pro-99991231-deadbeefdeadbeef")
+        self.assertFalse(v["ok"])
+
+    def test_client_online_verify_against_server(self):
+        """客户端 core.edition.verify_online 在线复核：通过 → 吊销后反映 revoked。"""
+        from core import edition
+        code, body = self.req("POST", "/api/license/issue",
+                              {"edition": "pro", "expires": "29990101"},
+                              token="test-admin-token")
+        self.assertEqual(code, 200)
+        key = body["key"]
+        result = edition.verify_online({"server_url": self.base}, key=key, timeout=5)
+        self.assertTrue(result["online"])
+        self.assertTrue(result["ok"])
+        code, rows = self.req("GET", "/api/licenses", token="test-admin-token")
+        code, r = self.req("POST", "/api/licenses/revoke", {"id": rows[0]["id"]}, token="test-admin-token")
+        self.assertTrue(r["ok"])
+        result = edition.verify_online({"server_url": self.base}, key=key, timeout=5)
+        self.assertTrue(result["online"])
+        self.assertEqual(result.get("error"), "revoked")
+
+
+if __name__ == "__main__":
+    unittest.main()

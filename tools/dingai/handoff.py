@@ -313,7 +313,17 @@ def run_main(argv):
 
 
 def edition_main():
-    sys.stdout.write(json.dumps(current_edition().describe(), indent=2, ensure_ascii=False) + "\n")
+    edition = current_edition()
+    info = edition.describe()
+    try:
+        from core.sync import load_settings
+        cfg = load_settings()
+    except Exception:
+        cfg = {}
+    if cfg.get("mode") == "server" and cfg.get("server_url"):
+        # 在线复核（软失败：服务端不可达时保留离线判定）
+        info["server_check"] = edition.verify_online(cfg)
+    sys.stdout.write(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
     return 0
 
 

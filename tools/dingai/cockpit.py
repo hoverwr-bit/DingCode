@@ -78,7 +78,8 @@ function load(name){
   document.getElementById('mode').textContent='同步模式: '+s.sync_mode+' · 项目: '+s.project;
   document.getElementById('bannerHost').innerHTML=s.banner?'<div class="banner">'+esc(s.banner)+'</div>':'';
   var h='<div class="card"><h4>版本与功能</h4><div class="muted">来源: '+esc(ed.source||'—')+'</div><div style="margin-top:8px">'+
-   (ed.features||[]).map(function(f){return '<span class="badge" style="margin-right:6px">'+esc(f)+'</span>';}).join('')+'</div></div>';
+   (ed.features||[]).map(function(f){return '<span class="badge" style="margin-right:6px">'+esc(f)+'</span>';}).join('')+'</div>'+
+   (s.server_check?('<div class="muted" style="margin-top:8px">服务端核验: '+(s.server_check.online?(s.server_check.ok?'通过':'未通过 — '+esc(s.server_check.error||'')):'离线（'+esc(s.server_check.reason||'不可达')+'）')+'</div>'):'')+'</div>';
   h+='<div class="card"><h4>会话 ('+s.sessions.length+')</h4>'+(s.sessions.length?'<table><tr><th>agent</th><th>repo</th><th>branch</th><th>pins</th><th>状态</th></tr>'+
    s.sessions.map(function(x){return '<tr><td>'+esc(x.agent)+'</td><td>'+esc(x.repo)+'</td><td>'+esc(x.branch)+'</td><td>'+esc((x.pins||[]).join(', '))+'</td><td>'+esc(x.status)+'</td></tr>';}).join('')+'</table>':'<div class="muted">无活动会话</div>')+'</div>';
   document.getElementById('tab-overview').innerHTML=h;});
@@ -163,6 +164,10 @@ def build_state():
         rows = local_notes_pins()
     releases = rel.search_releases(state_root, "")
     sessions = collide.list_sessions(state_root)
+    server_check = None
+    if cfg["mode"] == "server" and cfg["server_url"]:
+        # 团队服务端在线复核本机密钥（吊销/席位/到期）；软失败，不阻塞页面
+        server_check = edition.verify_online(cfg, timeout=3)
     banner = ""
     notices = os.path.join(state_root, "notices.json")
     try:
@@ -174,6 +179,7 @@ def build_state():
         pass
     return {
         "edition": edition.describe(),
+        "server_check": server_check,
         "sync_mode": cfg["mode"],
         "project": cfg["project"],
         "banner": banner,
@@ -210,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/state":
             state = build_state()
-            _json(self, {k: state[k] for k in ("edition", "sync_mode", "project", "banner", "sessions")})
+            _json(self, {k: state[k] for k in ("edition", "server_check", "sync_mode", "project", "banner", "sessions")})
             return
         if path == "/api/pins":
             _json(self, {k: build_state()[k] for k in ("pins", "mode")})
