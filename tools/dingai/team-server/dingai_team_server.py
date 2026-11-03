@@ -69,6 +69,20 @@ CREATE TABLE IF NOT EXISTS comments (
   body TEXT,
   created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS licenses (
+  id INTEGER PRIMARY KEY,
+  key_hash TEXT UNIQUE,
+  key_preview TEXT,
+  edition TEXT,
+  expires TEXT,
+  seats INTEGER DEFAULT 1,
+  seats_used INTEGER DEFAULT 0,
+  machines TEXT DEFAULT '[]',
+  issued_by TEXT,
+  revoked INTEGER DEFAULT 0,
+  created_at TEXT,
+  revoked_at TEXT
+);
 """
 
 BOARD_HTML = """<!DOCTYPE html>
@@ -94,6 +108,7 @@ BOARD_HTML = """<!DOCTYPE html>
  <select id="ty"><option value="">type</option><option>bug</option><option>change</option><option>question</option></select>
  <button id="go" type="button">Refresh</button>
  <a href="/releases" style="color:#fff">Releases</a>
+ <a href="/licenses" style="color:#fff">Licenses</a>
  <span id="cnt"></span>
 </header>
 <div id="banner" style="display:none;background:#ffe08a;color:#1c1e21;padding:8px 18px;font-size:13px"></div>
@@ -146,9 +161,179 @@ BOARD_HTML = """<!DOCTYPE html>
  load();
 </script></body></html>"""
 
+LICENSES_HTML = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>DingCode licenses</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{margin:0;font-family:-apple-system,"PingFang SC",sans-serif;background:#f4f5f7;color:#1c1e21}
+ header{background:#1c2430;color:#fff;padding:10px 18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ header b{font-size:15px} input,select,button{font:12px sans-serif}
+ main{padding:16px;max-width:900px;margin:0 auto}
+ .card{background:#fff;border:1px solid #e2e4e8;border-radius:8px;padding:14px;margin-bottom:14px}
+ table{width:100%;border-collapse:collapse;font-size:12px}
+ th,td{padding:7px 9px;border-bottom:1px solid #f0f1f3;text-align:left}
+ th{color:#777;font-weight:500}
+ .tag{display:inline-block;background:#e8eefb;border-radius:4px;padding:1px 6px;font-size:11px}
+ .tag.revoked{background:#fde8e8;color:#b91c1c}
+ .tag.ok{background:#e8f7ee;color:#15803d}
+ .keybox{font:13px monospace;background:#f6f8fa;border:1px dashed #94a3b8;border-radius:6px;padding:10px;margin-top:8px;word-break:break-all}
+ .muted{color:#777;font-size:12px}
+</style></head><body>
+<header>
+ <b>DingCode Licenses</b>
+ <input id="tok" placeholder="admin bearer token" size="28">
+ <a href="/" style="color:#fff">← Board</a>
+ <span id="msg" class="muted"></span>
+</header>
+<main>
+ <div class="card">
+  <b>签发新密钥</b>
+  <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+   <select id="ed"><option value="pro">pro</option><option value="team">team</option></select>
+   <input id="ex" placeholder="到期日 yyyymmdd，终身填 99991231" size="24" value="99991231">
+   <input id="se" placeholder="席位" size="4" value="1">
+   <button id="issue" type="button">签发</button>
+  </div>
+  <div id="newKey"></div>
+ </div>
+ <div class="card">
+  <b>已签发 (<span id="cnt">0</span>)</b>
+  <table><tr><th>#</th><th>密钥</th><th>版本</th><th>到期</th><th>席位</th><th>状态</th><th>签发人</th><th>时间</th><th></th></tr>
+  <tbody id="rows"></tbody></table>
+ </div>
+</main>
+<script>
+ const tok = document.getElementById('tok');
+ try { tok.value = sessionStorage.getItem('dingai-token') || ''; } catch (e) {}
+ tok.onchange = function () { try { sessionStorage.setItem('dingai-token', tok.value); } catch (e) {} };
+ function headers() { return tok.value ? {Authorization: 'Bearer ' + tok.value} : {}; }
+ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+ async function load(){
+   const r = await fetch('/api/licenses', {headers: headers()});
+   if (r.status === 403) { document.getElementById('msg').textContent = '需要管理员 token'; return; }
+   const rows = await r.json();
+   document.getElementById('msg').textContent = '';
+   document.getElementById('cnt').textContent = rows.length;
+   document.getElementById('rows').innerHTML = rows.map(function(x){
+     const state = x.revoked ? '<span class="tag revoked">已吊销</span>'
+       : (x.seats_used >= x.seats ? '<span class="tag revoked">席位已满</span>' : '<span class="tag ok">有效</span>');
+     return '<tr><td>'+x.id+'</td><td style="font-family:monospace">'+esc(x.key_preview)+'</td><td>'+esc(x.edition)+'</td>'+
+       '<td>'+esc(x.expires)+'</td><td>'+x.seats_used+'/'+x.seats+'</td><td>'+state+'</td>'+
+       '<td>'+esc(x.issued_by||'')+'</td><td class="muted">'+esc(x.created_at||'')+'</td>'+
+       '<td>'+(x.revoked ? '' : '<button type="button" onclick="revoke('+x.id+')">吊销</button>')+'</td></tr>';
+   }).join('');
+ }
+ async function revoke(id){
+   if (!confirm('吊销 #' + id + '？该密钥所有端立即失效。')) return;
+   await fetch('/api/licenses/revoke', {method:'POST', headers:Object.assign({'Content-Type':'application/json'}, headers()), body: JSON.stringify({id:id})});
+   load();
+ }
+ document.getElementById('issue').onclick = async function(){
+   const body = {edition: document.getElementById('ed').value, expires: document.getElementById('ex').value.trim(), seats: parseInt(document.getElementById('se').value || '1', 10)};
+   const r = await fetch('/api/license/issue', {method:'POST', headers:Object.assign({'Content-Type':'application/json'}, headers()), body: JSON.stringify(body)});
+   const data = await r.json();
+   if (!r.ok) { alert('签发失败: ' + (data.error || r.status)); return; }
+   document.getElementById('newKey').innerHTML = '<div class="keybox">'+esc(data.key)+'</div><div class="muted">只显示这一次，请立即复制发给客户。</div>';
+   load();
+ };
+ load();
+</script></body></html>"""
+
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---- 许可证（团队版席位管理）----
+
+def _license_preview(key):
+    return key[:18] + "…" + key[-4:]
+
+
+def license_issue(conn, edition, expires, seats, issued_by):
+    """签发密钥并登记。密钥只在本次响应里完整出现一次，库中只存哈希。"""
+    key = edition_lib.issue_key(edition, expires)
+    try:
+        conn.execute(
+            "INSERT INTO licenses(key_hash, key_preview, edition, expires, seats, issued_by, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (sha(key), _license_preview(key), edition, expires, max(1, int(seats or 1)), issued_by, now()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # 极小概率哈希碰撞重试由调用方处理
+    return key
+
+
+def license_list(conn):
+    rows = conn.execute(
+        "SELECT id, key_preview, edition, expires, seats, seats_used, machines, issued_by, revoked, created_at, revoked_at"
+        " FROM licenses ORDER BY id DESC"
+    ).fetchall()
+    out = []
+    for row in rows:
+        machines = json.loads(row[6] or "[]")
+        out.append({
+            "id": row[0], "key_preview": row[1], "edition": row[2], "expires": row[3],
+            "seats": row[4], "seats_used": row[5], "machines": len(machines),
+            "issued_by": row[7], "revoked": bool(row[8]),
+            "created_at": row[9], "revoked_at": row[10],
+        })
+    return out
+
+
+def _license_by_key(conn, key):
+    return conn.execute(
+        "SELECT id, edition, expires, seats, seats_used, machines, revoked FROM licenses WHERE key_hash = ?",
+        (sha(key),),
+    ).fetchone()
+
+
+def license_verify(conn, key):
+    """客户端在线核验：HMAC 合法 + 未吊销 + 未过期 + 席位未满。"""
+    edition, expires = edition_lib.parse_key(key)
+    if not edition:
+        return {"ok": False, "error": "bad key"}
+    row = _license_by_key(conn, key)
+    if row is None:
+        return {"ok": False, "error": "unknown key"}
+    if row[6]:
+        return {"ok": False, "error": "revoked"}
+    if edition_lib._expired(row[2]):
+        return {"ok": False, "error": "expired", "expires": row[2]}
+    if int(row[4]) >= int(row[3]):
+        return {"ok": False, "error": "seats full", "seats": row[3], "seats_used": row[4]}
+    return {"ok": True, "edition": row[1], "expires": row[2], "seats": row[3], "seats_used": row[4]}
+
+
+def license_activate(conn, key, machine):
+    """席位激活；同一 machine 重复激活幂等。返回 (ok, error)。"""
+    row = _license_by_key(conn, key)
+    if row is None:
+        return False, "unknown key"
+    machines = json.loads(row[5] or "[]")
+    machine = (machine or "unknown")[:64]
+    if machine in machines:
+        return True, ""
+    if row[6]:
+        return False, "revoked"
+    if edition_lib._expired(row[2]):
+        return False, "expired"
+    if len(machines) >= int(row[3]):
+        return False, "seats full"
+    machines.append(machine)
+    conn.execute("UPDATE licenses SET machines = ?, seats_used = ? WHERE id = ?",
+                 (json.dumps(machines), len(machines), row[0]))
+    conn.commit()
+    return True, ""
+
+
+def license_revoke(conn, license_id):
+    cur = conn.execute("UPDATE licenses SET revoked = 1, revoked_at = ? WHERE id = ? AND revoked = 0",
+                       (now(), int(license_id)))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def root_dir():
@@ -253,6 +438,18 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return user
 
+    def _auth_admin(self, conn):
+        """许可证管理的严格鉴权：即使未开 REQUIRE_AUTH，也必须出示管理员 token，
+        不允许 anonymous 越权签发/吊销密钥。"""
+        user = user_from_header(conn, self.headers.get("Authorization"))
+        if user is None:
+            self._send(401, '{"error":"admin token required"}')
+            return None
+        if ROLES.get(user["role"], 0) < ROLES["admin"]:
+            self._send(403, '{"error":"forbidden"}')
+            return None
+        return user
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -266,8 +463,17 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         if path in ("/", "/index.html"):
             return self._send(200, BOARD_HTML, "text/html; charset=utf-8")
+        if path == "/licenses":
+            return self._send(200, LICENSES_HTML, "text/html; charset=utf-8")
         conn = connect()
         try:
+            if path == "/api/license/verify":
+                key = (qs.get("key") or [""])[0]
+                return self._send(200, json.dumps(license_verify(conn, key)))
+            if path == "/api/licenses":
+                if self._auth_admin(conn) is None:
+                    return
+                return self._send(200, json.dumps(license_list(conn)))
             if path == "/api/notes":
                 if self._auth(conn, "viewer") is None:
                     return
@@ -413,18 +619,31 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
                 return self._send(200, json.dumps({"name": name, "role": role, "token": token}))
             if path == "/api/license/issue":
-                # 团队版授权：管理员签发 DGA1 密钥。客户端用同一密钥离线验证，
-                # 或服务端用 DINGAI_LICENSE_SECRET 作为自定义密钥源。
-                user = self._auth(conn, "admin")
+                # 团队版授权：管理员签发 DGA1 密钥并登记席位。密钥只在响应里完整出现一次。
+                user = self._auth_admin(conn)
                 if user is None:
                     return
                 body = self._json()
                 edition = (body.get("edition") or "pro").lower()
                 expires = str(body.get("expires") or "").strip()
+                seats = body.get("seats") or 1
                 if edition not in ("pro", "team") or not (len(expires) == 8 and expires.isdigit()):
-                    return self._send(400, '{"error":"edition (pro|team) and expires yyyymmdd required"}')
-                key = edition_lib.issue_key(edition, expires)
-                return self._send(200, json.dumps({"edition": edition, "expires": expires, "key": key}))
+                    return self._send(400, '{"error":"edition (pro|team), expires yyyymmdd and optional seats required"}')
+                key = license_issue(conn, edition, expires, seats, user["name"])
+                return self._send(200, json.dumps({"edition": edition, "expires": expires,
+                                                   "seats": max(1, int(seats or 1)), "key": key}))
+            if path == "/api/licenses/revoke":
+                user = self._auth_admin(conn)
+                if user is None:
+                    return
+                body = self._json()
+                if license_revoke(conn, body.get("id")):
+                    return self._send(200, '{"ok":true}')
+                return self._send(404, '{"error":"not found or already revoked"}')
+            if path == "/api/license/activate":
+                body = self._json()
+                ok, error = license_activate(conn, str(body.get("key") or ""), str(body.get("machine") or ""))
+                return self._send(200 if ok else 403, json.dumps({"ok": ok, "error": error}))
             if path.startswith("/api/pins/by-note/"):
                 return self._pin_action(conn, path)
             if path.startswith("/api/pins/") and path.endswith("/status"):

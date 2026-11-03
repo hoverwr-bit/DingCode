@@ -269,3 +269,15 @@ class EditionTests(unittest.TestCase):
         with self.assertRaises(edition.EditionError):
             edition.require("release", "community")
         self.assertTrue(edition.require("release", "pro"))
+
+    def test_verify_online_soft_fails(self):
+        from core import edition
+        # 无 server 或无 key：直接软失败，不抛异常
+        self.assertFalse(edition.verify_online({})["online"])
+        # 服务端不可达：软失败并给出 reason，保留离线判定
+        os.environ["DINGAI_LICENSE"] = edition.issue_key("pro", "29990101")
+        result = edition.verify_online({"server_url": "http://127.0.0.1:1"}, timeout=1)
+        self.assertFalse(result["online"])
+        self.assertTrue(result.get("reason"))
+        # find_key 从 env 找到原始密钥
+        self.assertTrue(edition.find_key().startswith("DGA1-pro-"))

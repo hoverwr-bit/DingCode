@@ -107,6 +107,52 @@ def _read_license_file(path):
     return ""
 
 
+def find_key(project=""):
+    """Return the raw DGA1 key from env or license.json, or ""."""
+    raw = (os.environ.get("DINGAI_LICENSE") or "").strip()
+    if raw.startswith(KEY_PREFIX + "-"):
+        return raw
+    candidates = []
+    if project:
+        candidates.append(os.path.join(project, ".dingai", "license.json"))
+    candidates.append(os.path.join(os.path.expanduser("~"), "DingAI", "license.json"))
+    for path in candidates:
+        raw = _read_license_file(path).strip()
+        if raw.startswith(KEY_PREFIX + "-"):
+            return raw
+    return ""
+
+
+def verify_online(settings, key=None, timeout=5):
+    """Server-mode online re-check of a DGA1 key against the team server.
+
+    Soft fail by design: no server, no key, or any network/parse error returns
+    {"online": False} so callers keep the offline verdict. When the server
+    answers, its verdict (revoked / seats / expiry) wins over offline checks.
+    """
+    import urllib.parse
+    import urllib.request
+    settings = settings or {}
+    server = (settings.get("server_url") or "").strip()
+    key = (key if key is not None else find_key()).strip()
+    if not server or not key.startswith(KEY_PREFIX + "-"):
+        return {"online": False, "reason": "no-server-or-key"}
+    url = server.rstrip("/") + "/api/license/verify?key=" + urllib.parse.quote(key, safe="")
+    headers = {}
+    if settings.get("token"):
+        headers["Authorization"] = "Bearer " + settings["token"]
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode() or "{}")
+    except Exception as exc:
+        return {"online": False, "reason": str(exc)[:120]}
+    if not isinstance(body, dict):
+        return {"online": False, "reason": "bad-response"}
+    body["online"] = True
+    return body
+
+
 def detect(project=""):
     """Return (edition, source). One of community / pro / team."""
     env = os.environ
