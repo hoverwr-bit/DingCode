@@ -26,8 +26,9 @@ import time
 KEY_PREFIX = "DGA1"
 EDITIONS = ("community", "pro", "team")
 
-# Dev/self-host default. Override with DINGAI_LICENSE_SECRET in production.
-_DEFAULT_SECRET = b"dingcode-license-dev-secret-v1"
+# Shared with the Cloudflare licensing worker (commerce/worker.js LICENSE_SECRET).
+# Override with DINGAI_LICENSE_SECRET for self-hosted team servers.
+_DEFAULT_SECRET = b"3d5360eb375e3cf53242ac9d0222c5b39818bc63e798dcdb31c042b0cf84f9f5"
 
 # feature -> minimum edition
 _FEATURE_MIN = {
