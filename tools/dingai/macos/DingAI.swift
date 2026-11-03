@@ -15,6 +15,7 @@ import Vision
 import ScreenCaptureKit
 import Network
 import ApplicationServices
+import StoreKit
 
 // MARK: - 数据模型(截图像素坐标,左上原点)
 
@@ -98,6 +99,105 @@ struct OcrTextItem {
     var text: String
     var cx: Double        // 截图像素
     var cy: Double
+}
+
+// MARK: - 版本门控(edition)
+// community(免费开源)=定位钉+复制JSON；pro/team=箭头/方框/椭圆/聚光/文字等全部工具。
+// 解锁：环境变量 DINGAI_LICENSE(原始密钥)/DINGAI_EDITION，或 ~/DingAI/license.json {"key":"DGA1-..."}。
+func currentEdition() -> String {
+    let env = ProcessInfo.processInfo.environment
+    for key in ["DINGAI_LICENSE", "DINGAI_EDITION"] {
+        guard let raw = env[key], !raw.isEmpty else { continue }
+        let low = raw.lowercased()
+        if low.hasPrefix("dga1-pro") { return "pro" }
+        if low.hasPrefix("dga1-team") { return "team" }
+        if low == "pro" || low == "team" { return low }
+    }
+    let path = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI/license.json")
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let edition = (obj["edition"] as? String)?.lowercased(), edition == "pro" || edition == "team" {
+            return edition   // App Store 解锁记录（StoreKit 验证后由 App 写入）
+        }
+        if let key = (obj["key"] as? String)?.lowercased() {
+            if key.hasPrefix("dga1-pro") { return "pro" }
+            if key.hasPrefix("dga1-team") { return "team" }
+        }
+    }
+    return "community"
+}
+
+// MARK: - App Store 内购解锁(StoreKit 2)
+// 买断型 IAP：购买/恢复成功后写 ~/DingAI/license.json {"edition":"pro","source":"appstore"}，
+// currentEdition() 与 core/edition.py 都认这个记录；与 DGA1 密钥体系并行，密钥由网页渠道发放。
+@MainActor
+final class ProStore {
+    static let shared = ProStore()
+    static let productId = "dev.dingcode.pro.lifetime"
+    private var listenTask: Task<Void, Never>?
+
+    func start() {
+        guard listenTask == nil else { return }
+        listenTask = Task { [weak self] in
+            for await result in Transaction.updates {
+                if case .verified(let tx) = result, tx.productID == Self.productId {
+                    self?.activate()
+                }
+            }
+        }
+    }
+
+    func restore() async -> Bool {
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let tx) = result, tx.productID == Self.productId {
+                activate()
+                return true
+            }
+        }
+        return false
+    }
+
+    func purchase() async -> String {
+        do {
+            let products = try await Product.products(for: [Self.productId])
+            guard let product = products.first else { return "商品尚未在 App Store Connect 配置" }
+            let result = try await product.purchase()
+            switch result {
+            case .success(let verification):
+                if case .verified(let tx) = verification {
+                    activate()
+                    await tx.finish()
+                    return ""
+                }
+                return "购买凭证校验失败"
+            case .userCancelled:
+                return ""
+            case .pending:
+                return "等待审核(家庭共享/儿童账户)，批准后会自动解锁"
+            @unknown default:
+                return "购买未完成"
+            }
+        } catch {
+            return "购买失败: \(error.localizedDescription)"
+        }
+    }
+
+    private func activate() {
+        Self.writeProLicense()
+        let alert = NSAlert()
+        alert.messageText = "DingCode 专业版已解锁"
+        alert.informativeText = "重启 DingAI 后生效：箭头、方框、聚光、驾驶台与 agent 工作流全部可用。"
+        alert.runModal()
+    }
+
+    static func writeProLicense() {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent("DingAI")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = ["edition": "pro", "source": "appstore"]
+        if let data = try? JSONSerialization.data(withJSONObject: obj) {
+            try? data.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("license.json")))
+        }
+    }
 }
 
 // MARK: - 页内桥服务(anno-bridge v1) anno-bridge
@@ -537,6 +637,7 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        ProStore.shared.start()
         setupStatusBar()
         registerHotKey()
         trackFrontmostApp()
@@ -570,6 +671,32 @@ final class AnnoController: NSObject, NSApplicationDelegate {
 
     // MARK: 状态栏
 
+    @objc func upgradePro() {
+        Task { @MainActor in
+            ProStore.shared.start()
+            let message = await ProStore.shared.purchase()
+            if !message.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "升级专业版"
+                alert.informativeText = message
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc func restorePro() {
+        Task { @MainActor in
+            ProStore.shared.start()
+            let ok = await ProStore.shared.restore()
+            if !ok {
+                let alert = NSAlert()
+                alert.messageText = "恢复购买"
+                alert.informativeText = "没有找到专业版购买记录。请确认使用的 Apple ID 与购买时一致。"
+                alert.runModal()
+            }
+        }
+    }
+
     func setupStatusBar() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         // 图标:自绘图钉(模板图,深浅菜单栏自动适配)
@@ -587,6 +714,14 @@ final class AnnoController: NSObject, NSApplicationDelegate {
                             action: nil, keyEquivalent: "")
         st.isEnabled = false
         menu.addItem(st)
+        if currentEdition() == "community" {
+            menu.addItem(withTitle: "升级专业版…", action: #selector(upgradePro), keyEquivalent: "")
+            menu.addItem(withTitle: "恢复购买", action: #selector(restorePro), keyEquivalent: "")
+        } else {
+            let edItem = NSMenuItem(title: "DingCode \(currentEdition()) 版已解锁", action: nil, keyEquivalent: "")
+            edItem.isEnabled = false
+            menu.addItem(edItem)
+        }
         menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
         menu.autoenablesItems = false
         item.menu = menu
@@ -2529,7 +2664,9 @@ final class AnnotationView: NSView {
     var modeTextBtn: NSButton?
 
     func installToolBar() {
-        let bar = DragBar(frame: NSRect(x: bounds.midX - 560, y: 16, width: 1120, height: 44))
+        let pro = currentEdition() != "community"
+        let barWidth: CGFloat = pro ? 1120 : 480
+        let bar = DragBar(frame: NSRect(x: bounds.midX - barWidth / 2, y: 16, width: barWidth, height: 44))
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.88).cgColor
         bar.layer?.cornerRadius = 10
@@ -2538,39 +2675,44 @@ final class AnnotationView: NSView {
 
         var x: CGFloat = 12
         // 0选择 1箭头 2方框 3椭圆 4聚光 5文字。单击(非选择/文字)仍落钉。
+        // community 免费版只装「选择」：落钉、复制JSON、完成；箭头/方框/椭圆/聚光/文字为 pro。
         let sel = textBtn("选择", frame: NSRect(x: x, y: 8, width: 52, height: 28))
         sel.tag = 20; sel.action = #selector(pickMode(_:)); sel.target = self
         bar.addSubview(sel); modeSelectBtn = sel; x += 56
-        let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
-        bar.addSubview(a); modeArrowBtn = a; x += 74
-        let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
-        bar.addSubview(b); modeBoxBtn = b; x += 74
-        let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
-        bar.addSubview(e); modeEllipseBtn = e; x += 74
-        let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
-        spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
-        bar.addSubview(spot); modeSpotBtn = spot; x += 74
-        let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
-        tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
-        bar.addSubview(tx); modeTextBtn = tx; x += 72
+        if pro {
+            let a = textBtn("➜ 箭头", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            a.tag = 21; a.action = #selector(pickMode(_:)); a.target = self
+            bar.addSubview(a); modeArrowBtn = a; x += 74
+            let b = textBtn("▭ 方框", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            b.tag = 22; b.action = #selector(pickMode(_:)); b.target = self
+            bar.addSubview(b); modeBoxBtn = b; x += 74
+            let e = textBtn("◯ 椭圆", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            e.tag = 23; e.action = #selector(pickMode(_:)); e.target = self
+            bar.addSubview(e); modeEllipseBtn = e; x += 74
+            let spot = textBtn("◉ 聚光", frame: NSRect(x: x, y: 8, width: 70, height: 28))
+            spot.tag = 24; spot.action = #selector(pickMode(_:)); spot.target = self
+            bar.addSubview(spot); modeSpotBtn = spot; x += 74
+            let tx = textBtn("T 文字", frame: NSRect(x: x, y: 8, width: 64, height: 28))
+            tx.tag = 25; tx.action = #selector(pickMode(_:)); tx.target = self
+            bar.addSubview(tx); modeTextBtn = tx; x += 72
+        }
         refreshModeButtons()
 
-        for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
-            let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
-            dot.action = #selector(pickColor(_:)); dot.tag = tag
-            dot.target = self
-            bar.addSubview(dot); x += 26
+        if pro {
+            for (c, tag) in [("red", 1), ("yellow", 2), ("cyan", 3)] {
+                let dot = colorDot(colorNamed(c), frame: NSRect(x: x, y: 12, width: 20, height: 20))
+                dot.action = #selector(pickColor(_:)); dot.tag = tag
+                dot.target = self
+                bar.addSubview(dot); x += 26
+            }
+            x += 8
+            for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
+                let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
+                w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
+                bar.addSubview(w); x += 36
+            }
+            x += 10
         }
-        x += 8
-        for (_, tag) in [(2, 11), (4, 12), (6, 13)] {
-            let w = textBtn("—", frame: NSRect(x: x, y: 8, width: 34, height: 28))
-            w.tag = tag; w.action = #selector(pickWidth(_:)); w.target = self
-            bar.addSubview(w); x += 36
-        }
-        x += 10
         let acts: [(String, Selector)] = [("⌘Z撤销", #selector(undo)),
                                           ("清空", #selector(clearAll)),
                                           ("复制JSON", #selector(copyJSON)),

@@ -201,3 +201,71 @@ class CollisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EditionTests(unittest.TestCase):
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in
+                     ("DINGAI_LICENSE", "DINGAI_EDITION", "DINGAI_LICENSE_SECRET")}
+        for k in self._old:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, value in self._old.items():
+            if value is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+
+    def test_default_is_community(self):
+        from core import edition
+        self.assertEqual(edition.detect()[0], "community")
+        self.assertTrue(edition.enabled("pin"))
+        self.assertTrue(edition.enabled("prompt"))
+        self.assertFalse(edition.enabled("marks"))
+        self.assertFalse(edition.enabled("release"))
+        self.assertFalse(edition.enabled("team-board"))
+
+    def test_env_name_selects_edition(self):
+        from core import edition
+        os.environ["DINGAI_EDITION"] = "pro"
+        self.assertEqual(edition.detect()[0], "pro")
+        self.assertTrue(edition.enabled("cockpit"))
+        self.assertFalse(edition.enabled("team-board"))
+        os.environ["DINGAI_EDITION"] = "team"
+        self.assertTrue(edition.enabled("team-board"))
+
+    def test_key_roundtrip_and_expiry(self):
+        from core import edition
+        future = edition.time.strftime("%Y%m%d", edition.time.gmtime(edition.time.time() + 86400 * 30))
+        past = "20000101"
+        key = edition.issue_key("pro", future)
+        self.assertEqual(edition.parse_key(key), ("pro", future))
+        self.assertEqual(edition.parse_key(edition.issue_key("team", future)), ("team", future))
+        self.assertEqual(edition.parse_key(key[:-1] + ("0" if key[-1] != "0" else "1")), (None, None))
+        self.assertEqual(edition.parse_key(edition.issue_key("pro", past))[0], "pro")
+        os.environ["DINGAI_LICENSE"] = edition.issue_key("pro", past)
+        self.assertEqual(edition.detect()[0], "community")  # 过期回退免费版
+
+    def test_custom_secret(self):
+        from core import edition
+        future = "29990101"
+        os.environ["DINGAI_LICENSE_SECRET"] = "s3lf-h0st-s3cret"
+        key = edition.issue_key("pro", future)
+        os.environ["DINGAI_LICENSE"] = key
+        self.assertEqual(edition.detect()[0], "pro")
+        os.environ.pop("DINGAI_LICENSE_SECRET", None)
+        self.assertEqual(edition.parse_key(key), (None, None))  # 换密钥后失效
+
+    def test_license_file_and_require(self):
+        from core import edition
+        with tempfile.TemporaryDirectory() as tmp:
+            future = "29990101"
+            os.makedirs(os.path.join(tmp, ".dingai"))
+            path = os.path.join(tmp, ".dingai", "license.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"key": edition.issue_key("team", future)}, fh)
+            self.assertEqual(edition.detect(tmp)[0], "team")
+        with self.assertRaises(edition.EditionError):
+            edition.require("release", "community")
+        self.assertTrue(edition.require("release", "pro"))

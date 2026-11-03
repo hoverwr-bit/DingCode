@@ -21,7 +21,13 @@ this script is the CLI and the MCP server (nothing else in the toolbox speaks MC
   python3 handoff.py session choose <id> queue|isolate|hand|continue
   python3 handoff.py session end <id>
   python3 handoff.py session list
+  python3 handoff.py workflow [init]          # 查看 / 初始化 .dingai/workflow.json（pro）
+  python3 handoff.py run [note.json] [--dry-run]   # 钉过直接执行：prompt→agent→scope 检查（pro）
+  python3 handoff.py edition                  # 显示当前版本（community/pro/team）
   python3 handoff.py mcp                    # Content-Length JSON-RPC on stdio
+
+Editions: community (free, pin + JS prompt copy) / pro (cockpit, all features) / team.
+See core/edition.py. DINGAI_EDITION=pro or a DGA1 license key unlocks pro.
 """
 
 import json
@@ -153,7 +159,166 @@ def mark_tool_schema():
     }
 
 
+def current_edition():
+    from core import edition
+    return edition
+
+
+def gate(feature):
+    """Raise EditionError when the current edition lacks a pro/team feature."""
+    return current_edition().require(feature)
+
+
+DEFAULT_WORKFLOW = {
+    "name": "default",
+    "steps": [
+        {"agent": ["claude", "-p"], "input": "handoff-prompt"},
+        {"check": "scope"},
+    ],
+}
+
+
+def workflow_path(project=None):
+    project = project if project is not None else project_dir()
+    if not project:
+        return ""
+    return os.path.join(project, ".dingai", "workflow.json")
+
+
+def load_workflow(project=None):
+    path = workflow_path(project)
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("steps"), list):
+                return data
+        except (OSError, ValueError):
+            pass
+    return dict(DEFAULT_WORKFLOW)
+
+
+def save_workflow(data, project=None):
+    path = workflow_path(project)
+    if not path:
+        return {"ok": False, "error": "no project dir (set DINGAI_PROJECT or ~/DingAI/project.txt)"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    return {"ok": True, "path": path}
+
+
+def expand_args(args, prompt):
+    return [str(a).replace("{prompt}", prompt) for a in args]
+
+
+def run_workflow(note_text, workflow=None, dry_run=False, project=None, stream=None):
+    """钉过直接执行：handoff prompt → agent 命令 → scope 检查。"""
+    gate("workflow")
+    project = project if project is not None else project_dir()
+    workflow = workflow or load_workflow(project)
+    out = stream or sys.stdout
+    prompt = prompt_for(note_text)
+    record_baseline(project)
+    observe_note(note_text, "run")
+    report = {"ok": True, "steps": [], "project": project, "workflow": workflow.get("name") or ""}
+    for index, step in enumerate(workflow.get("steps") or []):
+        if not isinstance(step, dict):
+            continue
+        if step.get("agent"):
+            argv = expand_args([str(a) for a in step["agent"]], prompt)
+            entry = {"step": index, "agent": argv}
+            report["steps"].append(entry)
+            if dry_run:
+                continue
+            if not project or not os.path.isdir(project):
+                report.update(ok=False, error="no project dir; cannot run the agent step")
+                return report
+            use_stdin = "{prompt}" not in [str(a) for a in step["agent"]]
+            try:
+                proc = subprocess.run(
+                    argv, cwd=project, text=True,
+                    input=prompt if use_stdin else None,
+                    capture_output=True, timeout=int(step.get("timeout") or 1800),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                entry["error"] = str(exc)
+                report.update(ok=False, error="agent step failed: %s" % exc)
+                return report
+            entry["returncode"] = proc.returncode
+            entry["stdout"] = proc.stdout
+            entry["stderr"] = proc.stderr
+            out.write(proc.stdout or "")
+            if proc.returncode != 0:
+                report.update(ok=False, error="agent exited with %d" % proc.returncode)
+                return report
+        elif step.get("check") == "scope":
+            entry = {"step": index, "check": "scope"}
+            report["steps"].append(entry)
+            if dry_run:
+                continue
+            check = scope_check(project)
+            entry["report"] = check
+            out.write(format_scope(check) + "\n")
+            if check.get("warnings") and not step.get("optional"):
+                report.update(ok=False, error="scope check reported warnings")
+                return report
+    return report
+
+
+def workflow_main(argv):
+    try:
+        gate("workflow")
+    except Exception as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    if len(argv) > 2 and argv[2] == "init":
+        result = save_workflow(dict(DEFAULT_WORKFLOW))
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0 if result.get("ok") else 1
+    project = project_dir()
+    workflow = load_workflow(project)
+    sys.stdout.write(json.dumps({"project": project, "path": workflow_path(project) or "(default)",
+                                 "workflow": workflow}, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def run_main(argv):
+    try:
+        gate("workflow")
+    except Exception as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    args = [a for a in argv[2:] if a != "--dry-run"]
+    dry = "--dry-run" in argv[2:]
+    note = read_note(args[0] if args else "")
+    if dry:
+        workflow = load_workflow()
+        prompt = prompt_for(note)
+        plan = []
+        for step in workflow.get("steps") or []:
+            if isinstance(step, dict) and step.get("agent"):
+                argv2 = expand_args([str(a) for a in step["agent"]], prompt)
+                via = "arg {prompt}" if "{prompt}" in [str(a) for a in step["agent"]] else "stdin"
+                plan.append({"run": argv2, "prompt_via": via})
+            elif isinstance(step, dict) and step.get("check"):
+                plan.append({"check": step["check"]})
+        sys.stdout.write(json.dumps({"dry_run": True, "plan": plan}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    report = run_workflow(note)
+    if not dry:
+        sys.stderr.write(json.dumps({k: v for k, v in report.items() if k != "steps"}, ensure_ascii=False) + "\n")
+    return 0 if report.get("ok") else 1
+
+
+def edition_main():
+    sys.stdout.write(json.dumps(current_edition().describe(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 def list_agent_pins(project=None):
+    gate("sync")
     from core.sync import list_pins
     return list_pins(project)
 
@@ -401,26 +566,41 @@ def handle_rpc(msg):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
-            tool_schema(), scope_tool_schema(), reject_tool_schema(), list_tool_schema(), mark_tool_schema()]}}
+        tools = [tool_schema()]
+        try:
+            gate("scope")
+            tools += [scope_tool_schema(), reject_tool_schema()]
+        except Exception:
+            pass
+        try:
+            gate("sync")
+            tools += [list_tool_schema(), mark_tool_schema()]
+        except Exception:
+            pass
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name == "dingai_handoff":
-            return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(arguments)}
-        if name == "dingai_scope_check":
-            report = scope_check(arguments.get("project") or None)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
-        if name == "dingai_reject":
-            result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
-        if name == "dingai_list_pins":
-            result = list_agent_pins(arguments.get("project") or None)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
-        if name == "dingai_mark_fixed":
-            result = mark_fixed(arguments)
-            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        try:
+            if name == "dingai_handoff":
+                return {"jsonrpc": "2.0", "id": mid, "result": call_handoff(arguments)}
+            if name == "dingai_scope_check":
+                gate("scope")
+                report = scope_check(arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": format_scope(report)}], "structured": report}}
+            if name == "dingai_reject":
+                gate("scope")
+                result = reject_changes(arguments.get("paths"), arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+            if name == "dingai_list_pins":
+                result = list_agent_pins(arguments.get("project") or None)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+            if name == "dingai_mark_fixed":
+                result = mark_fixed(arguments)
+                return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result)}], "structured": result}}
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True}}
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
     if mid is None:
         return None
@@ -780,6 +960,24 @@ def main(argv):
     if cmd in ("-h", "--help", "help"):
         sys.stdout.write(__doc__ or "")
         return 0
+    if cmd == "edition":
+        return edition_main()
+    if cmd == "workflow":
+        return workflow_main(argv)
+    if cmd == "run":
+        return run_main(argv)
+    # Everything below is gated by edition; community keeps rules + prompt only.
+    gates = {
+        "baseline": "scope", "scope": "scope", "reject": "scope",
+        "pins": "sync", "mark-fixed": "sync",
+        "release": "release", "session": "session",
+    }
+    if cmd in gates:
+        try:
+            gate(gates[cmd])
+        except Exception as exc:
+            sys.stderr.write("%s\n" % exc)
+            return 1
     if cmd == "rules":
         sys.stdout.write(load_rules() + "\n")
         return 0

@@ -276,15 +276,29 @@ def notice_banner(path=None):
     return " · ".join(part for part in parts if part)
 
 
-def toolbar_title(pins=None, banner=""):
-    base = "DingAI pins %d" % pins if pins is not None else "DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done"
+def toolbar_title(pins=None, banner="", pro=True):
+    if pins is not None:
+        base = "DingAI pins %d" % pins
+    elif pro:
+        base = "DingAI  p pin  b/c/q type  a arrow  r box  s spot  Esc done"
+    else:
+        base = "DingAI community  p pin  b/c/q type  Esc done"
     if banner:
         return (base + " | " + banner)[:240]
     return base
 
 
+def _edition_pro():
+    from core import edition
+    try:
+        edition.require("marks")
+        return True
+    except Exception:
+        return False
+
+
 def run_toolbar():
-    """X11 toolbar. p then click drops a pin. a, r, and s take two clicks for an arrow, box, or spotlight. Esc exports."""
+    """X11 toolbar. p then click drops a pin. a, r, and s take two clicks for an arrow, box, or spotlight (pro). Esc exports."""
     lib = _x11()
     lib.XCreateSimpleWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong]
     lib.XCreateSimpleWindow.restype = ctypes.c_ulong
@@ -300,13 +314,14 @@ def run_toolbar():
     if not display:
         print("No X11 display. On Wayland, run: grim anno-linux.png", file=sys.stderr)
         return 1
+    pro = _edition_pro()
     screen = lib.XDefaultScreen(display)
     root = lib.XRootWindow(display, screen)
     window = lib.XCreateSimpleWindow(display, root, 40, 40, 720, 36, 1, 0, 0xFFFFFF)
     banner = notice_banner()
     if banner:
         print(banner, file=sys.stderr)
-    lib.XStoreName(display, window, toolbar_title(banner=banner).encode())
+    lib.XStoreName(display, window, toolbar_title(banner=banner, pro=pro).encode())
     lib.XSelectInput(display, window, (1 << 0) | (1 << 2))
     lib.XMapWindow(display, window)
     lib.XFlush(display)
@@ -356,16 +371,22 @@ def run_toolbar():
             elif keysym in (ord("q"),):
                 session.pin_type = "question"
             elif keysym in (ord("a"),):
+                if not pro:
+                    continue
                 armed = "arrow"
                 session.drag_from = None
                 lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)
                 lib.XFlush(display)
             elif keysym in (ord("r"),):
+                if not pro:
+                    continue
                 armed = "box"
                 session.drag_from = None
                 lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)
                 lib.XFlush(display)
             elif keysym in (ord("s"),):
+                if not pro:
+                    continue
                 armed = "spotlight"
                 session.drag_from = None
                 lib.XGrabPointer(display, root, 0, 1 << 2, 1, 1, 0, 0, 0)

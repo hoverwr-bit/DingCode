@@ -145,3 +145,18 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_admin_issues_a_license_key(self):
+        from core import edition
+        code, body = self.req("POST", "/api/license/issue",
+                              {"edition": "pro", "expires": "29990101"},
+                              token="test-admin-token")
+        self.assertEqual(code, 200)
+        self.assertEqual(edition.parse_key(body["key"]), ("pro", "29990101"))
+        # 未认证不能签发
+        code, _ = self.req("POST", "/api/license/issue", {"edition": "pro", "expires": "29990101"})
+        self.assertEqual(code, 403)
+        # 参数不合法
+        code, _ = self.req("POST", "/api/license/issue", {"edition": "nope", "expires": "29990101"},
+                           token="test-admin-token")
+        self.assertEqual(code, 400)
