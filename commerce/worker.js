@@ -69,14 +69,14 @@ async function verifyLemonSqueezy(rawBody, signature, secret) {
   return diff === 0;
 }
 
-async function sendMail(to, subject, text) {
+async function sendMail(to, subject, text, env) {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Authorization": `Bearer ${env.RESEND_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ from: MAIL_FROM, to, subject, text }),
+    body: JSON.stringify({ from: env.MAIL_FROM, to, subject, text }),
   });
   return res.ok;
 }
@@ -120,7 +120,7 @@ export default {
         + `1. 命令行临时解锁：DINGAI_LICENSE=${key} python3 tools/dingai/handoff.py edition\n`
         + `2. 写入 ~/DingAI/license.json：{"key": "${key}"}\n`
         + `3. 网页端：localStorage['dingai-license'] = '${key}'\n\n`
-        + `到期日：${expires === "99991231" ? "终身" : expires}\n`);
+        + `到期日：${expires === "99991231" ? "终身" : expires}\n`, env);
       return new Response(JSON.stringify({ ok: true, mailed: mailOk }), { status: 200 });
     }
 
