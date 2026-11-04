@@ -47,7 +47,7 @@ function issueKeyPy(edition, yyyymmdd) {
     const wk = await issueKeyWorker(edition, expires);
     const parsed = execFileSync("python3", ["-c",
       "import sys; sys.path.insert(0, '../tools/dingai'); from core import edition; print(edition.parse_key(sys.argv[1]))",
-      wk], { cwd: __dirname }).toString().trim();
+      wk], { cwd: __dirname, env: { ...process.env, DINGAI_LICENSE_SECRET: SECRET } }).toString().trim();
     const ok = parsed === `('${edition}', '${expires}')`;
     console.log(`${ok ? "ok " : "FAIL"} python parses worker key -> ${parsed}`);
     if (!ok) failed++;

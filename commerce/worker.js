@@ -1,7 +1,7 @@
 // DingCode 专业版授权 Worker：落地页 + Lemon Squeezy webhook + 密钥在线核验。
 // 密钥算法与 tools/dingai/core/edition.py 逐字节一致（改一处必须同步另一处）。
 
-const BUY_URL = "https://dingcode.lemonsqueezy.com/buy/pro-lifetime"; // ← 换成你的 checkout 链接
+const BUY_URL = "https://dingcode.lemonsqueezy.com/checkout/buy/120504ba-8720-4256-ad88-d988a5057035";
 
 const HTML = `<!DOCTYPE html>
 <html lang="zh">

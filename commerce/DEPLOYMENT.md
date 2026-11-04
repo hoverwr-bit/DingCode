@@ -7,8 +7,8 @@
 
 | 渠道 | 状态 | 说明 |
 |---|---|---|
-| App Store 内购（macOS） | 🔧 待配置 | 需签 Paid Apps 协议 + 建 IAP 商品 `dev.dingcode.pro.lifetime` |
-| Lemon Squeezy 网页买断 | 🟡 部署完成，待商品+激活 | Worker 已上线并通过端到端冒烟测试 |
+| App Store 内购（macOS） | 🟡 商品已建，待协议与发布 | owner 告知 IAP 商品已建；本地编译、签名及 App Store 解锁记录识别通过，Paid Apps 协议、沙盒测试和上传仍待核验 |
+| Lemon Squeezy 网页买断 | 🟡 Worker 与结账链接已部署，店铺审核中 | 商品与 webhook 仍为 test 模式；已建商品的名称、价格、变体状态仍需在 dashboard 修正 |
 | 团队版 team-server | ✅ 已交付 | 自托管，见 `tools/dingai/team-server/`，密钥算法与本 Worker 一致 |
 
 ## 账号与 ID
@@ -23,7 +23,8 @@
 ## 已部署组件
 
 - **Worker**：`https://dingcode-licenses.dingcode.workers.dev`
-  - `GET /` 落地页（购买按钮的 `BUY_URL` 待填真实 checkout 链接）
+  - `GET /` 落地页已接真实 checkout：`https://dingcode.lemonsqueezy.com/checkout/buy/120504ba-8720-4256-ad88-d988a5057035`
+  - 2026-11-03 重新部署，Version ID `64b7deaf-0d7c-4ae5-9239-d92db33d8d2b`；线上已核验新链接且旧占位链接消失
   - `POST /webhook/lemonsqueezy` LS webhook，验签 → 签发 DGA1 → KV → Resend 发邮件
   - `GET /api/license/verify?key=` 在线核验/吊销抓手
 - **KV namespace**：`LICENSES` = `94b4b293ca29400d89fecb1a8c1231d5`
@@ -57,22 +58,24 @@
 
 ## 剩余清单（按序）
 
-1. **LS 后台建商品**（网页 API 不支持，只能 dashboard）：Products → New product，
-   名 “DingCode Pro — 全平台终身版”，one-time，variant “终身版” **₫399,000**，Status=Live。
-   描述文案见 git 历史或询问 owner。
-2. 商品建好后：API 查 variant → 把 checkout 链接写进 `commerce/worker.js` 的
-   `BUY_URL` → `wrangler deploy` 重新部署。
-3. **店铺激活**：Settings 里完成 Identity verification（护照签发国选 China，姓名须为
-   `WANG GANG` 与 Vietcombank 账户一致）+ 审核通过；然后把 webhook 148809 切到 live 模式
-   （或在 live 下重建 webhook，注意 LS webhook secret ≤40 字符，改后要同步
-   `wrangler secret put LS_WEBHOOK_SECRET`）。
+1. **修正已建 LS 商品**（网页 API 不支持写商品，只能 dashboard）：当前 product id `1498304`、
+   variant id `2333468`，名称 `dingcode`、variant `Default`、价格 **₫99,999**、variant `pending`，
+   product `published` 且为 test 模式。改成名 “DingCode Pro — 全平台终身版”，one-time，
+   variant “终身版” **₫399,000**，variant Status=Live/Published。
+2. ✅ **接入 checkout 并重新部署 Worker**：已完成，见上方 Version ID；`node commerce/test-worker.js`
+   已全部通过（测试现为 Python 验签显式注入同一个测试 secret，避免与生产默认 secret 混用）。
+3. **店铺激活**：后台已显示 “Your application has been received and will be reviewed as soon as possible”，
+   需等审核通过；然后把 webhook 148809 切到 live 模式（或在 live 下重建 webhook，注意
+   LS webhook secret ≤40 字符，改后要同步 `wrangler secret put LS_WEBHOOK_SECRET`）。
 4. **提现**：Settings → Payout 已登记 Vietcombank 账户（CITAD `01203001`，
-   账号 `1070997571`，户名 `WANG GANG`）；确认 payout 绑定成功。
+   账号 `1070997571`，户名 `WANG GANG`）；本次未能登录复核绑定状态。
 5. 真实下单测试（可用 LS test mode 的 100% off 测试商品）：走一遍
    下单 → 收邮件 → `DINGAI_LICENSE=<key> python3 tools/dingai/handoff.py edition` 显示 pro。
-6. **App Store 渠道**（与网页渠道独立）：App Store Connect 签 Paid Apps 协议，
-   IAP 商品 id `dev.dingcode.pro.lifetime`；macOS 端 StoreKit 解锁写
-   `~/DingAI/license.json` 的 `{"edition":"pro","source":"appstore"}` 记录。
+6. **App Store 渠道**（与网页渠道独立）：owner 告知 IAP 商品 `dev.dingcode.pro.lifetime` 已建；
+   仍须在 App Store Connect 核验 Paid Apps 协议、商品审核信息与沙盒账号，并完成发布构建和上传。
+   macOS 端 StoreKit 解锁写 `~/DingAI/license.json` 的 `{"edition":"pro","source":"appstore"}` 记录；
+   2026-11-03 已验证该记录能被 `handoff.py edition` 识别为 pro。本机 `swiftc` 编译、签名和
+   `codesign --verify` 已通过，但只有 Command Line Tools、没有完整 Xcode，尚不能产出 App Store 上传包。
 
 ## 常用运维命令
 
