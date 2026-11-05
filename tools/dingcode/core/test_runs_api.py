@@ -1,0 +1,1042 @@
+"""Tests for the record page surface (core/runs_api.py): M1 reads, M2 writes.
+
+Starts a real bridge on an ephemeral port against a temp DINGCODE_HOME and a
+temp dist dir, then drives it with raw http.client so Host and Origin headers
+are under test control. M2 write tests patch runs_api.spawn_autofix so a rerun
+request never starts a real engine process.
+
+Run: python3 ./core/test_runs_api.py  (or python3 -m core.test_runs_api)
+"""
+
+import hashlib
+import http.client
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import bridge  # noqa: E402
+from core import runs_api  # noqa: E402
+
+SID = "case-1"
+SID2 = "case-2"
+DIFF = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-hello\n+world\n"
+SUMMARY = {
+    "pins": [
+        {
+            "id": "p1",
+            "status": "fixed",
+            "summary_zh": "改了 a.txt 第 1 行",
+            "files": ["a.txt"],
+            "diff": DIFF,
+        }
+    ]
+}
+MANIFEST = {"kind": "git", "head": "abc1234", "folder": "/tmp/proj",
+            "files_sha256": {"a.txt": "deadbeef"}}
+NOTE = {"pins": [{"id": "p1", "note": "这个按钮改成蓝色"}]}
+# 源 note 文件（M2 改批注/重跑都以它为准），status.json 的 note 字段指向它。
+SOURCE_NOTE = {
+    "pins": [
+        {"id": "p1", "status": "open", "note": "这个按钮改成蓝色"},
+        {"id": "p2", "status": "confirmed", "note": "已确认"},
+    ]
+}
+
+
+class RunsApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.home = tempfile.mkdtemp(prefix="dingcode-runs-")
+        cls.dist = tempfile.mkdtemp(prefix="dingcode-dist-")
+        os.environ["DINGCODE_HOME"] = cls.home
+        os.environ["DINGCODE_RECORD_DIST"] = cls.dist
+        cls.source_note = os.path.join(cls.home, "source-notes", "case-1.json")
+        os.makedirs(os.path.dirname(cls.source_note))
+        cls._write(cls.source_note, SOURCE_NOTE)
+        run = os.path.join(cls.home, "runs", SID)
+        round1 = os.path.join(run, "round-1")
+        os.makedirs(round1)
+        cls._write(os.path.join(run, "status.json"), {
+            "status": "done", "round": 1, "summary_line": "修复了 1 颗钉",
+            "note": cls.source_note, "finished": "2026-10-25T10:00:00Z",
+        })
+        cls._write(os.path.join(run, "note.json"), NOTE)
+        cls._write(os.path.join(round1, "summary.json"), SUMMARY)
+        cls._write(os.path.join(round1, "manifest.json"), MANIFEST)
+        # newline=""：磁盘字节固定 LF，否则 Windows 文本模式写出 CRLF，
+        # 服务的 diff 就不再是 DIFF 原文。
+        with open(os.path.join(round1, "diff.patch"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(DIFF)
+        with open(os.path.join(round1, "pre.diff"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(DIFF)
+        with open(os.path.join(cls.dist, "index.html"), "w", encoding="utf-8") as fh:
+            fh.write("<!doctype html><html><body>record</body></html>")
+        cls._fixture_case2()
+        cls.httpd = bridge.make_server(0)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=10)
+        os.environ.pop("DINGCODE_HOME", None)
+        os.environ.pop("DINGCODE_RECORD_DIST", None)
+        shutil.rmtree(cls.home, ignore_errors=True)
+        shutil.rmtree(cls.dist, ignore_errors=True)
+
+    @staticmethod
+    def _write(path, obj):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False)
+
+    @classmethod
+    def _fixture_case2(cls):
+        """逐颗撤回（M3）的夹具：一颗 pin_only 轮，带 pre/、post/ 和 files_sha256。"""
+        cls.folder2 = os.path.join(cls.home, "proj-case2")
+        os.makedirs(cls.folder2)
+        run = os.path.join(cls.home, "runs", SID2)
+        round1 = os.path.join(run, "round-1")
+        os.makedirs(os.path.join(round1, "pre"))
+        os.makedirs(os.path.join(round1, "post"))
+        base = b"l1\nl2\nl3\n"
+        pinned = b"l1\nX\nl3\n"
+        with open(os.path.join(round1, "pre", "a.txt"), "wb") as fh:
+            fh.write(base)
+        with open(os.path.join(round1, "post", "a.txt"), "wb") as fh:
+            fh.write(pinned)
+        cls._write(os.path.join(run, "status.json"), {
+            "status": "done", "round": 1, "summary_line": "修复了 1 颗钉",
+            "note": cls.source_note, "folder": cls.folder2,
+            "finished": "2026-10-26T10:00:00Z",
+        })
+        cls._write(os.path.join(round1, "summary.json"), {
+            "pins": [{
+                "id": "p1", "status": "fixed", "summary_zh": "改了 a.txt 第 2 行",
+                "files": ["a.txt"], "pin_only": True, "pin": "p1", "rerun": 1,
+            }]
+        })
+        cls._write(os.path.join(round1, "manifest.json"), {
+            "kind": "copy", "folder": cls.folder2, "copied": ["a.txt"],
+            "files_sha256": {"a.txt": {
+                "pre": hashlib.sha256(base).hexdigest(),
+                "post": hashlib.sha256(pinned).hexdigest(),
+            }},
+        })
+
+    def request(self, path, method="GET", headers=None, data=b""):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            merged = {"Host": "127.0.0.1:%d" % self.port}
+            merged.update(headers or {})
+            for key, value in merged.items():
+                conn.putheader(key, value)
+            conn.endheaders()
+            if data:
+                conn.send(data)
+            resp = conn.getresponse()
+            body = resp.read()
+            headers_out = dict((k.lower(), v) for k, v in resp.getheaders())
+            return resp.status, body, headers_out
+        finally:
+            conn.close()
+
+    @property
+    def self_origin(self):
+        return "http://127.0.0.1:%d" % self.port
+
+    def post_write(self, path, obj, origin="self"):
+        """POST with JSON body; origin "self" by default, None = no Origin header."""
+        headers = {}
+        if origin == "self":
+            headers["Origin"] = self.self_origin
+        elif origin:
+            headers["Origin"] = origin
+        data = json.dumps(obj).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(data))
+        return self.request(path, method="POST", headers=headers, data=data)
+
+    def creds(self):
+        status, body, _ = self.request("/api/session")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        return {"client": data["client"], "token": data["token"]}
+
+    # -- origin / Host 门禁 ------------------------------------------------
+
+    def test_self_origin_allowed(self):
+        status, body, headers = self.request(
+            "/api/sessions", headers={"Origin": "http://127.0.0.1:%d" % self.port})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        names = [item["session"] for item in data["sessions"]]
+        self.assertIn(SID, names)
+        # 同源请求不发 CORS 头。
+        self.assertNotIn("access-control-allow-origin", headers)
+
+    def test_cli_no_origin_allowed(self):
+        status, body, _ = self.request("/api/runs/" + SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["session"], SID)
+        self.assertEqual(data["status"], "done")
+        self.assertEqual(data["pins"][0]["id"], "p1")
+
+    def test_foreign_origin_403(self):
+        for origin in ("http://evil.example", "http://localhost:%d" % (self.port + 1),
+                       "null"):
+            status, _, _ = self.request(
+                "/api/sessions", headers={"Origin": origin})
+            self.assertEqual(status, 403, origin)
+
+    def test_forged_host_403(self):
+        # DNS rebinding: 外部域名解析到 127.0.0.1 时 Host 不是环回地址。
+        status, _, _ = self.request("/api/sessions", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+        status, _, _ = self.request(
+            "/api/sessions",
+            headers={"Host": "evil.example",
+                     "Origin": "http://127.0.0.1:%d" % self.port})
+        self.assertEqual(status, 403)
+
+    def test_shell_forwarded_port(self):
+        # BK-02: 原生壳 DingCode.app 占 127.0.0.1:8763，把 /app、/api 原样转发
+        # 到内部 bridge（本测试服务器就在 8763 之外的其他端口）。转发保留
+        # Host 与 Origin，壳的公开端口要按本机页面放行。
+        public_host = "127.0.0.1:%d" % bridge.APP_PUBLIC_PORT
+        public_origin = "http://" + public_host
+        status, body, _ = self.request(
+            "/api/sessions", headers={"Host": public_host, "Origin": public_origin})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # 带 token+confirm 的写请求同样通过。
+        creds = self.creds()
+        payload = {**creds, "confirm": "p1", "note": "x"}
+        data = json.dumps(payload).encode("utf-8")
+        status, body, _ = self.request(
+            "/api/runs/%s/pins/p1/note" % SID, method="POST",
+            headers={"Host": public_host, "Origin": public_origin,
+                     "Content-Type": "application/json",
+                     "Content-Length": str(len(data))},
+            data=data)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        # localhost 形式的公开端口也放行。
+        status, _, _ = self.request(
+            "/api/sessions",
+            headers={"Host": "localhost:%d" % bridge.APP_PUBLIC_PORT,
+                     "Origin": "http://localhost:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        # 其他非本机端口的 Host 仍拒绝。
+        status, _, _ = self.request(
+            "/api/sessions", headers={"Host": "127.0.0.1:9999", "Origin": public_origin})
+        self.assertEqual(status, 403)
+        # 外域 Origin 仍 403。
+        status, _, _ = self.request(
+            "/api/sessions",
+            headers={"Host": public_host, "Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_post_is_405(self):
+        # 只读路径不吃 POST：POST 只属于两个写路由，其余 /api 404，/app 405。
+        status, _, _ = self.request("/api/sessions", method="POST",
+                                    headers={"Content-Length": "0"})
+        self.assertEqual(status, 404)
+        status, _, headers = self.request("/app/", method="POST",
+                                          headers={"Content-Length": "0"})
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("allow"), "GET")
+
+    def test_bad_sid_rejected(self):
+        status, _, _ = self.request("/api/runs/%2e%2e")
+        self.assertEqual(status, 400)
+        status, _, _ = self.request("/api/runs/x/rounds/1/files/y",
+                                    headers={"Host": "127.0.0.1:%d" % self.port})
+        # x 存在性检查发生在 sid 校验之前应不影响：sid "x" 合法但会话不存在。
+        self.assertEqual(status, 404)
+
+    # -- 只读端点 ----------------------------------------------------------
+
+    def test_round_detail(self):
+        status, body, _ = self.request("/api/runs/%s/rounds/1" % SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["manifest"]["kind"], "git")
+        self.assertEqual(data["manifest"]["head"], "abc1234")
+        self.assertEqual(data["manifest"]["files_sha256"], ["a.txt"])
+        self.assertFalse(data["manifest"]["reverted"])
+
+    def test_round_files_whitelist(self):
+        status, body, _ = self.request("/api/runs/%s/rounds/1/files/diff.patch" % SID)
+        self.assertEqual(status, 200)
+        self.assertEqual(body.decode("utf-8"), DIFF)
+        for name in ("status.json", "note.json", "secret.txt", "..", "."):
+            status, _, _ = self.request(
+                "/api/runs/%s/rounds/1/files/%s" % (SID, name))
+            self.assertEqual(status, 404, name)
+
+    def test_note_endpoint(self):
+        status, body, _ = self.request("/api/runs/%s/note" % SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["pins"][0]["note"], "这个按钮改成蓝色")
+
+    def test_pin_history(self):
+        status, body, _ = self.request("/api/runs/%s/pins/p1" % SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["pin_id"], "p1")
+        self.assertEqual(len(data["rounds"]), 1)
+        self.assertEqual(data["rounds"][0]["summary_zh"], "改了 a.txt 第 1 行")
+        # 不存在的钉 404。
+        status, _, _ = self.request("/api/runs/%s/pins/nope" % SID)
+        self.assertEqual(status, 404)
+
+    def test_unknown_session_404(self):
+        status, _, _ = self.request("/api/runs/missing-session")
+        self.assertEqual(status, 404)
+        status, _, _ = self.request("/api/runs/%s/rounds/9" % SID)
+        self.assertEqual(status, 404)
+
+    # -- M2 写接口 ----------------------------------------------------------
+
+    def test_write_requires_self_origin(self):
+        creds = self.creds()
+        payload = {**creds, "confirm": "p1", "note": "x"}
+        # 无 Origin 的本地客户端只读：写必须来自页面自身的同源请求。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, payload, origin=None)
+        self.assertEqual(status, 403)
+        # 外域 Origin 在 bridge 层就被拒。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, payload,
+            origin="http://evil.example")
+        self.assertEqual(status, 403)
+
+    def test_write_requires_client_token(self):
+        # 缺 client/token → 401。
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID, {"confirm": "p1", "note": "x"})
+        self.assertEqual(status, 401)
+        self.assertIn("client", json.loads(body)["error"])
+        # 错 token → 401。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {"client": 999, "token": "nope", "confirm": "p1", "note": "x"})
+        self.assertEqual(status, 401)
+
+    def test_write_confirm_mismatch_403(self):
+        creds = self.creds()
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p2", "note": "x"})
+        self.assertEqual(status, 403)
+        self.assertIn("confirm", json.loads(body)["error"])
+
+    def test_write_bad_pid_400(self):
+        creds = self.creds()
+        # %2e%2e 不被解码成 ..，但包含 % 不满足 pid 白名单。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%2e%%2e/note" % SID,
+            {**creds, "confirm": "..", "note": "x"})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%20/rerun" % SID,
+            {**creds, "confirm": "%20"})
+        self.assertEqual(status, 400)
+
+    def test_write_bad_json_and_too_large(self):
+        creds = self.creds()
+        status, _, _ = self.request(
+            "/api/runs/%s/pins/p1/note" % SID, method="POST",
+            headers={"Origin": self.self_origin, "Content-Type": "application/json",
+                     "Content-Length": "5"},
+            data=b"not{json")
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "长" * 40000})
+        self.assertEqual(status, 413)
+
+    def test_note_edit_saves_to_source_note(self):
+        creds = self.creds()
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "改成绿色并加大字号"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["note"], "改成绿色并加大字号")
+        with open(self.source_note, encoding="utf-8") as fh:
+            after = json.load(fh)
+        self.assertEqual(after["pins"][0]["note"], "改成绿色并加大字号")
+        self.assertEqual(after["pins"][1]["note"], "已确认")  # 别的钉不动
+        # P-20261026-DB-04: 版本由 git 管，改批注不再产生 .bak。
+        self.assertFalse(os.path.exists(self.source_note + ".bak"))
+        # runs/note.json 不被手改。
+        status, body, _ = self.request("/api/runs/%s/note" % SID)
+        self.assertEqual(json.loads(body)["pins"][0]["note"], "这个按钮改成蓝色")
+
+    def test_note_edit_validations(self):
+        creds = self.creds()
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": 123})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/note" % SID,
+            {**creds, "confirm": "p1", "note": "超" * 3000})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/zz/note" % SID, {**creds, "confirm": "zz", "note": "x"})
+        self.assertEqual(status, 404)
+
+    def test_rerun_enqueues_round(self):
+        creds = self.creds()
+        captured = []
+        original = runs_api.spawn_autofix
+        runs_api.spawn_autofix = lambda sid, n, pid, fb="": captured.append((sid, n, pid, fb))
+        try:
+            status, body, _ = self.post_write(
+                "/api/runs/%s/pins/p1/rerun" % SID,
+                {**creds, "confirm": "p1", "feedback": "再宽一点"})
+        finally:
+            runs_api.spawn_autofix = original
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["round"], 2)  # 已有 round-1，重跑入队 round-2
+        self.assertEqual(captured, [(SID, 2, "p1", "再宽一点")])
+
+    def test_rerun_validations(self):
+        creds = self.creds()
+        captured = []
+        original = runs_api.spawn_autofix
+        runs_api.spawn_autofix = lambda *a: captured.append(a)
+        try:
+            # 已确认的钉不重跑（open_pins_note 语义）。
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/p2/rerun" % SID, {**creds, "confirm": "p2"})
+            self.assertEqual(status, 400)
+            # 不存在的钉 404。
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/zz/rerun" % SID, {**creds, "confirm": "zz"})
+            self.assertEqual(status, 404)
+            self.assertEqual(captured, [])
+            # 已有运行在进行 → 409。
+            status_path = os.path.join(self.home, "runs", SID, "status.json")
+            with open(status_path, encoding="utf-8") as fh:
+                old = fh.read()
+            self._write(status_path, {"status": "running", "round": 2})
+            try:
+                status, _, _ = self.post_write(
+                    "/api/runs/%s/pins/p1/rerun" % SID, {**creds, "confirm": "p1"})
+                self.assertEqual(status, 409)
+            finally:
+                with open(status_path, "w", encoding="utf-8") as fh:
+                    fh.write(old)
+        finally:
+            runs_api.spawn_autofix = original
+        self.assertEqual(captured, [])
+
+    # -- M3 逐颗撤回 ---------------------------------------------------------
+
+    def _case2_file(self, text):
+        path = os.path.join(self.folder2, "a.txt")
+        # newline=""：字节与 post 快照完全一致（Windows 文本模式会 \n→\r\n，
+        # sha256 对不上就会走合并路径而不是快路径）。
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        return path
+
+    def _case2_summary(self):
+        path = os.path.join(self.home, "runs", SID2, "round-1", "summary.json")
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_revert_success_restores_the_pin_before(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nX\nl3\n")  # 磁盘 == post → 快路径
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["restored"], ["a.txt"])
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nl2\nl3\n")  # 写回改前字节
+        self.assertTrue(self._case2_summary().get("reverted"))
+
+    def test_revert_conflict_is_409_and_disk_untouched(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nZ\nl3\n")  # 后续轮改了同一行 → 同 hunk 冲突
+        status, body, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+        self.assertEqual(status, 409)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["conflicts"], ["a.txt"])
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nZ\nl3\n")  # 磁盘未动
+        self.assertNotIn("reverted", self._case2_summary())
+        with open(os.path.join(self.home, "runs", SID2, "status.json"), encoding="utf-8") as fh:
+            self.assertNotIn("reverted_pin", json.load(fh))
+
+    def test_revert_rejections(self):
+        creds = self.creds()
+        path = self._case2_file("l1\nX\nl3\n")
+        # 无 Origin（本地客户端）只读：写必须来自页面同源。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"}, origin=None)
+        self.assertEqual(status, 403)
+        # 外域 Origin 在 bridge 层就被拒。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"},
+            origin="http://evil.example")
+        self.assertEqual(status, 403)
+        # 缺/错 client+token → 401。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {"confirm": "p1"})
+        self.assertEqual(status, 401)
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {"client": 999, "token": "x", "confirm": "p1"})
+        self.assertEqual(status, 401)
+        # confirm 不是这个钉 → 403。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p2"})
+        self.assertEqual(status, 403)
+        # 非法 pid → 400。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/%%2e%%2e/revert" % SID2, {**creds, "confirm": ".."})
+        self.assertEqual(status, 400)
+        # 没有可撤回 pin_only 轮的钉 → 404。
+        status, _, _ = self.post_write(
+            "/api/runs/%s/pins/p2/revert" % SID2, {**creds, "confirm": "p2"})
+        self.assertEqual(status, 404)
+        # 全部拒绝路径磁盘都不动。
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "l1\nX\nl3\n")
+
+    def test_revert_refuses_while_running(self):
+        creds = self.creds()
+        status_path = os.path.join(self.home, "runs", SID2, "status.json")
+        with open(status_path, encoding="utf-8") as fh:
+            old = fh.read()
+        self._write(status_path, {"status": "running", "round": 1, "note": self.source_note,
+                                  "folder": self.folder2})
+        try:
+            status, _, _ = self.post_write(
+                "/api/runs/%s/pins/p1/revert" % SID2, {**creds, "confirm": "p1"})
+            self.assertEqual(status, 409)
+        finally:
+            with open(status_path, "w", encoding="utf-8") as fh:
+                fh.write(old)
+
+    # -- /app 静态服务 ------------------------------------------------------
+
+    def test_static_index(self):
+        status, body, headers = self.request("/app/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"record", body)
+        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+        status, body, _ = self.request("/app")
+        self.assertEqual(status, 200)
+        self.assertIn(b"record", body)
+
+    def test_static_traversal_rejected(self):
+        # 未编码的 ../ 在 realpath 检查处挡下。
+        status, _, _ = self.request("/app/../core/bridge.py")
+        self.assertEqual(status, 403)
+        status, _, _ = self.request("/app/../../etc/passwd")
+        self.assertEqual(status, 403)
+        # 编码后的 %2e%2e 不被解码，落入白名单后缀检查，绝不能 200。
+        status, _, _ = self.request("/app/%2e%2e/core/bridge.py")
+        self.assertNotEqual(status, 200)
+
+    def test_static_suffix_whitelist(self):
+        status, _, _ = self.request("/app/nope.exe")
+        self.assertEqual(status, 404)
+        status, _, _ = self.request("/app/missing.html")
+        self.assertEqual(status, 404)
+
+    def test_static_windows_style_traversal_rejected(self):
+        # Windows 风格反斜杠穿越（M5）：反斜杠与编码 %5C 都不许绕过守卫，绝不能 200。
+        for path in ("/app/..\\core\\bridge.py", "/app/..\\..\\windows\\Program.cs",
+                     "/app/%2e%2e%5ccore%5cbridge.py"):
+            status, _, _ = self.request(path)
+            self.assertNotEqual(status, 200, path)
+
+    def test_note_edit_busy_returns_409(self):
+        # Windows 场景：note 被编辑器/杀软占用 → os.replace 抛 PermissionError，
+        # 接口返回 409 而不是崩掉 handler 线程。
+        with open(self.source_note, encoding="utf-8") as fh:
+            before = fh.read()
+        creds = self.creds()
+        with mock.patch("core.runs_api.os.replace", side_effect=PermissionError(13, "busy")):
+            status, body, _ = self.post_write(
+                "/api/runs/%s/pins/p1/note" % SID,
+                {**creds, "confirm": "p1", "note": "占用时也要优雅失败"})
+        self.assertEqual(status, 409)
+        self.assertIn("busy", json.loads(body)["error"])
+        # 失败不落脏数据：源 note 不变，也没有残留 .tmp。
+        with open(self.source_note, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertFalse(os.path.exists(self.source_note + ".tmp"))
+
+    # -- M6 首次设置引导 -----------------------------------------------------
+
+    def test_config_get_defaults(self):
+        # 全新临时 home：没有 setup_done（首次判定成立），dispatch 由缺省 auto 推导。
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["setup_done"])
+        self.assertEqual(data["dispatch"], "auto")
+        self.assertTrue(data["auto"])
+        self.assertEqual(data["engine"], "claude")
+        self.assertIn("/app/", data["app_url"])
+
+    def test_config_app_url_follows_public_host(self):
+        # BK-02: 壳转发保留公开端口的 Host（仅 _host_ok 放行的两种写法），
+        # 此时 app_url 指回 DingCode.app 的公开地址；直连时保持本端口地址。
+        status, body, _ = self.request(
+            "/api/config",
+            headers={"Host": "127.0.0.1:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
+        status, body, _ = self.request(
+            "/api/config",
+            headers={"Host": "localhost:%d" % bridge.APP_PUBLIC_PORT})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
+        # 直连内部端口（默认 Host）仍是本端口地址，不受 8763 影响。
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(json.loads(body)["app_url"],
+                         "http://127.0.0.1:%d/app/" % self.port)
+
+    def test_config_write_auth(self):
+        status, _, _ = self.post_write("/api/config", {"dispatch": "manual"}, origin=None)
+        self.assertEqual(status, 403)
+        status, body, _ = self.post_write("/api/config", {"dispatch": "manual"})
+        self.assertEqual(status, 401)
+        creds = self.creds()
+        status, body, _ = self.post_write(
+            "/api/config", {**creds, "dispatch": "manual", "confirm": "projects"})
+        self.assertEqual(status, 403)
+        self.assertIn("confirm", json.loads(body)["error"])
+
+    def test_config_write_roundtrip_and_validations(self):
+        creds = self.creds()
+        status, body, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config", "dispatch": "manual",
+            "engine": "codex", "port": 9999, "setup_done": True,
+        })
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["dispatch"], "manual")
+        self.assertFalse(data["auto"])  # 旧 auto 字段同步
+        self.assertTrue(data["setup_done"])
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(json.loads(body)["port"], 9999)
+        # config.json 里保留无关字段（extension_id），dispatch 同步 auto。
+        from handoff import config_path, load_config
+        with open(config_path(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw["extension_id"] = "a" * 32
+        with open(config_path(), "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        cfg = load_config()
+        self.assertEqual(cfg["extension_id"], "a" * 32)
+        self.assertEqual(cfg["dispatch"], "manual")
+        # 校验：非法 dispatch / engine / port / engine_path 都 400。
+        for patch in (
+            {"dispatch": "x"}, {"engine": "claude-code"}, {"port": 70000},
+            {"port": "abc"}, {"engine_path": "relative/claude"},
+            {"engine_path": os.path.join(self.home, "no-such-bin")},
+            {"setup_done": "yes"},
+        ):
+            status, body, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", **patch})
+            self.assertEqual(status, 400, patch)
+
+    # -- engines 配置接口 -----------------------------------------------------
+
+    def _config_engines(self):
+        """config.json 落盘的 engines 原值（load_config 会清洗，这里要看原始键）。"""
+        from handoff import config_path
+        with open(config_path(), encoding="utf-8") as fh:
+            return json.load(fh).get("engines")
+
+    def _fake_engine_bin(self):
+        path = os.path.join(self.home, "bin", "fake-engine")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_engine_catalog_defaults(self):
+        creds = self.creds()
+        # 先清回默认 engines，目录断言不依赖别的用例留下的覆盖。
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": {}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        self.assertEqual(status, 200)
+        rows = json.loads(body)["engine_catalog"]
+        self.assertEqual([r["name"] for r in rows],
+                         ["claude", "codex", "pi", "cursor", "gemini", "kimi"])
+        by_name = dict((r["name"], r) for r in rows)
+        for name, row in by_name.items():
+            self.assertEqual(row["hidden"], name == "kimi", name)
+            self.assertFalse(row["custom"], name)
+        for name in ("claude", "codex"):
+            self.assertEqual(by_name[name]["risk"], "", name)
+        for name in ("pi", "cursor", "gemini", "kimi"):
+            self.assertTrue(by_name[name]["risk"], name)
+        self.assertEqual(by_name["claude"]["default_args"], by_name["claude"]["args"])
+        # 全新 home：预设超时默认 1800 秒。
+        self.assertEqual(by_name["claude"]["timeout_sec"], 1800)
+        self.assertEqual(by_name["claude"]["default_timeout_sec"], 1800)
+
+    def test_engine_custom_definition(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config",
+            "engines": {"mine": {"command": bin_path, "args": ["--x", "{prompt}"]}}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertIn("mine", rows)  # 自定义排在预设之后
+        self.assertTrue(rows["mine"]["custom"])
+        self.assertFalse(rows["mine"]["hidden"])
+        self.assertEqual(rows["mine"]["command"], bin_path)
+        self.assertEqual(rows["mine"]["args"], ["--x", "{prompt}"])
+
+    def test_engine_override_roundtrip(self):
+        creds = self.creds()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config", "engines": {"claude": {"timeout_sec": 0}}})
+        self.assertEqual(status, 200)
+        # 整体替换：config.json 的 engines 键就是提交的值。
+        self.assertEqual(self._config_engines(), {"claude": {"timeout_sec": 0}})
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertEqual(rows["claude"]["timeout_sec"], 0)
+        self.assertEqual(rows["claude"]["default_timeout_sec"], 1800)
+        # 只提交了 timeout：args 仍是预设默认。
+        self.assertEqual(rows["claude"]["args"], rows["claude"]["default_args"])
+        # engines={} 恢复默认。
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": {}})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/config")
+        rows = dict((r["name"], r) for r in json.loads(body)["engine_catalog"])
+        self.assertEqual(rows["claude"]["timeout_sec"], 1800)
+
+    def test_engine_override_validations(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        baseline = {"claude": {"timeout_sec": 60}}
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engines": baseline})
+        self.assertEqual(status, 200)
+        bad = [
+            ("engines not an object", ["claude"]),
+            ("uppercase name", {"Claude": {"timeout_sec": 1}}),
+            ("name with space", {"my engine": {"timeout_sec": 1}}),
+            ("hidden not accepted", {"claude": {"hidden": True}}),
+            ("risk not accepted", {"claude": {"risk": "x"}}),
+            ("unknown field", {"claude": {"nope": 1}}),
+            ("custom missing args", {"mine": {"command": bin_path}}),
+            ("custom bare command", {"mine": {"command": "no-such-bin",
+                                              "args": ["{prompt}"]}}),
+            ("custom missing file", {"mine": {"command": os.path.join(self.home, "no-such-bin"),
+                                              "args": ["{prompt}"]}}),
+            ("custom args without {prompt}", {"mine": {"command": bin_path, "args": ["--x"]}}),
+            ("custom args with two {prompt}", {"mine": {"command": bin_path,
+                                                        "args": ["{prompt}", "{prompt}"]}}),
+            ("bare name not in preset command", {"pi": {"command": "rm"}}),
+            ("control char in args", {"claude": {"args": ["a\x00b"]}}),
+            ("negative timeout", {"claude": {"timeout_sec": -1}}),
+            ("timeout above 86400", {"claude": {"timeout_sec": 86401}}),
+            ("bool timeout", {"claude": {"timeout_sec": True}}),
+            ("string timeout", {"claude": {"timeout_sec": "5"}}),
+            ("template without {prompt}", {"claude": {"prompt_template": "no placeholder"}}),
+            ("too many engines", dict(("e%02d" % i, {"timeout_sec": 1}) for i in range(17))),
+        ]
+        for label, engines in bad:
+            status, _, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", "engines": engines})
+            self.assertEqual(status, 400, label)
+            # 校验在写盘之前：失败后 config.json 的 engines 原样不动。
+            self.assertEqual(self._config_engines(), baseline, label)
+
+    def test_engine_select_pi_kimi_custom_and_unknown(self):
+        creds = self.creds()
+        bin_path = self._fake_engine_bin()
+        status, _, _ = self.post_write("/api/config", {
+            **creds, "confirm": "config",
+            "engines": {"mine": {"command": bin_path, "args": ["--x", "{prompt}"]}}})
+        self.assertEqual(status, 200)
+        # 隐藏项（kimi）和自定义项同样可以通过接口选。
+        for name in ("pi", "kimi", "mine"):
+            status, body, _ = self.post_write(
+                "/api/config", {**creds, "confirm": "config", "engine": name})
+            self.assertEqual(status, 200, name)
+            self.assertEqual(json.loads(body)["engine"], name)
+            status, body, _ = self.request("/api/config")
+            self.assertEqual(json.loads(body)["engine"], name)
+        status, _, _ = self.post_write(
+            "/api/config", {**creds, "confirm": "config", "engine": "nope"})
+        self.assertEqual(status, 400)
+
+    def test_projects_read_write_and_delete(self):
+        status, body, _ = self.request("/api/projects")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"], [])
+        creds = self.creds()
+        # 目录必须是已存在的绝对路径。
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": "relative/path"})
+        self.assertEqual(status, 400)
+        status, _, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": os.path.join(self.home, "missing-dir")})
+        self.assertEqual(status, 400)
+        folder = os.path.join(self.home, "bound-proj")
+        os.makedirs(folder)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": folder})
+        self.assertEqual(status, 200)
+        rows = json.loads(body)["projects"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Notes")
+        self.assertEqual(rows[0]["folder"], folder)
+        self.assertTrue(rows[0]["exists"])
+        self.assertFalse(rows[0]["is_git"])
+        # 同名再绑 = 修改。
+        folder2 = os.path.join(self.home, "bound-proj-2")
+        os.makedirs(folder2)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "folder": folder2})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"][0]["folder"], folder2)
+        # 未知的删除 404；存在的删除成功。
+        status, _, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Nope", "delete": True})
+        self.assertEqual(status, 404)
+        status, body, _ = self.post_write(
+            "/api/projects", {**creds, "confirm": "projects",
+                              "name": "Notes", "delete": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["projects"], [])
+
+    def test_projects_rules_read_write(self):
+        folder = os.path.join(self.home, "rules-proj")
+        os.makedirs(folder)
+        from handoff import bind_target
+        self.assertEqual(bind_target("RulesApp", folder), "RulesApp")
+        status, _, _ = self.request("/api/projects/Unbound/rules")
+        self.assertEqual(status, 404)
+        status, body, _ = self.request("/api/projects/RulesApp/rules")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["exists"])
+        self.assertTrue(data["default"].strip())
+        # 写需要鉴权；confirm 必须是项目名本身。
+        creds = self.creds()
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules",
+            {**creds, "confirm": "OtherApp", "rules": "- x"})
+        self.assertEqual(status, 403)
+        rules = "- 最小改动。\n- 不要重构。"
+        status, body, _ = self.post_write(
+            "/api/projects/RulesApp/rules", {**creds, "confirm": "RulesApp", "rules": rules})
+        self.assertEqual(status, 200)
+        rules_path = os.path.join(folder, ".dingcode", "handoff-rules.md")
+        with open(rules_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), rules + "\n")
+        status, body, _ = self.request("/api/projects/RulesApp/rules")
+        data = json.loads(body)
+        self.assertTrue(data["exists"])
+        self.assertEqual(data["rules"], rules + "\n")  # 文件原样返回（含结尾换行）
+        # 绑定键是网址时走 percent-encoding。
+        folder2 = os.path.join(self.home, "rules-web")
+        os.makedirs(folder2)
+        bind_target("http://localhost:3000", folder2)
+        encoded = "http%3A%2F%2Flocalhost%3A3000"
+        status, _, _ = self.post_write(
+            "/api/projects/%s/rules" % encoded,
+            {**creds, "confirm": "http://localhost:3000", "rules": "- web 规则"})
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/api/projects/%s/rules" % encoded)
+        self.assertEqual(json.loads(body)["rules"], "- web 规则\n")
+        # 空规则 = 删项目文件回默认。
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules", {**creds, "confirm": "RulesApp", "rules": "  "})
+        self.assertEqual(status, 200)
+        self.assertFalse(os.path.exists(rules_path))
+        # 超长 400。
+        status, _, _ = self.post_write(
+            "/api/projects/RulesApp/rules",
+            {**creds, "confirm": "RulesApp", "rules": "x" * 20001})
+        self.assertEqual(status, 400)
+
+    def test_run_prompt_endpoint(self):
+        # SID 没有 prompt.md：由 runs/note.json 现拼。
+        status, body, _ = self.request("/api/runs/%s/prompt" % SID)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["source"], "built")
+        self.assertIn("这个按钮改成蓝色", data["prompt"])
+        self.assertIn("-----BEGIN USER ANNOTATION DATA-----", data["prompt"])
+        # 有 prompt.md 的会话直接返回落盘那份（manual 派活写入的）。
+        run2 = os.path.join(self.home, "runs", SID2)
+        with open(os.path.join(run2, "prompt.md"), "w", encoding="utf-8") as fh:
+            fh.write("FULL PROMPT FOR MANUAL DISPATCH\n")
+        status, body, _ = self.request("/api/runs/%s/prompt" % SID2)
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["source"], "prompt.md")
+        self.assertIn("MANUAL DISPATCH", data["prompt"])
+        # 未知会话 404。
+        status, _, _ = self.request("/api/runs/missing-session/prompt")
+        self.assertEqual(status, 404)
+
+    def test_default_port_reads_config(self):
+        from core import bridge
+        saved_env = os.environ.get("DINGCODE_BRIDGE_PORT")
+        try:
+            os.environ.pop("DINGCODE_BRIDGE_PORT", None)
+            # 前面的用例可能在共享 home 里写过 port；先清回默认。
+            self._write(os.path.join(self.home, "config.json"), {"port": 0})
+            self.assertEqual(bridge.default_port(), 8763)
+            self._write(os.path.join(self.home, "config.json"), {"port": 9123})
+            self.assertEqual(bridge.default_port(), 9123)
+            self._write(os.path.join(self.home, "config.json"), {"port": 70000})
+            self.assertEqual(bridge.default_port(), 8763)
+            os.environ["DINGCODE_BRIDGE_PORT"] = "9200"
+            self.assertEqual(bridge.default_port(), 9200)
+        finally:
+            if saved_env is None:
+                os.environ.pop("DINGCODE_BRIDGE_PORT", None)
+            else:
+                os.environ["DINGCODE_BRIDGE_PORT"] = saved_env
+            self._write(os.path.join(self.home, "config.json"), {})
+
+
+class BridgeSubprocessTests(unittest.TestCase):
+    """以真实方式启动的 /api/config 回归。
+
+    handoff.py 经 `from core.bridge import main` 把 bridge 作为包模块加载，
+    config_read 里的裸 `import bridge` 会 ModuleNotFoundError（P-20261026-LOG-52
+    之后的回归）。这里不 mock：subprocess 起 `python3 handoff.py bridge --port N`，
+    用默认 Host 和壳转发的公开端口 Host 各打一次 /api/config。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = tempfile.mkdtemp(prefix="dingcode-sub-")
+        cls.dist = tempfile.mkdtemp(prefix="dingcode-sub-dist-")
+        with open(os.path.join(cls.dist, "index.html"), "w", encoding="utf-8") as fh:
+            fh.write("<!doctype html>record")
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        cls.port = sock.getsockname()[1]
+        sock.close()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env["DINGCODE_HOME"] = cls.home
+        env["DINGCODE_RECORD_DIST"] = cls.dist
+        env.pop("DINGCODE_BRIDGE_PORT", None)
+        cls.proc = subprocess.Popen(
+            [sys.executable, os.path.join(root, "handoff.py"),
+             "bridge", "--port", str(cls.port)],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, env=env)
+
+        def _cleanup():
+            if cls.proc.poll() is None:
+                cls.proc.terminate()
+                try:
+                    cls.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    cls.proc.kill()
+                    cls.proc.wait(timeout=10)
+            cls.proc.stdout.close()
+            shutil.rmtree(cls.home, ignore_errors=True)
+            shutil.rmtree(cls.dist, ignore_errors=True)
+
+        cls.addClassCleanup(_cleanup)
+        # 等服务就绪；提前退出则把日志带进报错。
+        deadline = time.time() + 30
+        while True:
+            if cls.proc.poll() is not None:
+                out = cls.proc.stdout.read().decode("utf-8", "replace")
+                raise AssertionError("bridge exited early:\n" + out)
+            try:
+                status, _ = cls._get("/api/config")
+                if status == 200:
+                    return
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise AssertionError("bridge never answered /api/config")
+            time.sleep(0.1)
+
+    @classmethod
+    def _get(cls, path, host=None):
+        conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=10)
+        try:
+            headers = {"Host": host} if host else {}
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_config_via_real_startup(self):
+        # 直连（默认 Host）→ 200，app_url 指向实际监听端口。
+        status, body = self._get("/api/config")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["app_url"], "http://127.0.0.1:%d/app/" % self.port)
+        # 壳转发的公开端口 Host 同样 200，app_url 指回 8763。
+        status, body = self._get(
+            "/api/config", host="127.0.0.1:%d" % bridge.APP_PUBLIC_PORT)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body)["app_url"],
+            "http://127.0.0.1:%d/app/" % bridge.APP_PUBLIC_PORT)
+
+
+if __name__ == "__main__":
+    unittest.main()

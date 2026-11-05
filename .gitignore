@@ -1,6 +1,8 @@
 .DS_Store
 *.app
 tools/dingai/macos/DingAI
+tools/dingcode/macos/DingCode
+tools/dingcode/extension/dist/
 bin/
 obj/
 notes/
@@ -10,3 +12,10 @@ shots/
 *.cer
 __pycache__/
 *.pyc
+*.log
+*.bak
+.env*
+*.key
+*.pfx
+*.db
+*.sqlite

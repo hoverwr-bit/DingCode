@@ -1,0 +1,4 @@
+node_modules/
+# unplugin-auto-import / unplugin-vue-components 生成
+auto-imports.d.ts
+components.d.ts

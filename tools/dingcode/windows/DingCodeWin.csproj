@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DingCode</AssemblyName>
+    <RootNamespace>DingCode</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="..\i18n\strings.json" Link="strings.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 记录页（设计 20261025 M5）：python bridge 与预构建 SPA 随包发布，运行时零 npm。
+         PageBridge 把 /api/*、/app/* 反代到本包的 `python handoff.py bridge`（端口 8764），
+         所以包里要有 handoff.py + core/*.py + web/record/dist。 -->
+    <Content Include="..\handoff.py" Link="handoff.py" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\core\*.py" Link="core\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\web\record\dist\**\*" Link="web\record\dist\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- UseWPF brings in System.Windows.Automation (UIAutomationClient / UIAutomationTypes).
+       A bare Reference Include cannot be resolved on the net8.0-windows targeting pack and only warns. -->
+</Project>
